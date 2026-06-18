@@ -3,11 +3,15 @@ mod pdf;
 use std::any::{Any, TypeId};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::marker::PhantomData;
 
 use ecow::EcoVec;
+use typst_syntax::{Span, Spanned};
 
 use crate::Feature;
-use crate::foundations::{Element, Module, NativeElement, Scope, StyleChain};
+use crate::foundations::{
+    Element, Field, Module, NativeElement, Scope, SettableProperty, StyleChain,
+};
 
 pub use self::pdf::*;
 
@@ -59,9 +63,10 @@ pub trait FormatElement: NativeElement {
 /// A type that can be populated from a [`StyleChain`].
 #[expect(private_bounds)]
 pub trait Populate: Bounds {
-    /// Populate this type with details from the given styles.
-    fn populate(&mut self, styles: StyleChain);
+    /// Populate this type with details from the given local styles.
+    fn populate(&mut self, styles: Spanned<StyleChain>);
 
+    // TODO: Can this be moved to `Bounds` somehow?
     fn dyn_clone(&self) -> Box<dyn Populate>;
 
     fn describe(&self) -> (&'static str, &'static str);
@@ -91,6 +96,11 @@ impl<T: Hash + Debug + Send + Sync + 'static> Bounds for T {
 pub struct FormatOptions(EcoVec<FormatOption>);
 
 impl FormatOptions {
+    /// Initialize default format options from a list of formats.
+    pub fn new(formats: &[Format]) -> Self {
+        Self(formats.iter().map(Format::default_options).collect())
+    }
+
     /// Get a concrete format option type.
     pub fn get<T: FormatElement>(&self) -> &T::Options {
         // TODO: Maybe just return default options, if the document doesn't have
@@ -118,18 +128,9 @@ impl FormatOptions {
                 );
             })
     }
-}
-
-impl FormatOptions {
-    /// Initialize default format options from a list of formats.
-    pub fn new(formats: &[Format]) -> Self {
-        Self(formats.iter().map(Format::default_options).collect())
-    }
 
     /// Populate the format options with details from the given styles.
-    pub fn populate(&mut self, styles: StyleChain) {
-        // TODO: More fine-grained field assignments that track spans?
-        // - Possibly use a map from Elements to options?
+    pub fn populate(&mut self, styles: Spanned<StyleChain>) {
         for o in self.0.make_mut() {
             o.populate(styles);
         }
@@ -139,7 +140,7 @@ impl FormatOptions {
 pub struct FormatOption(Box<dyn Populate>);
 
 impl FormatOption {
-    pub fn populate(&mut self, styles: StyleChain) {
+    pub fn populate(&mut self, styles: Spanned<StyleChain>) {
         self.0.populate(styles);
     }
 
@@ -197,26 +198,139 @@ impl Debug for FormatOption {
 /// }
 /// ```
 pub trait Fields: Default {
-    type Value<T: Debug + Clone + Eq + PartialEq + Hash + Default>: Debug
-        + Clone
-        + Default
-        + Eq
-        + PartialEq
-        + Hash;
+    type Value<E, const I: u8>: Debug + Default + Clone + Eq + Hash
+    where
+        E: SettableProperty<I>,
+        E::Type: Debug + Clone + Eq + Hash;
 }
 
 /// Marker for types with fully resolved fields.
-#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Complete;
 
 impl Fields for Complete {
-    type Value<T: Debug + Default + Clone + Eq + PartialEq + Hash> = T;
+    type Value<E, const I: u8>
+        = SpannedValue<E, I>
+    where
+        E: SettableProperty<I>,
+        E::Type: Debug + Clone + Eq + Hash;
+}
+
+/// A [`Spanned`] value that is associtated with a specific [`Field`] of an
+/// element. This allows reusing the [`Default`] value specified on the element,
+/// by reading from an empty [`StyleChain`].
+#[derive(Debug, Clone, Hash)]
+pub struct SpannedValue<E, const I: u8>
+where
+    E: SettableProperty<I>,
+{
+    /// The format element's field this value should be read from.
+    field: PhantomData<Field<E, I>>,
+    pub v: E::Type,
+    pub span: Span,
+}
+
+impl<E, const I: u8> SpannedValue<E, I>
+where
+    E: SettableProperty<I>,
+{
+    pub fn new(v: E::Type, span: Span) -> Self {
+        Self { span, v, field: PhantomData }
+    }
+
+    pub fn detached(v: E::Type) -> Self {
+        Self::new(v, Span::detached())
+    }
+
+    pub fn populate(&mut self, styles: Spanned<StyleChain>) {
+        if styles.v.has(Field::<E, I>::new()) {
+            *self =
+                SpannedValue::new(styles.v.get_cloned(Field::<E, I>::new()), styles.span);
+        }
+    }
+}
+
+impl<E, const I: u8> Default for SpannedValue<E, I>
+where
+    E: SettableProperty<I>,
+    E::Type: Debug + Clone + Eq + Hash,
+{
+    fn default() -> Self {
+        Self::new(
+            StyleChain::default().get_cloned(Field::<E, I>::new()),
+            Span::detached(),
+        )
+    }
+}
+
+impl<E, const I: u8> Copy for SpannedValue<E, I>
+where
+    E: SettableProperty<I>,
+    E::Type: Copy,
+{
+}
+
+impl<E, const I: u8> Eq for SpannedValue<E, I>
+where
+    E: SettableProperty<I>,
+    E::Type: Eq,
+{
+}
+
+impl<E, const I: u8> PartialEq for SpannedValue<E, I>
+where
+    E: SettableProperty<I>,
+    E::Type: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.v == other.v && self.span == other.span
+    }
+}
+
+impl<E, const I: u8> From<Spanned<E::Type>> for SpannedValue<E, I>
+where
+    E: SettableProperty<I>,
+{
+    fn from(value: Spanned<E::Type>) -> Self {
+        Self::new(value.v, value.span)
+    }
 }
 
 /// Marker for types with optional/partial fields.
-#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Partial;
 
 impl Fields for Partial {
-    type Value<T: Debug + Default + Clone + Eq + PartialEq + Hash> = Option<T>;
+    type Value<E, const I: u8>
+        = Option<E::Type>
+    where
+        E: SettableProperty<I>,
+        E::Type: Debug + Clone + Eq + Hash;
+}
+
+impl Partial {
+    pub fn resolve<E, const I: u8>(
+        partial: <Partial as Fields>::Value<E, I>,
+        default: <Complete as Fields>::Value<E, I>,
+    ) -> <Complete as Fields>::Value<E, I>
+    where
+        E: SettableProperty<I>,
+        E::Type: Debug + Copy + Clone + Eq + Hash,
+    {
+        partial.map(SpannedValue::detached).unwrap_or(default)
+    }
+
+    pub fn resolve_cloned<E, const I: u8>(
+        partial: &<Partial as Fields>::Value<E, I>,
+        default: &<Complete as Fields>::Value<E, I>,
+    ) -> <Complete as Fields>::Value<E, I>
+    where
+        E: SettableProperty<I>,
+        E::Type: Debug + Clone + Eq + Hash,
+    {
+        partial
+            .clone()
+            .map(SpannedValue::detached)
+            .unwrap_or_else(|| default.clone())
+    }
 }
