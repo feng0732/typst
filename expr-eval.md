@@ -1093,7 +1093,9 @@ Expr::CodeBlock(CodeBlock { body: Code })
 - `x` 被捕获为 `BindingKind::Captured(Function)`
 - `x = 2` 尝试 `Binding::write()` → 失败，因为 Captured 绑定是只读的
 
-### 8.7 闭包中调用可变方法：报错
+### 8.7 闭包中调用可变方法：完全只读
+
+#### 8.7.1 直接修改捕获变量：报错
 
 ```
 源码:
@@ -1102,46 +1104,95 @@ Expr::CodeBlock(CodeBlock { body: Code })
 #f()
 ```
 
-这段代码**会报错**，而非静默修改副本。错误信息为：
+这段代码**会报错**，错误信息为：
 
 ```
 variables from outside the function are read-only and cannot be modified
 ```
 
-**详细分析**：
+**调用路径分析**：
 
-1. `arr` 被闭包捕获为 `BindingKind::Captured(Function)`
-2. 调用 `f()` 时，`arr.push(4)` 是一个字段访问函数调用
-3. `FuncCall::eval` 检测到 `push` 是可变方法（`is_mutating_method("push") == true`）
-4. 进入 `maybe_resolve_mutating`，先求值参数，再调用 `target.access(vm)` 获取可变引用
-5. `Ident::access` → `vm.scopes.get_mut("arr")` → `Binding::write()`
-6. **`Binding::write()` 发现 `kind == Captured(Function)`，报错！**
+```
+arr.push(4)
+  │
+  ▼ FuncCall::eval (call.rs#L23)
+  检测到 callee 是 FieldAccess，且 push 是可变方法
+  │
+  ▼ maybe_resolve_mutating(vm, target=arr, field=push, args, span)
+  1. args.eval(vm)  →  Args { [Arg(name=None, value=4)] }
+  2. target.access(vm)
+     │
+     ▼ Ident::access (access.rs#L29-L42)
+        vm.scopes.get_mut("arr")  →  &mut Binding
+        Binding::write()          →  检查 kind
+        kind == Captured(Function) →  报错！
+```
 
-也就是说，**闭包捕获的变量不仅不能被赋值语句修改，也不能被可变方法修改**。两者走的是同一个 `Binding::write()` 检查点。
+错误发生在 `Binding::write()` 处（[scope.rs#L313-L325](file:///d:/fz/0601-2/solo-dogfeeding/code/121-typst/crates/typst-library/src/foundations/scope.rs#L313-L325)），因为 `Captured` 绑定被设计为完全只读。
 
-如果确实需要在闭包内修改外部数组，正确做法是把数组放在字典中，通过字典字段间接修改：
+#### 8.7.2 通过字典字段间接修改：仍然报错
+
+一个常见的误区是："把数组放进字典里，通过 `data.arr.push(4)` 是不是就能绕过只读检查？"
 
 ```
 源码:
 #let data = (arr: (1, 2, 3))
 #let f = () => { data.arr.push(4) }
 #f()
-// data.arr 现在是 (1, 2, 3, 4)
 ```
 
-**这为什么能工作？**
+**答案是：也会报同样的错误。**
 
-1. `data` 被捕获为 `BindingKind::Captured(Function)`——值类型是 `Value::Dict`
-2. `data.arr.push(4)` 被解析为 `Expr::FuncCall`，callee 是嵌套的字段访问
-3. 外层 `data.arr` 是一个普通字段访问求值（走 `Eval`，不是 `Access`），返回字典中 `arr` 字段的**值副本**
-4. 但 `data.arr.push(4)` 整体是一个方法调用，`push` 是可变方法
-5. `FuncCall::eval` 检测到 `push` 是可变方法后，对 `data.arr` 的 target（即 `data.arr` 这个 FieldAccess 表达式）调用 `target.access(vm)`
-6. `FieldAccess::access` → `access_dict(vm, access)` → 先 `access.target().access(vm)` 获取 `data` 的可变引用
-7. 这里关键来了：`data` 在闭包的作用域中是 `Captured` 绑定，`Ident::access` 会调用 `Binding::write()` —— **这一步会报错！**
+原因在于 `FieldAccess::access` 的实现是**递归的**（[access.rs#L50-L53](file:///d:/fz/0601-2/solo-dogfeeding/code/121-typst/crates/typst-eval/src/access.rs#L50-L53)）：
 
-实际上，在当前的 Typst 实现中，**即使是 `data.arr.push(4)` 也会报同样的错误**，因为 `FieldAccess::access` 的实现是递归的——它先通过 `access.target().access(vm)` 获取目标的可变引用，而 `data` 是 Captured 绑定。
+```rust
+impl Access for ast::FieldAccess<'_> {
+    fn access<'a>(self, vm: &'a mut Vm) -> SourceResult<&'a mut Value> {
+        access_dict(vm, self)?.at_mut(self.field().get()).at(self.span())
+    }
+}
+```
 
-> **总结**：闭包中对捕获变量的任何修改尝试（无论是赋值、复合赋值还是可变方法调用）都会在 `Binding::write()` 处被拦截报错。闭包捕获的变量是完全只读的。
+而 `access_dict` 会递归调用 `access.target().access(vm)`（[access.rs#L76-L107](file:///d:/fz/0601-2/solo-dogfeeding/code/121-typst/crates/typst-eval/src/access.rs#L76-L107)）：
+
+```rust
+pub(crate) fn access_dict<'a>(vm: &'a mut Vm, access: ast::FieldAccess)
+    -> SourceResult<&'a mut Dict>
+{
+    match access.target().access(vm)? {  // ← 递归获取 target 的可变引用
+        Value::Dict(dict) => Ok(dict),
+        ...
+    }
+}
+```
+
+**完整调用路径**：
+
+```
+data.arr.push(4)
+  │
+  ▼ FuncCall::eval
+  callee = FieldAccess(data.arr), 可变方法 = push
+  │
+  ▼ maybe_resolve_mutating(vm, target=data.arr, field=push, args, span)
+  1. args.eval(vm) → Args { [4] }
+  2. target.access(vm)   // target 是 data.arr (FieldAccess)
+     │
+     ▼ FieldAccess::access (data.arr)
+        access_dict(vm, access=data.arr)
+          │
+          ▼ access.target().access(vm)   // access.target() = data (Ident)
+             │
+             ▼ Ident::access("data")
+                vm.scopes.get_mut("data") → &mut Binding { kind: Captured(Function) }
+                Binding::write() → 报错！
+```
+
+递归一直追溯到最外层的 `Ident("data")`，而 `data` 是 Captured 绑定，所以 `Binding::write()` 同样会报错。
+
+> **结论**：闭包中对捕获变量的**任何**修改尝试——无论是直接赋值、复合赋值、字段赋值、还是可变方法调用——最终都会在 `Binding::write()` 处被拦截。闭包捕获的变量是**完全只读**的，没有任何方式可以绕过。
+>
+> 这是设计使然：值捕获（capture by value）+ 不可变语义，确保闭包的行为是可预测的，不会产生意外的副作用。
 
 ### 8.8 for 循环中的作用域
 
@@ -1297,7 +1348,7 @@ Expr::Binary { op: Assign, lhs: Expr::FieldAccess(...), rhs: ... }
 
 1. **词法作用域**：变量查找沿作用域链从内到外，最远到标准库全局。不存在动态作用域。
 
-2. **值捕获，非引用捕获，且捕获变量完全只读**：闭包通过 `CapturesVisitor` 在**定义时**静态分析需要捕获的变量，然后 clone 值存入 `captured` Scope。调用时完全不继承调用方的作用域。被捕获的变量标记为 `BindingKind::Captured`，不仅赋值语句（`=`/`+=`）会报错，**可变方法调用**（如 `arr.push(4)`）也会报错——因为可变方法通过 `Access` trait 获取 `&mut Value`，而 `Ident::access` 最终调用 `Binding::write()` 对 Captured 绑定报错。
+2. **值捕获，非引用捕获，且捕获变量完全只读**：闭包通过 `CapturesVisitor` 在**定义时**静态分析需要捕获的变量，然后 clone 值存入 `captured` Scope。调用时完全不继承调用方的作用域。被捕获的变量标记为 `BindingKind::Captured`，**任何**修改尝试——赋值语句、复合赋值、字段赋值、可变方法调用——都会在 `Binding::write()` 处被拦截。即使是通过字典字段间接访问（如 `data.arr.push(4)`）也不例外，因为 `FieldAccess::access` 会递归调用 `target.access()` 一直追溯到最外层的标识符。
 
 3. **代码块/内容块自动创建作用域**：`CodeBlock.eval()` 和 `ContentBlock.eval()` 会 `enter`/`exit` 作用域，`ForLoop` 也为循环体创建新作用域。
 
