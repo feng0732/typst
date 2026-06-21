@@ -731,22 +731,34 @@ if let Some(sink) = sink {
 args.finish()?;
 ```
 
-**参数绑定按参数声明顺序逐一处理**：
+**参数绑定按 `params.children()` 的声明顺序逐一处理**（Typst 语法规定参数声明顺序为：位置参数 → 展开参数 → 命名参数，但代码层面并不假设固定顺序，而是逐一遍历 `params.children()` 并按每个参数类型分派）：
 
 | 参数类型 | 绑定方式 |
 |---|---|
 | `Pos(Ident)` | `args.expect::<Value>(&ident)` — 从 `args` 中消费第一个位置参数并绑定 |
 | `Pos(Pattern)` | `args.expect` 取值 + `destructure` 解构绑定（支持 `(a, b)` 模式） |
-| `Spread(sink_ident)` | 记录 sink，延迟处理。先计算 `sink_size = 实际位置参数数 - 声明的位置参数数`，然后用 `args.consume(sink_size)` 消费多余的位置参数 |
+| `Spread(sink_ident)` | 记录 sink 标识符，**立即消费多余的位置参数**：`sink_size = 实际位置参数数 - 已声明的位置参数数`，用 `args.consume(sink_size)` 消费多余部分存入 `sink_pos_values` |
 | `Named(name)` | `args.named::<Value>(&name)` 查找命名参数；未提供则使用 `defaults` 中的默认值（定义时已求值） |
 
-**sink 参数的微妙处理**：
+**sink 参数的两阶段处理**：
 
-1. `sink_size` 在参数绑定循环之前就计算好了（`num_pos_args - num_pos_params`）
-2. 在循环中遇到 `Spread` 参数时，只记录 sink 标识符，不立即消费参数
-3. 循环结束后，`args.take()` 拿走所有剩余参数（包括未消费的命名参数）
-4. 如果 sink 有名字（`sink_ident` 是 `Some`），将剩余参数 + 多余的位置参数打包成 `Args` 绑定到该名字
-5. 如果 sink 没名字（裸 `..`），剩余参数仍被 `args.take()` 消费掉（确保 `args.finish()` 通过），但不绑定到任何变量
+1. **循环内（Spread 分支）：
+   - `sink_size` 在循环之前就计算好了（`num_pos_args - num_pos_params`）
+   - 遇到 `Spread` 参数时，**立即**调用 `args.consume(sink_size)?` 消费多余的位置参数，存入 `sink_pos_values`
+   - 同时记录 `sink = Some(spread.sink_ident())`
+   - 这一步消费的是**位置参数**的多余部分，不涉及命名参数
+
+2. **循环后（第 683-692 行）**：
+   - `args.take()` 拿走所有**剩余**参数（即命名参数、spread 后未被消费的参数）
+   - 如果 sink 有名字（`sink_ident` 是 `Some`），将 `sink_pos_values`（位置参数多余部分）追加到 `remaining_args` 中
+   - 然后把整合后的 `remaining_args` 绑定到 sink 变量
+
+3. **如果 sink 没名字（裸 `..`）**：
+   - 仍执行 `args.take()` 消费掉所有剩余参数
+   - 但不绑定到任何变量（确保 `args.finish()` 通过，不会因为有未消费参数报错）
+
+**为什么分两阶段？**
+- 位置参数的多余部分必须在 Spread 分支内消费，因为后续的 Named 参数也在循环中会继续消费命名参数，而命名参数是按名字查找的，不受位置参数顺序无关。如果不先消费多余位置参数，那么 `expect` 等操作可能会从错误的位置取参数。
 
 **命名参数默认值的使用**：`closure.defaults` 是一个与 AST 中命名参数一一对应的 `Vec<Value>`。在参数绑定循环中，`defaults.iter()` 按顺序逐一取出。`args.named()` 如果在 `args` 中找到了对应的命名参数就消费并返回它；如果没找到，就用 `default.clone()` 作为值。这确保了：
 - 调用方显式传入的命名参数优先于默认值
@@ -1374,6 +1386,6 @@ Expr::Binary { op: Assign, lhs: Expr::FieldAccess(...), rhs: ... }
 
 14. **可变方法需要 Access 而非 Eval**：`arr.push(4)` 之所以能修改 `arr`，不是因为 `push` 是特殊的语言级操作，而是因为 `FuncCall::eval` 检测到可变方法名后，改走 `target.access(vm)` → `call_method_mut` 路径，获取 `&mut Value` 实现原地修改。
 
-15. **参数消费模型是破坏性的**：`Args` 的 `expect`/`named`/`consume`/`take` 都会从 `items` 中移除已处理的参数。`eval_closure` 按 Pos → Spread → Named 的顺序逐一消费，最后 `args.finish()` 确保无多余参数。
+15. **参数消费模型是破坏性的**：`Args` 的 `expect`/`named`/`consume`/`take` 都会从 `items` 中移除已处理的参数。`eval_closure` 按 `params.children()` 的声明顺序遍历处理每个参数，最后 `args.finish()` 确保无多余参数。
 
-16. **sink 参数的延迟消费**：`Spread` 参数在循环中只记录标识符，实际消费发生在循环之后。多余的位置参数通过 `args.consume(sink_size)` 取出，剩余参数通过 `args.take()` 一次性取走。
+16. **sink 参数的两阶段处理**：`Spread` 参数在循环的 Spread 分支中就调用 `args.consume(sink_size)` 消费掉多余的**位置参数**（`consume` 会跳过命名参数只取位置参数）；循环结束后再 `args.take()` 取走所有剩余参数（主要是命名参数），两部分合并后绑定到 sink 变量。
