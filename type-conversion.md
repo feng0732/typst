@@ -10,62 +10,28 @@
 
 ```rust
 pub enum Value {
-    None,           // 无意义值
-    Auto,           // 智能默认值
-    Bool(bool),     // 布尔值
-    Int(i64),       // 整数
-    Float(f64),     // 浮点数
-    Length(Length), // 长度
-    Angle(Angle),   // 角度
-    Ratio(Ratio),   // 比例
-    Relative(Rel<Length>), // 相对长度
-    Fraction(Fr),   // 分数
-    Color(Color),   // 颜色
-    Gradient(Gradient),   // 渐变
-    Tiling(Tiling), // 平铺填充
-    Symbol(Symbol), // 符号
-    Version(Version), // 版本
-    Str(Str),       // 字符串
-    Bytes(Bytes),   // 原始字节
-    Label(Label),   // 标签
-    Datetime(Datetime), // 日期时间
-    Decimal(Decimal), // 十进制数
-    Duration(Duration), // 持续时间
-    Content(Content), // 内容
-    Styles(Styles), // 样式
-    Array(Array),   // 数组
-    Dict(Dict),     // 字典
-    Func(Func),     // 函数
-    Args(Args),     // 捕获的参数
-    Type(Type),     // 类型本身
-    Module(Module), // 模块
-    Dyn(Dynamic),   // 动态值
+    None, Auto, Bool(bool), Int(i64), Float(f64),
+    Length(Length), Angle(Angle), Ratio(Ratio),
+    Relative(Rel<Length>), Fraction(Fr),
+    Color(Color), Gradient(Gradient), Tiling(Tiling),
+    Symbol(Symbol), Version(Version),
+    Str(Str), Bytes(Bytes), Label(Label),
+    Datetime(Datetime), Decimal(Decimal), Duration(Duration),
+    Content(Content), Styles(Styles),
+    Array(Array), Dict(Dict), Func(Func), Args(Args),
+    Type(Type), Module(Module), Dyn(Dynamic),
 }
 ```
 
-每个 `Value` 变体都可以通过 `ty()` 方法获取其对应的 `Type`，定义在 [value.rs#L116-L149](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L116-L149)。
+每个 `Value` 变体都可通过 `ty()` 获取对应的 `Type`（[value.rs#L116-L149](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L116-L149)）。
 
 ### 1.2 Type 类型：类型的元信息
 
-`Type` 结构体描述了值的种类，定义在 [ty.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/ty.rs#L64-L65)：
-
-```rust
-#[ty(scope, cast)]
-#[derive(Copy, Clone, Eq, PartialEq, Hash)]
-pub struct Type(Static<NativeTypeData>);
-```
-
-每个 `Type` 包含：
-- `short_name()`: 代码中使用的短名（如 `str`）
-- `long_name()`: 诊断中使用的长名（如 `string`）
-- `title()`: 文档中使用的标题名（如 `String`）
-- `docs()`: Markdown 格式的文档
-- `constructor()`: 类型的构造函数
-- `scope()`: 类型关联的作用域
+`Type` 结构体描述了值的种类（[ty.rs#L64-L65](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/ty.rs#L64-L65)），包含 `short_name()`（如 `str`）、`long_name()`（如 `string`）、`title()`（如 `String`）、`constructor()`、`scope()` 等元信息。
 
 ### 1.3 NativeType trait：类型的 Rust 侧定义
 
-`NativeType` trait 将 Rust 类型与 Typst 类型关联起来，定义在 [ty.rs#L190-L203](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/ty.rs#L190-L203)：
+`NativeType` trait 将 Rust 类型与 Typst 类型关联（[ty.rs#L190-L203](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/ty.rs#L190-L203)）：
 
 ```rust
 pub trait NativeType {
@@ -79,23 +45,22 @@ pub trait NativeType {
 
 ## 2. 转换核心 Trait
 
-类型转换系统由三个核心 trait 组成，定义在 [cast.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs)：
+类型转换系统由三个核心 trait 组成，定义在 [cast.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs)。
 
 ### 2.1 Reflect：类型元数据与可转换性检查
 
 ```rust
 pub trait Reflect {
-    fn input() -> CastInfo;          // 描述可以转换为此类型的值
-    fn output() -> CastInfo;         // 描述此类型可以转换出的值
-    fn castable(value: &Value) -> bool; // 快速检查值是否可转换
-    fn error(found: &Value) -> HintedString; // 生成错误信息
+    fn input() -> CastInfo;
+    fn output() -> CastInfo;
+    fn castable(value: &Value) -> bool;
+    fn error(found: &Value) -> HintedString;
 }
 ```
 
-**关键设计说明**：
-- `input()` 和 `output()` 返回 `CastInfo`，用于文档生成和自动补全
-- `castable()` 是性能优化的快速检查路径，避免通过 `CastInfo` 进行昂贵的动态检查
-- `error()` 利用 `CastInfo` 生成友好的错误消息
+- `input()` / `output()` 返回 `CastInfo`，用于文档和自动补全
+- `castable()` 是快速检查路径，避免通过 `CastInfo` 做堆分配 + 动态检查（[cast.rs#L42-L44](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L42-L44)）
+- `error()` 委托给 `Self::input().error(found)` 生成带提示的错误消息
 
 ### 2.2 IntoValue：Rust 类型 → Typst Value（不可失败）
 
@@ -105,8 +70,6 @@ pub trait IntoValue {
 }
 ```
 
-这是一个**单向不可失败**的转换，用于将 Rust 类型转换为 `Value` 枚举。
-
 ### 2.3 FromValue：Typst Value → Rust 类型（可失败）
 
 ```rust
@@ -115,22 +78,41 @@ pub trait FromValue<V = Value>: Sized + Reflect {
 }
 ```
 
-这是一个**可能失败**的转换，返回 `HintedStrResult<Self>`，失败时包含带提示的错误信息。
-
-### 2.4 CastInfo：转换信息描述
-
-`CastInfo` 枚举描述了可能的转换目标，定义在 [cast.rs#L294-L304](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L294-L304)：
+注意：`FromValue` 的默认泛型参数是 `Value`，但 `Args` 的各方法约束是 `T: FromValue<Spanned<Value>>`。对于 `Spanned<Value>`，有两个关键的 impl（[cast.rs#L280-L291](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L280-L291)）：
 
 ```rust
-pub enum CastInfo {
-    Any,                     // 任意值
-    Value(Value, &'static str), // 特定值 + 文档
-    Type(Type),              // 某类型的任意值
-    Union(Vec<Self>),        // 多个可选值
+// 1. T 本身可以 from Value 时，Spanned<Value> → T：丢弃 span
+impl<T: FromValue> FromValue<Spanned<Value>> for T {
+    fn from_value(value: Spanned<Value>) -> HintedStrResult<Self> {
+        T::from_value(value.v)  // 解包，丢掉 span
+    }
+}
+
+// 2. T 本身可以 from Value 时，Spanned<Value> → Spanned<T>：保留 span
+impl<T: FromValue> FromValue<Spanned<Value>> for Spanned<T> {
+    fn from_value(value: Spanned<Value>) -> HintedStrResult<Self> {
+        let span = value.span;
+        T::from_value(value.v).map(|t| Spanned::new(t, span))
+    }
 }
 ```
 
-`CastInfo` 实现了 `Add` trait，可以通过 `+` 运算符组合成 `Union`。
+由于 Rust 的方法解析优先选特化 impl，当目标类型 `T` 本身就是 `Spanned<Inner>` 时走第二条路径，否则走第一条路径丢弃 span——span 已在调用方通过 `.at(span)` 附加到 `SourceDiagnostic` 中了。
+
+### 2.4 CastInfo：转换信息描述
+
+`CastInfo` 枚举（[cast.rs#L294-L304](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L294-L304)）：
+
+```rust
+pub enum CastInfo {
+    Any,                          // 任意值
+    Value(Value, &'static str),   // 特定值 + 文档
+    Type(Type),                   // 某类型的任意值
+    Union(Vec<Self>),             // 多个可选值
+}
+```
+
+`CastInfo` 实现了 `Add` trait，可通过 `+` 组合成 `Union`。
 
 ---
 
@@ -138,41 +120,36 @@ pub enum CastInfo {
 
 ### 3.1 primitive! 宏：基础类型的自动转换
 
-`primitive!` 宏为基础类型批量实现 `Reflect`、`IntoValue` 和 `FromValue`，定义在 [value.rs#L578-L617](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L578-L617)。
+`primitive!` 宏（[value.rs#L578-L617](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L578-L617)）为基础类型批量实现 `Reflect`、`IntoValue` 和 `FromValue`。
 
-**宏签名**：
-```rust
-primitive! { 
-    $ty:ty: $name:literal, $variant:ident 
-    $(, $other:ident$(($binding:ident))? => $out:expr)* 
-}
-```
+宏签名中，逗号后的每个 `$other:ident$(($binding:ident))? => $out:expr` 定义了一条**自动转换规则**——当 `FromValue::from_value()` 收到不匹配主变体的值时，尝试匹配这些备选分支。
 
-**使用示例**（[value.rs#L621](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L621)）：
+以 `f64` 为例（[value.rs#L621](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L621)）：
+
 ```rust
 primitive! { f64: "float", Float, Int(v) => v as f64 }
 ```
 
-这表示：
-- Rust 类型 `f64` 对应 Typst 类型名 `"float"`
-- 对应 `Value` 变体 `Value::Float`
-- **自动转换规则**：`Value::Int(v)` 可以自动转换为 `f64`（通过 `v as f64`）
+展开后：
+- `castable()` 接受 `Value::Float(_)` 和 `Value::Int(_)`
+- `from_value()` 先匹配 `Value::Float(v)` → 直接返回；再匹配 `Value::Int(v)` → `Ok(v as f64)`；其余 → `Err(Self::error(&v))`
 
-**更多自动转换示例**：
+更多自动转换规则（[value.rs#L619-L663](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L619-L663)）：
 
-| 目标类型    | 自动转换源                     | 转换逻辑                     |
-|------------|-------------------------------|-----------------------------|
-| `f64`      | `Int(v)`                      | `v as f64`                  |
-| `Rel<Length>` | `Length(v)`, `Ratio(v)`    | `v.into()`                  |
-| `Str`      | `Symbol(symbol)`              | `symbol.get().into()`       |
-| `Content`  | `None`, `Symbol(v)`, `Str(v)` | 空内容 / 符号元素 / 文本元素 |
-| `Func`     | `Type(ty)`, `Symbol(symbol)`  | 构造函数 / 符号函数        |
+| 目标类型       | 主变体           | 自动转换源                          | 转换逻辑                        |
+|---------------|-----------------|------------------------------------|--------------------------------|
+| `f64`         | `Float`         | `Int(v)`                           | `v as f64`                     |
+| `Rel<Length>` | `Relative`      | `Length(v)`, `Ratio(v)`            | `v.into()`                     |
+| `Str`         | `Str`           | `Symbol(symbol)`                   | `symbol.get().into()`          |
+| `Content`     | `Content`       | `None`, `Symbol(v)`, `Str(v)`      | 空内容/符号元素/文本元素         |
+| `Func`        | `Func`          | `Type(ty)`, `Symbol(symbol)`       | 构造函数/符号函数（可失败）       |
 
 ### 3.2 cast! 宏：自定义类型转换
 
-`cast!` 宏用于为自定义类型实现转换，定义在 [cast.rs#L467-L521](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L467-L521)。
+`cast!` 宏（[cast.rs#L467-L521](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L467-L521)）用于为自定义类型定义双向转换。
 
-**示例**：
+示例（[cast.rs#L467-L480](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L467-L480)）：
+
 ```rust
 cast! {
     SyntaxMode,
@@ -187,114 +164,82 @@ cast! {
 }
 ```
 
-这表示：
-- `SyntaxMode → Value`: 通过匹配变体转换为对应字符串
-- `Value → SyntaxMode`: 匹配特定字符串值转换为对应变体
+格式：`类型, self=>表达式, 字符串=>变体` 或 `绑定:类型=>表达式`。
 
-### 3.3 cast! 宏的展开过程（宏实现）
+### 3.3 cast! 宏的展开过程
 
-`cast!` 宏的实际展开由 [macros/cast.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-macros/src/cast.rs) 中的 `cast()` 函数处理，生成三个 impl 块：
+由 [macros/cast.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-macros/src/cast.rs) 中的 `cast()` 函数处理，生成三个 impl 块。
 
-1. **`Reflect` impl** ([macros/cast.rs#L82-L95](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-macros/src/cast.rs#L82-L95))：
-   - `input()`: 组合所有可接受的 `CastInfo`
-   - `output()`: 与 input 相同或使用动态类型
-   - `castable()`: 快速检查逻辑（字符串匹配 + 类型可转换检查）
+**`FromValue` impl 的展开**（[macros/cast.rs#L289-L336](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-macros/src/cast.rs#L289-L336)）：按如下优先级依次尝试：
 
-2. **`IntoValue` impl** ([macros/cast.rs#L98-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-macros/src/cast.rs#L98-L106))：
-   - 使用用户提供的表达式或 `Value::dynamic(self)`
+1. **动态类型检查**（仅 `type` 标记的 cast）：如果 `value` 是 `Value::Dyn` 且 `dynamic.is::<Self>()`，则 downcast 返回
+2. **字符串匹配**：如果 `value` 是 `Value::Str`，match 其内容对应各个 `"string" => Expr` 分支
+3. **类型级转换检查**：对每个 `binding: Ty => Expr` 分支，先调用 `<Ty as Reflect>::castable(&value)` 做预筛，通过则调用 `<Ty as FromValue>::from_value(value)?` 做实际转换
+4. **全部失败**：`Err(<Self as Reflect>::error(&value))`
 
-3. **`FromValue` impl** ([macros/cast.rs#L108-L116](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-macros/src/cast.rs#L108-L116))：
-   - 依次尝试动态类型检查、字符串匹配、类型转换
-   - 全部失败则调用 `<Self as Reflect>::error(&value)`
+注意 cast! 展开中的 **castable 预筛** 与 `Args::find()` 中的 **castable 预筛** 是不同层面的：前者发生在 `FromValue::from_value()` 内部，后者发生在 `Args` 层。两者可以叠加——`Args::find()` 先用 `T::castable()` 过滤掉不可能匹配的参数，再对被选中的参数调用 `T::from_value()`，后者内部再次对每个子类型做 castable 检查。
 
 ### 3.4 运算中的自动转换
 
-在运算过程中，`ops.rs` 中定义了大量自动转换规则。
+`ops.rs` 在算术/比较运算中定义了大量跨类型转换规则（[ops.rs#L91-L172](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/ops.rs#L91-L172)）。这些转换不走 `FromValue`，而是直接 match `(Value, Value)` 对。例如 `Int + Float → Float`、`Length + Ratio → Relative`、`Color + Length → Stroke` 等。
 
-**加法运算示例**（[ops.rs#L91-L172](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/ops.rs#L91-L172)）：
+---
+
+## 4. 参数消费与类型转换的完整流程
+
+这是本文档的核心部分。`Args` 定义在 [args.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/args.rs)。每个参数是 `Arg` 结构体（[args.rs#L514-L521](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/args.rs#L514-L521)），包含 `span: Span`、`name: Option<Str>`（命名参数有名称，位置参数为 `None`）、`value: Spanned<Value>`。
+
+### 4.1 eat()：消费第一个位置参数，不做预筛
+
 ```rust
-pub fn add(lhs: Value, rhs: Value) -> HintedStrResult<Value> {
-    Ok(match (lhs, rhs) {
-        // Int + Float → Float
-        (Int(a), Float(b)) => Float(a as f64 + b),
-        (Float(a), Int(b)) => Float(a + b as f64),
-        
-        // Length + Ratio → Relative
-        (Length(a), Ratio(b)) => Relative(b + a),
-        (Ratio(a), Length(b)) => Relative(a + b),
-        
-        // Str + Symbol → Str
-        (Str(a), Symbol(b)) => Str(format_str!("{a}{b}")),
-        
-        // Color + Length → Stroke
-        (Color(color), Length(thickness)) => {
-            Stroke::from_pair(color, thickness).into_value()
-        }
-        // ... 更多组合
-    })
-}
-```
-
-**比较运算中的自动转换**（[ops.rs#L422-L468](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/ops.rs#L422-L468)）：
-```rust
-pub fn equal(lhs: &Value, rhs: &Value) -> bool {
-    match (lhs, rhs) {
-        // Int == Float → 转换为 f64 比较
-        (&Int(i), &Float(f)) | (&Float(f), &Int(i)) => i as f64 == f,
-        
-        // Length == Relative → 比较绝对部分且相对部分为零
-        (&Length(len), &Relative(rel)) | (&Relative(rel), &Length(len)) => {
-            len == rel.abs && rel.rel.is_zero()
-        }
-        // ...
-    }
-}
-```
-
-### 3.5 参数传递中的自动转换
-
-在函数调用时，`Args` 提供了多种方法来自动转换参数，定义在 [args.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/args.rs)。
-
-**eat() 方法**（[args.rs#L112-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/args.rs#L112-L124)）：
-```rust
+// args.rs#L112-L124
 pub fn eat<T>(&mut self) -> SourceResult<Option<T>>
 where
     T: FromValue<Spanned<Value>>,
 {
     for (i, slot) in self.items.iter().enumerate() {
-        if slot.name.is_none() {
-            let value = self.items.remove(i).value;
+        if slot.name.is_none() {                          // 只看位置参数
+            let value = self.items.remove(i).value;       // 取出 Spanned<Value>
             let span = value.span;
             return T::from_value(value).at(span).map(Some);
         }
     }
-    Ok(None)
+    Ok(None)  // 没有位置参数时返回 None，不是错误
 }
 ```
 
-**named() 方法**（[args.rs#L218-L236](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/args.rs#L218-L236)）：
+**步骤**：
+1. 遍历 `items`，找到第一个 `name == None` 的位置参数
+2. 从 `items` 中 `remove` 它（**消费**，后续调用不会再看到这个参数）
+3. 调用 `T::from_value(value)`——此处 `value` 类型为 `Spanned<Value>`，走 `FromValue<Spanned<Value>> for T` impl，内部解包为 `T::from_value(value.v)`
+4. `.at(span)` 将 `HintedStrResult<T>` 转为 `SourceResult<T>`，把参数的 span 附到 `SourceDiagnostic` 上
+5. **不做 `T::castable()` 预筛**——无论值的类型是什么，直接尝试转换，失败则报错
+
+### 4.2 expect()：eat() + 缺参数报错
+
 ```rust
-pub fn named<T>(&mut self, name: &str) -> SourceResult<Option<T>>
+// args.rs#L150-L158
+pub fn expect<T>(&mut self, what: &str) -> SourceResult<T>
 where
     T: FromValue<Spanned<Value>>,
 {
-    let mut i = 0;
-    let mut found = None;
-    while i < self.items.len() {
-        if self.items[i].name.as_deref() == Some(name) {
-            let value = self.items.remove(i).value;
-            let span = value.span;
-            found = Some(T::from_value(value).at(span)?);
-        } else {
-            i += 1;
-        }
+    match self.eat()? {
+        Some(v) => Ok(v),
+        None => bail!(self.missing_argument(what)),
     }
-    Ok(found)
 }
 ```
 
-**find() 方法**（[args.rs#L177-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/args.rs#L177-L189)）：
+`expect()` 是 `eat()` 的包装。当没有位置参数时，`eat()` 返回 `Ok(None)`，`expect()` 会生成 `"missing argument: {what}"` 错误。
+
+`missing_argument()` 还有一个特殊逻辑（[args.rs#L161-L174](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/args.rs#L161-L174)）：如果用户写了 `name: value` 但参数实际上是位置参数，会提示 `"the argument '{what}' is positional"; hint: "try removing '{name}:'"` 。
+
+**注意**：`expect()` 有两种失败——"缺少参数"（`missing_argument`）和 "类型转换失败"（来自 `eat()` 内 `from_value` 的错误），两者的诊断消息不同。
+
+### 4.3 find()：按类型预筛，消费第一个可转换的位置参数
+
 ```rust
+// args.rs#L177-L189
 pub fn find<T>(&mut self) -> SourceResult<Option<T>>
 where
     T: FromValue<Spanned<Value>>,
@@ -310,291 +255,268 @@ where
 }
 ```
 
-**关键点**：
-- `eat()`：按顺序消费第一个位置参数并尝试转换
-- `find()`：查找第一个**可转换**的位置参数（使用 `T::castable()` 预检查）
-- `named()`：按名称查找参数并转换
-- 所有转换失败都会通过 `.at(span)` 附加源码位置信息
+**与 `eat()` 的关键区别**：多了一步 `T::castable(&slot.value.v)` 预筛。只有通过预筛的参数才会被消费和转换。
 
----
+**为什么需要预筛**：`find()` 的典型场景是"在多个位置参数中找到那个类型匹配的"。例如函数签名 `(spacing: Length, body: Content)`，`Content` 和 `Length` 都可能是位置参数，`find::<Content>()` 需要跳过不匹配的 `Length` 参数。如果直接用 `eat()`，遇到类型不匹配就会报错而非继续查找。
 
-## 4. 失败诊断机制
+**预筛与实际转换的关系**：`castable()` 返回 `true` 时，`from_value()` 通常也会成功，但这不是绝对的。`castable()` 检查的是值的顶层 `Value` 变体，而 `from_value()` 内部可能有更细致的校验（如 `Func` 从 `Type` 转换时要调用 `ty.constructor()?`，`castable` 只看 `Value::Type(_)` 不检查是否有构造函数）。这种情况下 `castable` 通过但 `from_value` 失败，错误会正常传播。
 
-### 4.1 HintedStrResult：带提示的错误类型
+### 4.4 all()：消费所有位置参数，不预筛，收集错误
 
-转换失败返回 `HintedStrResult<T>`，定义为：
 ```rust
-pub type HintedStrResult<T> = Result<T, HintedString>;
-```
-
-`HintedString` 包含主错误消息和可选的提示信息，定义在 [diag.rs#L519-L564](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/diag.rs#L519-L564)：
-```rust
-pub struct HintedString(EcoVec<EcoString>);
-// - 第一个元素：主错误消息
-// - 后续元素：提示信息
-```
-
-### 4.2 CastInfo::error()：智能错误生成
-
-`CastInfo::error()` 方法根据期望的类型和实际值生成友好的错误消息，定义在 [cast.rs#L309-L365](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L309-L365)。
-
-**核心逻辑**：
-```rust
-pub fn error(&self, found: &Value) -> HintedString {
-    let mut matching_type = false;
-    let mut parts = vec![];
-
-    self.walk(|info| match info {
-        CastInfo::Any => parts.push("anything".into()),
-        CastInfo::Value(value, _) => {
-            parts.push(value.repr());
-            if value.ty() == found.ty() {
-                matching_type = true;  // 类型匹配但值不匹配
-            }
-        }
-        CastInfo::Type(ty) => parts.push(eco_format!("{ty}")),
-        CastInfo::Union(_) => {}
-    });
-
-    let mut msg = format!("expected {}", repr::separated_list(&parts, "or"));
-    
-    if !matching_type {
-        msg.push_str(&format!(", found {}", found.ty()));
-    }
-
-    let mut msg: HintedString = msg.into();
-    
-    // 智能提示：根据常见错误添加提示
-    if let Value::Int(i) = found {
-        if !matching_type && parts.iter().any(|p| p == "length") {
-            msg.hint(eco_format!("a length needs a unit - did you mean {i}pt?"));
-        }
-    } else if let Value::Str(s) = found {
-        if !matching_type && parts.iter().any(|p| p == "label") {
-            if typst_syntax::is_valid_label_literal_id(s) {
-                msg.hint(eco_format!("use `<{s}>` or `label({})` to create a label", s.repr()));
-            }
-        }
-    }
-    
-    msg
-}
-```
-
-### 4.3 智能提示场景
-
-| 错误场景                | 提示示例                                                |
-|-------------------------|---------------------------------------------------------|
-| 传入整数但期望长度      | `a length needs a unit - did you mean 5pt?`             |
-| 传入字符串但期望标签    | `use <intro> or label("intro") to create a label`       |
-| 传入 decimal 但期望 float | `if loss of precision is acceptable, explicitly cast the decimal to a float with float(value)` |
-
-### 4.4 错误传播链
-
-转换失败时的错误传播路径：
-
-```
-FromValue::from_value() → HintedStrResult<T>
-       ↓ (失败)
-    HintedString { message, hints: [...] }
-       ↓ (.at(span))
-SourceResult<T> = Result<T, EcoVec<SourceDiagnostic>>
-       ↓
-    SourceDiagnostic {
-        severity: Error,
-        span: DiagSpan,      // 源码位置
-        message: EcoString,  // 主消息
-        trace: EcoVec<Tracepoint>, // 调用栈
-        hints: EcoVec<Spanned<EcoString, DiagSpan>>, // 提示
-    }
-```
-
-`.at(span)` 方法由 `At` trait 提供，定义在 [diag.rs#L498-L505](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/diag.rs#L498-L505)：
-```rust
-impl<T, S> At<T> for Result<T, S>
+// args.rs#L192-L214
+pub fn all<T>(&mut self) -> SourceResult<Vec<T>>
 where
-    S: Into<EcoString>,
+    T: FromValue<Spanned<Value>>,
 {
-    fn at(self, span: Span) -> SourceResult<T> {
-        self.map_err(|message| eco_vec![SourceDiagnostic::error(span, message)])
+    let mut list = vec![];
+    let mut errors = eco_vec![];
+    self.items.retain(|item| {
+        if item.name.is_some() {
+            return true;  // 保留命名参数
+        }
+        let span = item.value.span;
+        let spanned = Spanned::new(std::mem::take(&mut item.value.v), span);
+        match T::from_value(spanned).at(span) {
+            Ok(val) => list.push(val),
+            Err(diags) => errors.extend(diags),
+        }
+        false  // 移除所有位置参数
+    });
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(list)
+}
+```
+
+**行为**：
+- 遍历所有位置参数，对每个都调用 `from_value()` 尝试转换
+- **不做 `castable()` 预筛**——成功转的进 `list`，失败的攒到 `errors`
+- 用 `retain()` 一边遍历一边移除：命名参数保留，位置参数全部移除
+- 如果有任何转换失败，一次性返回所有错误（`EcoVec<SourceDiagnostic>`）；全部成功则返回 `Vec<T>`
+- 不匹配的参数不会被跳过，而是直接报错
+
+### 4.5 named()：按名称消费命名参数，取最后一个
+
+```rust
+// args.rs#L218-L236
+pub fn named<T>(&mut self, name: &str) -> SourceResult<Option<T>>
+where
+    T: FromValue<Spanned<Value>>,
+{
+    // We don't quit once we have a match because when multiple matches
+    // exist, we want to remove all of them and use the last one.
+    let mut i = 0;
+    let mut found = None;
+    while i < self.items.len() {
+        if self.items[i].name.as_deref() == Some(name) {
+            let value = self.items.remove(i).value;
+            let span = value.span;
+            found = Some(T::from_value(value).at(span)?);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(found)
+}
+```
+
+**行为**：
+- 按名称查找命名参数
+- **不做 `castable()` 预筛**——找到就尝试转换，失败就报错
+- 当存在多个同名参数时，**移除所有同名参数，取最后一个**——循环不会提前退出
+- 转换失败时通过 `?` 提前返回错误
+
+### 4.6 named_or_find()：先查命名参数，再按类型查找位置参数
+
+```rust
+// args.rs#L239-L247
+pub fn named_or_find<T>(&mut self, name: &str) -> SourceResult<Option<T>>
+where
+    T: FromValue<Spanned<Value>>,
+{
+    match self.named(name)? {
+        Some(value) => Ok(Some(value)),
+        None => self.find(),
     }
 }
 ```
 
-对于 `HintedStrResult`，`.at(span)` 会保留所有提示信息 ([diag.rs#L566-L575](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/diag.rs#L566-L575))：
+**行为**：先调用 `named(name)` 查找命名参数。如果找到就返回；如果没找到（返回 `None`，不是错误），再 fallback 到 `find()` 按类型预筛位置参数。
+
+### 4.7 五种方法的对比
+
+| 方法              | 参数筛选条件                       | castable 预筛 | 消费范围                    | 无参数时返回       |
+|------------------|-----------------------------------|--------------|----------------------------|-------------------|
+| `eat::<T>()`     | 第一个位置参数                     | ❌ 无         | 1 个位置参数               | `Ok(None)`        |
+| `expect::<T>()`  | 第一个位置参数                     | ❌ 无         | 1 个位置参数               | 缺参数错误         |
+| `find::<T>()`    | 第一个 `castable` 的位置参数       | ✅ 有         | 1 个位置参数               | `Ok(None)`        |
+| `all::<T>()`     | 全部位置参数                       | ❌ 无         | 所有位置参数               | `Ok(vec![])`      |
+| `named::<T>(n)`  | 名称为 `n` 的命名参数（取最后一个） | ❌ 无         | 所有同名命名参数           | `Ok(None)`        |
+
+---
+
+## 5. 失败诊断机制
+
+### 5.1 错误类型的层级
+
+转换过程涉及三种错误类型，层级由低到高：
+
+```
+HintedStrResult<T> = Result<T, HintedString>     // from_value 直接产出
+       ↓ .at(span)
+SourceResult<T>   = Result<T, EcoVec<SourceDiagnostic>>  // 最终交给引擎
+```
+
+`HintedString`（[diag.rs#L519-L564](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/diag.rs#L519-L564)）内部用 `EcoVec<EcoString>` 存储：第一个元素是主消息，后续元素是提示。
+
+### 5.2 from_value 失败 → HintedString 的生成
+
+当 `FromValue::from_value()` 收到不匹配的值时，调用 `<Self as Reflect>::error(&v)`。`Reflect::error()` 的默认实现（[cast.rs#L55-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L55-L57)）委托给 `Self::input().error(found)`。
+
+`CastInfo::error()`（[cast.rs#L309-L365](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L309-L365)）的完整逻辑：
+
+1. **walk `CastInfo`**：递归展开 `Union`，收集所有叶子节点的描述到 `parts`
+2. **构造主消息**：`"expected {separated_list(parts, "or")}"` + 如果实际值类型不在期望中，追加 `", found {found.ty()}"`
+3. **智能提示**：根据 `found` 值和期望类型添加上下文相关提示
+
+智能提示场景：
+
+| 实际值          | 期望含        | 提示示例                                                          |
+|----------------|--------------|------------------------------------------------------------------|
+| `Value::Int(i)` | `"length"`   | `a length needs a unit - did you mean {i}pt?`                    |
+| `Value::Str(s)` | `"label"`    | `use <{s}> or label({s}) to create a label`                      |
+| `Value::Decimal` | `"float"`   | `if loss of precision is acceptable, explicitly cast the decimal to a float with float(value)` |
+
+### 5.3 HintedString → SourceDiagnostic 的传播
+
+`.at(span)` 有两个 impl（[diag.rs#L498-L575](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/diag.rs#L498-L575)）：
+
+**泛型 `Result<T, S: Into<EcoString>>`**（[diag.rs#L498-L505](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/diag.rs#L498-L505)）：
 ```rust
-impl<T> At<T> for HintedStrResult<T> {
-    fn at(self, span: Span) -> SourceResult<T> {
-        self.map_err(|err| {
-            let mut components = err.0.into_iter();
-            let message = components.next().unwrap();
-            let diag = SourceDiagnostic::error(span, message).with_hints(components);
-            eco_vec![diag]
-        })
-    }
+fn at(self, span: Span) -> SourceResult<T> {
+    self.map_err(|message| eco_vec![SourceDiagnostic::error(span, message)])
 }
+```
+只保留主消息，不保留提示。
+
+**`HintedStrResult<T>` 专用**（[diag.rs#L566-L575](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/diag.rs#L566-L575)）：
+```rust
+fn at(self, span: Span) -> SourceResult<T> {
+    self.map_err(|err| {
+        let mut components = err.0.into_iter();
+        let message = components.next().unwrap();
+        let diag = SourceDiagnostic::error(span, message).with_hints(components);
+        eco_vec![diag]
+    })
+}
+```
+第一个元素做主消息，其余全部做提示。**因为 `from_value` 返回的是 `HintedStrResult`，所以 `Args` 方法中的 `.at(span)` 走这个 impl，提示信息不会丢失。**
+
+### 5.4 完整的错误传播路径
+
+以 `eat::<f64>()` 为例，当传入 `Value::Bool(true)` 时：
+
+```
+eat() 找到第一个位置参数 Value::Bool(true)
+  ↓
+T::from_value(Spanned<Value>{ v: Value::Bool(true), span })
+  ↓ FromValue<Spanned<Value>> for f64 → f64::from_value(Value::Bool(true))
+  ↓ (解包 spanned，调用 f64::from_value(Value::Bool(true)))
+  ↓
+primitive! 展开的 from_value:
+  match Value::Bool(true) {
+    Value::Float(v) => ...    // 不匹配
+    Value::Int(v) => ...      // 不匹配
+    v => Err(<f64 as Reflect>::error(&v))  // 走这里
+  }
+  ↓
+Reflect::error(&Value::Bool(true))
+  → Self::input().error(&Value::Bool(true))
+  → CastInfo::Type(Type::of::<f64>()).error(&Value::Bool(true))
+  ↓
+CastInfo::error() 生成:
+  parts = ["float"]
+  matching_type = false  (bool ≠ float)
+  msg = "expected float, found boolean"
+  无智能提示匹配（found 是 Bool 不是 Int/Str/Decimal）
+  ↓
+返回 Err(HintedString { "expected float, found boolean" })
+  ↓
+.at(span)
+  ↓ HintedStrResult<T> 专用的 At impl
+SourceDiagnostic::error(span, "expected float, found boolean")
+  ↓
+返回 Err(eco_vec![SourceDiagnostic { severity: Error, span, message, hints: [] }])
 ```
 
 ---
 
-## 5. 三者协作流程
+## 6. 三者协作总结
 
-### 5.1 完整的转换流程
+### 6.1 不同消费方法中四步骤的参与情况
 
-当函数调用需要将 `Value` 转换为目标类型 `T` 时，完整流程如下：
+一次参数消费涉及的四个步骤：
 
-```
-用户传入 Value
-    ↓
-Args.eat() / named() / find()
-    ↓
-1. T::castable(&value)   [快速检查]
-    ├─ 是 → 继续
-    └─ 否 → find() 跳过，eat()/named() 继续尝试
-    ↓
-2. T::from_value(value)  [实际转换]
-    ├─ 成功 → Ok(T)
-    └─ 失败 → HintedString（调用 T::error() 生成）
-    ↓
-3. .at(span)             [附加位置信息]
-    └─ SourceDiagnostic { span, message, hints }
-    ↓
-4. .trace(...)           [可选：添加调用栈]
-    ↓
-返回给用户
-```
+| 步骤            | 作用                          | eat | expect | find | all | named |
+|----------------|------------------------------|-----|--------|------|-----|-------|
+| ① 参数筛选      | 按位置/名称/类型筛选参数        | 位置 | 位置    | 位置+castable | 位置 | 名称   |
+| ② 消费移除      | 从 items 中 remove/retain     | 1个 | 1个    | 1个  | 全部 | 同名全部 |
+| ③ 实际转换      | `T::from_value(value)`        | ✅  | ✅     | ✅   | ✅  | ✅    |
+| ④ 诊断传播      | `.at(span)` → SourceDiagnostic | ✅  | ✅     | ✅   | ✅  | ✅    |
 
-### 5.2 以 f64 转换为例的协作
+**关键差异在步骤①**：
+- `find()` 在筛选阶段就调用 `T::castable()` 做预筛，跳过不可能匹配的参数
+- `eat()` / `expect()` / `all()` / `named()` 不做预筛，拿到参数就直接转换
 
-当需要将 `Value` 转换为 `f64` 时：
-
-1. **`Reflect::castable()`** 检查（[value.rs#L592-L596](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L592-L596)）：
-   ```rust
-   fn castable(value: &Value) -> bool {
-       matches!(value, Value::Float(_) | Value::Int(_))
-   }
-   ```
-
-2. **`FromValue::from_value()`** 转换（[value.rs#L604-L612](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L604-L612)）：
-   ```rust
-   fn from_value(value: Value) -> HintedStrResult<Self> {
-       match value {
-           Value::Float(v) => Ok(v),
-           Value::Int(v) => Ok(v as f64),  // 自动转换
-           v => Err(<Self as Reflect>::error(&v)),
-       }
-   }
-   ```
-
-3. **`Reflect::error()`** 生成错误（[cast.rs#L55-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L55-L57)）：
-   ```rust
-   fn error(found: &Value) -> HintedString {
-       Self::input().error(found)
-   }
-   ```
-
-4. **`CastInfo::error()`** 智能生成消息：
-   - `input()` 返回 `CastInfo::Type(Type::of::<f64>())`
-   - 期望类型为 `float`
-   - 如果传入 `Value::Bool(true)`，错误消息为：`"expected float, found boolean"`
-
-### 5.3 动态类型转换流程
-
-对于动态类型（通过 `Value::Dyn` 存储），转换流程如下（[macros/cast.rs#L310-L318](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-macros/src/cast.rs#L310-L318)）：
-
-```rust
-if let Value::Dyn(dynamic) = &value {
-    if let Some(concrete) = dynamic.downcast::<Self>() {
-        return Ok(concrete.clone());
-    }
-}
-```
-
-`Dynamic::downcast()` 使用 `Any` trait 进行类型检查，定义在 [value.rs#L515-L518](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/value.rs#L515-L518)：
-```rust
-pub fn downcast<T: 'static>(&self) -> Option<&T> {
-    let inner: &dyn Bounds = &*self.0;
-    (inner as &dyn Any).downcast_ref()
-}
-```
-
----
-
-## 6. 关键设计要点
-
-### 6.1 为什么不使用标准的 TryFrom/From？
-
-[cast.rs#L30-L32](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L30-L32) 给出了明确的解释：
-> We can't use `TryFrom<Value>` due to conflicting impls. We could use `From<T> for Value`, but that inverses the impl and leads to tons of `.into()` all over the place that become hard to decipher.
-
-- **`TryFrom<Value>`**：会与标准库的 blanket impl 冲突
-- **`From<T> for Value`**：会导致大量 `.into()` 调用，代码可读性差
-
-### 6.2 castable() 的性能意义
-
-[cast.rs#L42-L44](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L42-L44) 说明：
-> This exists for performance. The check could also be done through the [`CastInfo`], but it would be much more expensive (heap allocation + dynamic checks instead of optimized machine code for each type).
-
-`castable()` 是编译期生成的优化检查，避免了通过 `CastInfo` 进行堆分配和动态检查。
-
-### 6.3 Spanned<T> 的透明转换
-
-`Spanned<T>`（带源码位置的值）自动委托给内部类型的转换实现，定义在 [cast.rs#L74-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/122-typst/crates/typst-library/src/foundations/cast.rs#L74-L86)：
-```rust
-impl<T: Reflect> Reflect for Spanned<T> {
-    fn input() -> CastInfo { T::input() }
-    fn output() -> CastInfo { T::output() }
-    fn castable(value: &Value) -> bool { T::castable(value) }
-}
-```
-
-这使得位置信息在转换过程中被透明处理，不会干扰类型转换逻辑。
-
----
-
-## 7. 总结
-
-### 7.1 三个核心组件的职责
-
-| 组件          | 职责                                        | 关键类型/函数                  |
-|---------------|-------------------------------------------|-------------------------------|
-| **基础类型**  | 定义值的表示和类型元信息                    | `Value`, `Type`, `NativeType` |
-| **自动转换**  | 定义转换规则和执行转换                      | `Reflect`, `IntoValue`, `FromValue`, `primitive!`, `cast!` |
-| **失败诊断**  | 生成友好的错误消息和智能提示                | `CastInfo::error()`, `HintedString`, `SourceDiagnostic` |
-
-### 7.2 协作关系图
+### 6.2 协作关系图
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     基础类型系统                         │
-│  Value 枚举 ──→ ty() ──→ Type  ──→ NativeTypeData       │
-│  (运行时值)        (类型标识)    (元信息:名称/文档/作用域)│
-└──────────────────────┬──────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                     基础类型系统                           │
+│  Value 枚举 ──→ ty() ──→ Type ──→ NativeTypeData         │
+│  (运行时值)        (类型标识)    (元信息:名称/文档/作用域)  │
+└──────────────────────┬───────────────────────────────────┘
                        │
-┌──────────────────────▼──────────────────────────────────┐
-│                     自动转换机制                         │
-│  Reflect::castable()  →  快速检查                        │
-│  IntoValue::into_value() → Rust→Value（不可失败）        │
-│  FromValue::from_value() → Value→Rust（可失败）          │
-│  primitive! / cast! 宏 → 批量生成 impl                   │
-│  ops.rs 中的运算 → 跨类型运算的隐式转换                  │
-│  Args::eat/find/named → 参数解析时的自动转换             │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────┐
-│                     失败诊断机制                         │
-│  Reflect::error() → 委托给 CastInfo::error()             │
-│  CastInfo::error() → 生成期望/实际对比消息               │
-│  HintedString → 主消息 + 智能提示                        │
-│  .at(span) → 附加源码位置 → SourceDiagnostic            │
-│  .trace() → 添加调用栈追踪                               │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────▼───────────────────────────────────┐
+│               Args 参数消费层                              │
+│  eat()   ── 位置参数，直接转换，不预筛                     │
+│  expect() ── eat() + 缺参数报错                           │
+│  find()  ── 位置参数，castable 预筛后转换                  │
+│  all()   ── 全部位置参数，直接转换，攒错误                  │
+│  named() ── 按名称查找命名参数，取最后一个                  │
+│  named_or_find() ── named + find 的组合                   │
+└──────────────────────┬───────────────────────────────────┘
+                       │ 调用 T::from_value(value)
+┌──────────────────────▼───────────────────────────────────┐
+│              FromValue 转换层                              │
+│  FromValue<Spanned<Value>> for T ── 解包 span，委托      │
+│  FromValue<Value> for T ── 实际转换逻辑                   │
+│  primitive! 展开的 from_value ── match + 自动转换分支     │
+│  cast! 展开的 from_value ── dynamic→str→type 级联匹配    │
+│    ↳ 内部也有 castable 预筛（对每个子类型检查）            │
+└──────────────────────┬───────────────────────────────────┘
+                       │ 失败时调用 <Self as Reflect>::error()
+┌──────────────────────▼───────────────────────────────────┐
+│              失败诊断层                                    │
+│  Reflect::error() → CastInfo::error()                    │
+│  CastInfo::error() ── walk CastInfo → 期望类型列表        │
+│    ↳ 智能提示: Int→length / Str→label / Decimal→float    │
+│  HintedString ── 主消息 + hints                          │
+│  .at(span) ── HintedStrResult 专用 impl → SourceDiagnostic│
+│    ↳ 保留所有 hints（不会丢失提示）                        │
+└──────────────────────────────────────────────────────────┘
 ```
 
-### 7.3 设计亮点
+### 6.3 设计要点
 
-1. **三层 Trait 分离**：元信息（Reflect）、不可失败转换（IntoValue）、可失败转换（FromValue）各司其职
-2. **快速检查路径**：`castable()` 提供编译期优化的可转换性检查
-3. **智能错误生成**：`CastInfo::error()` 根据常见错误模式自动提供修复提示
-4. **宏驱动的实现**：`primitive!` 和 `cast!` 宏大幅减少重复代码
-5. **位置透明传递**：`Spanned<T>` 和 `.at(span)` 确保错误信息总能定位到源码
+1. **两层 castable 的分工**：`Args::find()` 的 castable 预筛用于在多个参数中"挑选"合适的那个；`cast!` 展开中的 castable 预筛用于在多个可选转换路径中"选择"匹配的分支。两者解决不同层面的问题。
+
+2. **eat 不预筛是故意的**：`eat()` 假设调用方已经知道下一个位置参数的预期类型，不需要跳过。如果类型不匹配，说明用户传错了参数，应该立即报错。
+
+3. **Spanned<Value> 的双层解包**：`Args` 中的值已经是 `Spanned<Value>`，传给 `T::from_value(value)` 时走 `FromValue<Spanned<Value>> for T` 解包为 `T::from_value(value.v)`。span 在调用方的 `.at(span)` 中被使用，不参与 `from_value` 的转换逻辑。
+
+4. **HintedStrResult 的 At impl 保留提示**：普通的 `StrResult` 通过 `.at(span)` 会丢失提示，但 `from_value` 返回 `HintedStrResult`，其 `At` impl 会拆解 `HintedString` 的 vec，第一个做消息、其余做 hints，确保智能提示不丢失。
+
+5. **named 取最后一个同名参数**：这模仿了命令行参数和 CSS 的"后者覆盖前者"语义。循环不提前退出，确保所有同名参数都被移除。
