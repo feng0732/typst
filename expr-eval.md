@@ -663,7 +663,7 @@ pub fn eval_closure(...) -> SourceResult<Value> {
         vm.define(name, func.clone());
     }
 
-    // 5. 绑定参数
+    // 5. 绑定参数（详见下方）
     // 6. 求值函数体
     let output = body.eval(&mut vm)?;
 
@@ -675,6 +675,84 @@ pub fn eval_closure(...) -> SourceResult<Value> {
 - **不继承调用方的任何作用域**：`Scopes::new(None)` 且 `scopes.top = closure.captured.clone()`
 - 闭包只能访问**捕获的变量 + 参数 + 递归自引用**
 - 这就是词法闭包的本质：函数体中的自由变量在**定义时**就已经确定了绑定
+
+#### 7.3.1 闭包参数绑定详细流程
+
+`eval_closure` 中参数绑定的核心代码（见 [call.rs#L647-L695](file:///d:/fz/0601-2/solo-dogfeeding/code/121-typst/crates/typst-eval/src/call.rs#L647-L695)）：
+
+```rust
+let num_pos_args = args.to_pos().len();
+let sink_size = num_pos_args.checked_sub(closure.num_pos_params);
+
+let mut sink = None;
+let mut sink_pos_values = None;
+let mut defaults = closure.defaults.iter();
+for p in params.children() {
+    match p {
+        // 位置参数
+        ast::Param::Pos(pattern) => match pattern {
+            ast::Pattern::Normal(ast::Expr::Ident(ident)) => {
+                vm.define(ident, args.expect::<Value>(&ident)?)
+            }
+            pattern => {
+                crate::destructure(&mut vm, pattern,
+                    args.expect::<Value>("pattern parameter")?)?;
+            }
+        },
+        // 展开参数（argument sink）
+        ast::Param::Spread(spread) => {
+            sink = Some(spread.sink_ident());
+            if let Some(sink_size) = sink_size {
+                sink_pos_values = Some(args.consume(sink_size)?);
+            }
+        }
+        // 命名参数
+        ast::Param::Named(named) => {
+            let name = named.name();
+            let default = defaults.next().unwrap();
+            let value =
+                args.named::<Value>(&name)?.unwrap_or_else(|| default.clone());
+            vm.define(name, value);
+        }
+    }
+}
+
+// 处理 argument sink 的剩余参数
+if let Some(sink) = sink {
+    let mut remaining_args = args.take();
+    if let Some(sink_name) = sink {
+        if let Some(sink_pos_values) = sink_pos_values {
+            remaining_args.items.extend(sink_pos_values);
+        }
+        vm.define(sink_name, remaining_args);
+    }
+}
+
+args.finish()?;
+```
+
+**参数绑定按参数声明顺序逐一处理**：
+
+| 参数类型 | 绑定方式 |
+|---|---|
+| `Pos(Ident)` | `args.expect::<Value>(&ident)` — 从 `args` 中消费第一个位置参数并绑定 |
+| `Pos(Pattern)` | `args.expect` 取值 + `destructure` 解构绑定（支持 `(a, b)` 模式） |
+| `Spread(sink_ident)` | 记录 sink，延迟处理。先计算 `sink_size = 实际位置参数数 - 声明的位置参数数`，然后用 `args.consume(sink_size)` 消费多余的位置参数 |
+| `Named(name)` | `args.named::<Value>(&name)` 查找命名参数；未提供则使用 `defaults` 中的默认值（定义时已求值） |
+
+**sink 参数的微妙处理**：
+
+1. `sink_size` 在参数绑定循环之前就计算好了（`num_pos_args - num_pos_params`）
+2. 在循环中遇到 `Spread` 参数时，只记录 sink 标识符，不立即消费参数
+3. 循环结束后，`args.take()` 拿走所有剩余参数（包括未消费的命名参数）
+4. 如果 sink 有名字（`sink_ident` 是 `Some`），将剩余参数 + 多余的位置参数打包成 `Args` 绑定到该名字
+5. 如果 sink 没名字（裸 `..`），剩余参数仍被 `args.take()` 消费掉（确保 `args.finish()` 通过），但不绑定到任何变量
+
+**命名参数默认值的使用**：`closure.defaults` 是一个与 AST 中命名参数一一对应的 `Vec<Value>`。在参数绑定循环中，`defaults.iter()` 按顺序逐一取出。`args.named()` 如果在 `args` 中找到了对应的命名参数就消费并返回它；如果没找到，就用 `default.clone()` 作为值。这确保了：
+- 调用方显式传入的命名参数优先于默认值
+- 默认值在**定义时**求值一次，调用时只是 clone
+
+**参数消费模型**：`Args` 的消费是**破坏性的**——`expect`、`named`、`consume`、`take` 都会从 `items` 中移除已处理的参数。最终 `args.finish()` 检查是否还有未消费的参数，有则报错"unexpected argument"。
 
 ### 7.4 context 表达式的闭包
 
@@ -703,6 +781,134 @@ impl Eval for ast::Contextual<'_> {
 - `Capturer::Context` 而非 `Capturer::Function`
 - `ClosureNode::Context` 存储的是 Markup 节点而非 Closure 节点
 - 无参数
+
+### 7.5 函数调用的完整链路
+
+一次函数调用 `f(a, b)` 涉及的调用链：
+
+```
+FuncCall::eval (call.rs#L23-L81)
+  │
+  ├─ 非字段访问调用：
+  │   1. callee.eval(vm) → Value
+  │   2. cast::<Func>() → Func
+  │   3. args.eval(vm) → Args（参数求值，见 §7.6）
+  │   4. call_func(vm, func, args, span)
+  │      └─ func.call(engine, context, args)
+  │         └─ func.call_impl(engine, context, args)  (func.rs#L324-L364)
+  │            ├─ Native → native.function(engine, context, &mut args)
+  │            ├─ Element → elem.construct(engine, &mut args)
+  │            ├─ Closure → eval_closure(func, closure, ..., args)  (call.rs#L600)
+  │            ├─ Plugin → func.call(inputs)
+  │            └─ With → 预置 with 参数 + 递归 call
+  │
+  └─ 字段访问调用（如 arr.push(4)）：
+      1. 检测到 callee 是 FieldAccess
+      2. 判断是否是可变方法（is_mutating_method）
+         ├─ 是可变方法 → maybe_resolve_mutating(vm, target, field, args, span)
+         │   2a. 先求值参数 args.eval(vm)
+         │   2b. target.access(vm) → &mut Value  （获取可变引用）
+         │   2c. call_method_mut(&mut value, method, args, span)
+         │       → 直接返回结果，不走 Func::call
+         │   2d. 如果 target 不是 Array/Dict，回退到普通调用路径
+         └─ 不是可变方法 → target.eval(vm) → Value
+      3. eval_field_callee(vm, access, field, target)
+         ├─ 方法查找：target.ty().scope().get(field)
+         │   → 找到 → FieldCallee::Method(func, target)
+         │   → args.insert(0, target_span, target)  （self 作为首参）
+         │   → call_func(vm, func, args, span)
+         ├─ 关联函数查找（Symbol/Func/Type/Module）：
+         │   → target.field(field) → FieldCallee::Func(func)
+         │   → call_func(vm, func, args, span)
+         └─ 字典字段调用：报错"cannot directly call dictionary keys as functions"
+```
+
+**关键设计**：
+
+1. **可变方法先于普通调用处理**：`maybe_resolve_mutating` 在 `eval_field_callee` 之前被调用，因为可变方法需要通过 `Access` trait 获取 `&mut Value`，而普通方法只需 `Eval` 返回的 `Value` 副本。两者不能混用——一旦 `access(vm)` 获取了可变借用，就无法再调用 `args.eval(vm)`，所以参数必须提前求值。
+
+2. **方法调用隐式传入 self**：当 `eval_field_callee` 返回 `FieldCallee::Method` 时，`target` 被插入 `args` 的第一个位置（`args.insert(0, target_span, target)`），这样 Rust 侧的 native 函数签名统一为 `(engine, context, &self, ...)` 形式。
+
+3. **字典字段不能直接调用**：`eval_field_callee` 对字典和命名参数（`Args`）做了专门拦截——即使字典中存着一个函数值，也不能用 `dict.key()` 语法调用它，因为这会和类型方法产生歧义。需要用 `(dict.key)(args)` 显式调用。
+
+4. **Func::With 的预置参数**：`Func::with` 创建一个 `FuncInner::With` 变体，把预置参数存在 `Arc<(Func, Args)>` 中。调用时，`with.1.items` 被前置到实际参数之前（`args.items = with.1.items.iter().cloned().chain(args.items).collect()`），然后委托给底层函数。
+
+5. **调用深度检查**：`FuncCall::eval` 开头先调用 `vm.engine.route.check_call_depth()`，防止无限递归。
+
+### 7.6 参数求值与展开：`Args::eval`
+
+`ast::Args` 的 `Eval` 实现（见 [call.rs#L367-L417](file:///d:/fz/0601-2/solo-dogfeeding/code/121-typst/crates/typst-eval/src/call.rs#L367-L417)）将 AST 参数节点转换为运行时 `Args`：
+
+```rust
+impl Eval for ast::Args<'_> {
+    type Output = Args;
+
+    fn eval(self, vm: &mut Vm) -> SourceResult<Self::Output> {
+        let mut items = EcoVec::with_capacity(self.items().count());
+
+        for arg in self.items() {
+            let span = arg.span();
+            match arg {
+                ast::Arg::Pos(expr) => {
+                    items.push(Arg {
+                        span,
+                        name: None,
+                        value: Spanned::new(expr.eval(vm)?, expr.span()),
+                    });
+                }
+                ast::Arg::Named(named) => {
+                    let expr = named.expr();
+                    items.push(Arg {
+                        span,
+                        name: Some(named.name().get().clone().into()),
+                        value: Spanned::new(expr.eval(vm)?, expr.span()),
+                    });
+                }
+                ast::Arg::Spread(spread) => match spread.expr().eval(vm)? {
+                    Value::None => {}
+                    Value::Array(array) => {
+                        items.extend(array.into_iter().map(|value| Arg {
+                            span,
+                            name: None,
+                            value: Spanned::new(value, span),
+                        }));
+                    }
+                    Value::Dict(dict) => {
+                        items.extend(dict.into_iter().map(|(key, value)| Arg {
+                            span,
+                            name: Some(key),
+                            value: Spanned::new(value, span),
+                        }));
+                    }
+                    Value::Args(args) => items.extend(args.items),
+                    v => bail!(spread.span(), "cannot spread {}", v.ty()),
+                },
+            }
+        }
+
+        Ok(Args { span: Span::detached(), items })
+    }
+}
+```
+
+**三种参数类型的处理**：
+
+| 语法 | AST 节点 | 运行时 `Arg` |
+|---|---|---|
+| `f(1, 2)` | `Arg::Pos(expr)` | `{ name: None, value: ... }` |
+| `f(x: 1)` | `Arg::Named(named)` | `{ name: Some("x"), value: ... }` |
+| `f(..arr)` | `Arg::Spread(spread)` | 展开为多个 `Arg` |
+
+**展开（spread）的规则**：
+- `..none` — 忽略，不产生任何参数
+- `..array` — 展开为多个**位置参数**（`name: None`）
+- `..dict` — 展开为多个**命名参数**（`name: Some(key)`）
+- `..args` — 直接拼接 `args.items`（保留原始的 name/value 结构）
+- 其他类型 — 报错
+
+**参数求值顺序**：参数按源码中从左到右的顺序逐一求值，**没有**惰性求值或重排序。每个参数表达式在被遍历到时立即求值。
+
+**位置参数与命名参数的统一存储**：`Args.items` 是一个扁平的 `EcoVec<Arg>`，位置参数和命名参数混在一起。消费时通过 `slot.name.is_none()` 区分。`Args::expect()` 从中找第一个 `name: None` 的参数消费，`Args::named()` 找对应 `name` 的参数消费。
 
 ---
 
@@ -785,20 +991,95 @@ Expr::CodeBlock(CodeBlock { body: Code })
 **调用 `f(5)` 时**：
 
 ```
-1. eval "f" → Func (从 scopes 查找)
-2. eval Args "(5)" → Args { items: [Arg { name: None, value: Int(5) }] }
-3. call_func → Func::call → eval_closure
+1. FuncCall::eval:
+   a. callee = "f" (Ident)，不是 FieldAccess，走普通调用路径
+   b. callee.eval(vm) → Func (从 scopes 查找)
+   c. cast::<Func>() → Func (closure 类型)
+   d. args.eval(vm) → Args { items: [Arg { name: None, value: Int(5) }] }
+
+2. call_func → Func::call → call_impl:
+   匹配 FuncInner::Closure → eval_closure(func, closure, ..., args)
+
+3. eval_closure:
    a. scopes = Scopes::new(None)  // 不继承调用方
    b. scopes.top = closure.captured.clone()  // { "outer": Int(10) }
-   c. vm.define("x", Int(5))  // 绑定参数
-   d. eval "x + outer"
+   c. 创建新 Vm
+   d. 无函数名，跳过递归自引用
+   e. 参数绑定循环：
+      - Param::Pos(Ident("x")) → args.expect::<Value>("x") → Int(5)
+        → vm.define("x", Int(5))
+   f. 无 sink 参数
+   g. args.finish() → Ok（无多余参数）
+   h. eval body "x + outer"
       - 查找 x → 当前 top → Int(5)
       - 查找 outer → 当前 top（captured）→ Int(10)
       - 5 + 10 = 15
 4. 返回 Value::Int(15)
 ```
 
-### 8.5 闭包中的变量遮蔽与不可修改
+### 8.5 带完整参数类型的闭包调用
+
+```
+源码:
+#let f = (a, b: 10, ..sink) => {
+  (a, b, sink.pos(), sink.named())
+}
+#f(1, c: 20, 2, 3)
+// 结果: (1, 10, (2, 3), (c: 20))
+```
+
+**定义 `f` 时**：
+
+```
+1. 求值命名参数默认值：defaults = [Value::Int(10)]  // b 的默认值
+2. CapturesVisitor 分析：无外部自由变量
+3. Closure { node, defaults: [Int(10)], captured: Scope::new(), num_pos_params: 1 }
+```
+
+**调用 `f(1, c: 20, 2, 3)` 时**：
+
+```
+1. args.eval(vm) → Args {
+     items: [
+       Arg { name: None, value: Int(1) },      // 1
+       Arg { name: Some("c"), value: Int(20) }, // c: 20
+       Arg { name: None, value: Int(2) },       // 2
+       Arg { name: None, value: Int(3) },       // 3
+     ]
+   }
+
+2. eval_closure 参数绑定:
+   num_pos_args = 3（位置参数：1, 2, 3）
+   num_pos_params = 1（声明的位置参数：a）
+   sink_size = 3 - 1 = 2
+
+   参数绑定循环:
+   - Param::Pos(Ident("a")) → args.expect("a") → Int(1)
+     args 剩余: [Arg(c:20), Arg(2), Arg(3)]
+     vm.define("a", Int(1))
+
+   - Param::Named("b") → args.named("b") → None（没找到）
+     default = defaults.next() → Int(10)
+     vm.define("b", Int(10))
+     args 剩余不变: [Arg(c:20), Arg(2), Arg(3)]
+
+   - Param::Spread(sink_ident=Some("sink")) →
+     sink = Some(Some("sink"))
+     sink_pos_values = args.consume(2) → [Arg(2), Arg(3)]
+     args 剩余: [Arg(c:20)]
+
+   循环结束后处理 sink:
+   - remaining_args = args.take() → Args { items: [Arg(c:20)] }
+   - remaining_args.items.extend(sink_pos_values)
+     → remaining_args = Args { items: [Arg(c:20), Arg(2), Arg(3)] }
+   - vm.define("sink", remaining_args)
+
+   args.finish() → Ok
+
+3. eval body → (1, 10, (2, 3), (c: 20))
+```
+
+### 8.6 闭包中的变量遮蔽与不可修改
 
 ```
 源码:
@@ -812,7 +1093,7 @@ Expr::CodeBlock(CodeBlock { body: Code })
 - `x` 被捕获为 `BindingKind::Captured(Function)`
 - `x = 2` 尝试 `Binding::write()` → 失败，因为 Captured 绑定是只读的
 
-### 8.6 闭包修改可变引用（数组/字典的 in-place 方法）
+### 8.7 闭包中调用可变方法：报错
 
 ```
 源码:
@@ -821,9 +1102,48 @@ Expr::CodeBlock(CodeBlock { body: Code })
 #f()
 ```
 
-这里 `arr` 被捕获的是**值的 clone**，所以 `arr.push(4)` 修改的是捕获的副本，不影响外部的 `arr`。Typst 的闭包是**值捕获**（capture by value），不是引用捕获。
+这段代码**会报错**，而非静默修改副本。错误信息为：
 
-### 8.7 for 循环中的作用域
+```
+variables from outside the function are read-only and cannot be modified
+```
+
+**详细分析**：
+
+1. `arr` 被闭包捕获为 `BindingKind::Captured(Function)`
+2. 调用 `f()` 时，`arr.push(4)` 是一个字段访问函数调用
+3. `FuncCall::eval` 检测到 `push` 是可变方法（`is_mutating_method("push") == true`）
+4. 进入 `maybe_resolve_mutating`，先求值参数，再调用 `target.access(vm)` 获取可变引用
+5. `Ident::access` → `vm.scopes.get_mut("arr")` → `Binding::write()`
+6. **`Binding::write()` 发现 `kind == Captured(Function)`，报错！**
+
+也就是说，**闭包捕获的变量不仅不能被赋值语句修改，也不能被可变方法修改**。两者走的是同一个 `Binding::write()` 检查点。
+
+如果确实需要在闭包内修改外部数组，正确做法是把数组放在字典中，通过字典字段间接修改：
+
+```
+源码:
+#let data = (arr: (1, 2, 3))
+#let f = () => { data.arr.push(4) }
+#f()
+// data.arr 现在是 (1, 2, 3, 4)
+```
+
+**这为什么能工作？**
+
+1. `data` 被捕获为 `BindingKind::Captured(Function)`——值类型是 `Value::Dict`
+2. `data.arr.push(4)` 被解析为 `Expr::FuncCall`，callee 是嵌套的字段访问
+3. 外层 `data.arr` 是一个普通字段访问求值（走 `Eval`，不是 `Access`），返回字典中 `arr` 字段的**值副本**
+4. 但 `data.arr.push(4)` 整体是一个方法调用，`push` 是可变方法
+5. `FuncCall::eval` 检测到 `push` 是可变方法后，对 `data.arr` 的 target（即 `data.arr` 这个 FieldAccess 表达式）调用 `target.access(vm)`
+6. `FieldAccess::access` → `access_dict(vm, access)` → 先 `access.target().access(vm)` 获取 `data` 的可变引用
+7. 这里关键来了：`data` 在闭包的作用域中是 `Captured` 绑定，`Ident::access` 会调用 `Binding::write()` —— **这一步会报错！**
+
+实际上，在当前的 Typst 实现中，**即使是 `data.arr.push(4)` 也会报同样的错误**，因为 `FieldAccess::access` 的实现是递归的——它先通过 `access.target().access(vm)` 获取目标的可变引用，而 `data` 是 Captured 绑定。
+
+> **总结**：闭包中对捕获变量的任何修改尝试（无论是赋值、复合赋值还是可变方法调用）都会在 `Binding::write()` 处被拦截报错。闭包捕获的变量是完全只读的。
+
+### 8.8 for 循环中的作用域
 
 ```
 源码:
@@ -848,7 +1168,7 @@ Expr::CodeBlock(CodeBlock { body: Code })
 4. vm.scopes.exit()    ← 退出，x 和 y 都不可见
 ```
 
-### 8.8 二元运算求值路径
+### 8.9 二元运算求值路径
 
 ```
 源码: #2 + 3 * 4
@@ -877,7 +1197,7 @@ Expr::Binary {
 - 求值时按树的后序遍历，左→右→根
 - `and` / `or` 有短路优化：左操作数已能确定结果时不求右操作数
 
-### 8.9 赋值写入完整路径
+### 8.10 赋值写入完整路径
 
 ```
 源码: #x += 5
@@ -977,26 +1297,32 @@ Expr::Binary { op: Assign, lhs: Expr::FieldAccess(...), rhs: ... }
 
 1. **词法作用域**：变量查找沿作用域链从内到外，最远到标准库全局。不存在动态作用域。
 
-2. **值捕获，非引用捕获**：闭包通过 `CapturesVisitor` 在**定义时**静态分析需要捕获的变量，然后 clone 值存入 `captured` Scope。调用时完全不继承调用方的作用域。
+2. **值捕获，非引用捕获，且捕获变量完全只读**：闭包通过 `CapturesVisitor` 在**定义时**静态分析需要捕获的变量，然后 clone 值存入 `captured` Scope。调用时完全不继承调用方的作用域。被捕获的变量标记为 `BindingKind::Captured`，不仅赋值语句（`=`/`+=`）会报错，**可变方法调用**（如 `arr.push(4)`）也会报错——因为可变方法通过 `Access` trait 获取 `&mut Value`，而 `Ident::access` 最终调用 `Binding::write()` 对 Captured 绑定报错。
 
-3. **捕获变量只读**：被捕获的变量标记为 `BindingKind::Captured`，`write()` 会失败。这是"闭包捕获变量不可修改"的实现根源。
+3. **代码块/内容块自动创建作用域**：`CodeBlock.eval()` 和 `ContentBlock.eval()` 会 `enter`/`exit` 作用域，`ForLoop` 也为循环体创建新作用域。
 
-4. **代码块/内容块自动创建作用域**：`CodeBlock.eval()` 和 `ContentBlock.eval()` 会 `enter`/`exit` 作用域，`ForLoop` 也为循环体创建新作用域。
+4. **let 绑定在 init 之后生效**：`CapturesVisitor` 处理 `LetBinding` 时先访问 `init` 再 `bind` 名称，因此 `#let x = x` 中的右侧 `x` 引用的是外层的 `x`。
 
-5. **let 绑定在 init 之后生效**：`CapturesVisitor` 处理 `LetBinding` 时先访问 `init` 再 `bind` 名称，因此 `#let x = x` 中的右侧 `x` 引用的是外层的 `x`。
+5. **闭包默认值在定义时求值**：命名参数的默认值在 `Closure.eval()` 中立即求值，存入 `closure.defaults`，调用时通过 `args.named::<Value>(&name)?.unwrap_or_else(|| default.clone())` 使用。
 
-6. **闭包默认值在定义时求值**：命名参数的默认值在 `Closure.eval()` 中立即求值，存入 `closure.defaults`，调用时通过 `args.named::<Value>(&name)?.unwrap_or_else(|| default.clone())` 使用。
+6. **递归自引用**：`eval_closure()` 中，如果闭包有名字，会把自身绑定到新 Vm 的作用域中，支持递归调用。
 
-7. **递归自引用**：`eval_closure()` 中，如果闭包有名字，会把自身绑定到新 Vm 的作用域中，支持递归调用。
+7. **模块求值产生独立作用域**：`eval()` 函数求值一个文件后，`vm.scopes.top` 被提取为模块的导出作用域（`Module::new(name, vm.scopes.top)`），外部只能通过 import 访问。
 
-8. **模块求值产生独立作用域**：`eval()` 函数求值一个文件后，`vm.scopes.top` 被提取为模块的导出作用域（`Module::new(name, vm.scopes.top)`），外部只能通过 import 访问。
+8. **双 trait 求值模型**：`Eval`  trait 用于只读求值（返回 `Value`），`Access` trait 用于可变左值访问（返回 `&mut Value`）。只有标识符、括号、字段访问和访问器方法调用能作为左值。
 
-9. **双 trait 求值模型**：`Eval`  trait 用于只读求值（返回 `Value`），`Access` trait 用于可变左值访问（返回 `&mut Value`）。只有标识符、括号、字段访问和访问器方法调用能作为左值。
+9. **优先级在解析时确定**：Pratt 算法在解析阶段就根据运算符优先级和结合性构建出正确的 AST 结构，求值阶段只需后序遍历，不需要再处理优先级。
 
-10. **优先级在解析时确定**：Pratt 算法在解析阶段就根据运算符优先级和结合性构建出正确的 AST 结构，求值阶段只需后序遍历，不需要再处理优先级。
+10. **Set/Show 规则的"作用于剩余"语义**：set/show 不是普通表达式，它们通过递归调用 `eval_code`/`eval_markup` 处理所有后续表达式，然后把样式应用到结果上。
 
-11. **Set/Show 规则的"作用于剩余"语义**：set/show 不是普通表达式，它们通过递归调用 `eval_code`/`eval_markup` 处理所有后续表达式，然后把样式应用到结果上。
+11. **值拼接（ops::join）**：顺序求值中每步的结果通过 `ops::join` 累积，内容值会合并成 sequence，`none` 会被吸收，其他不兼容类型会报错。
 
-12. **值拼接（ops::join）**：顺序求值中每步的结果通过 `ops::join` 累积，内容值会合并成 sequence，`none` 会被吸收，其他不兼容类型会报错。
+12. **字典字段赋值的特殊路径**：对字典字段的纯赋值（`=`）走 `dict.insert()` 路径，支持创建新字段；复合赋值（`+=` 等）走通用 Access 路径，要求字段已存在。
 
-13. **字典字段赋值的特殊路径**：对字典字段的纯赋值（`=`）走 `dict.insert()` 路径，支持创建新字段；复合赋值（`+=` 等）走通用 Access 路径，要求字段已存在。
+13. **函数调用的方法分派优先级**：字段访问调用（如 `x.f()`）优先在 `x` 的类型作用域中查找方法（`ty().scope().get(f)`），找不到才查找值自身的字段。字典字段不允许用方法语法调用。
+
+14. **可变方法需要 Access 而非 Eval**：`arr.push(4)` 之所以能修改 `arr`，不是因为 `push` 是特殊的语言级操作，而是因为 `FuncCall::eval` 检测到可变方法名后，改走 `target.access(vm)` → `call_method_mut` 路径，获取 `&mut Value` 实现原地修改。
+
+15. **参数消费模型是破坏性的**：`Args` 的 `expect`/`named`/`consume`/`take` 都会从 `items` 中移除已处理的参数。`eval_closure` 按 Pos → Spread → Named 的顺序逐一消费，最后 `args.finish()` 确保无多余参数。
+
+16. **sink 参数的延迟消费**：`Spread` 参数在循环中只记录标识符，实际消费发生在循环之后。多余的位置参数通过 `args.consume(sink_size)` 取出，剩余参数通过 `args.take()` 一次性取走。
