@@ -788,17 +788,19 @@ pub struct HtmlFrame {
 
 [convert_to_nodes()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L60-L90) 将 realize 产物转为 HtmlNode 列表。[handle()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L93-L163) 对每个元素分派：
 
-| 元素类型 | 处理 |
-|----------|------|
-| `TagElem` | 直接 push 内省标签 |
-| `HtmlElem` | [handle_html_elem()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L166-L248) → 构建 HtmlElement，递归处理子元素 |
-| `SpaceElem` | push 文本空格节点 |
-| `TextElem` | 应用大小写转换后 push |
-| `SmartQuoteElem` | 智能引号处理 |
-| `BoxElem` | 内联排版帧 |
-| `BlockElem` | 块级排版帧 |
-| `FrameElem` | 调用 `Routines::layout_frame` 排版后包装为 HtmlFrame |
-| 其他 | 发出警告并忽略 |
+| 元素类型 | 处理函数 | 路径类型 | 产物 |
+|----------|----------|----------|------|
+| `TagElem` | 直接 push | — | `HtmlNode::Tag` |
+| `HtmlElem` | [handle_html_elem()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L166-L248) | **HTML 片段转换** | `HtmlNode::Element`（含递归子节点） |
+| `SpaceElem` | 直接 push | — | `HtmlNode::Text(" ")` |
+| `TextElem` | [handle_text()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L252-L334) | — | `HtmlNode::Text`（空白保护） |
+| `SmartQuoteElem` | [handle_text()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L252-L334) | — | `HtmlNode::Text`（智能引号替换） |
+| `LinebreakElem` | 直接 push | — | `<br>` 或 `\n`（取决于 whitespace 模式） |
+| `HElem`（零尺寸） | 忽略 | — | — |
+| `BoxElem` | [handle_box()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L337-L369) | **HTML 片段转换**（inline） | `HtmlNode::Element`（`<span style="display: inline-block">` 或 子元素 inline 化） |
+| `BlockElem` | [handle_block()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L394-L438) | **HTML 片段转换**（block） | `HtmlNode::Element`（`<div>` 或 子元素 block 化） |
+| `FrameElem` | handle() 内联处理 | **Paged 排版路径** | `HtmlNode::Frame`（HtmlFrame → SVG） |
+| 其他 | — | — | 警告后忽略 |
 
 [ConversionLevel](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L23-L31) 控制转换上下文：
 - `Block`：顶层块级上下文，独立的智能引号状态
@@ -836,25 +838,150 @@ pub fn html(document: &HtmlDocument, options: &HtmlOptions) -> SourceResult<Stri
 }
 ```
 
-#### 7.2.6 HTML 嵌入帧排版深度分析
+#### 7.2.6 HTML 元素转换路径深度分析
 
-[HtmlFrame](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/dom.rs#L505-L521) 是 HTML 目标中最特殊的存在——它是 HTML 语义化世界与 Paged 排版世界之间的桥梁，其生成和渲染涉及两套完全不同的编译路径。
+[handle()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L93-L163) 是 HTML 目标的核心分派函数，将 realize 阶段的扁平化元素列表分派到三条完全不同的转换路径。
 
-**触发场景**
+**三类转换路径对比**
 
-在 HTML 目标下，以下元素会被转为 HtmlFrame：
-- 用户显式调用 `#html.frame(...)` 生成的 [FrameElem](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/lib.rs#L137-L142)
-- `BoxElem`、`BlockElem` 等无法直接映射为 HTML 元素的排版内容
-- 其他无法通过 show rule 转为 HtmlElem 的元素（发出警告后忽略，但 box/block 会走排版路径）
+| 路径 | 触发元素 | 核心处理 | 产物类型 | 是否涉及排版 |
+|------|----------|----------|----------|-------------|
+| **HTML 片段转换（block）** | `HtmlElem`（块级标签）、`BlockElem` | `html_block_fragment()` 递归 realize + convert | `HtmlNode::Element` | 否 |
+| **HTML 片段转换（inline）** | `HtmlElem`（内联标签）、`BoxElem` | `html_inline_fragment()` 递归 realize + convert | `HtmlNode::Element` | 否 |
+| **Paged 排版路径（嵌入帧）** | `FrameElem`（显式 `#html.frame`） | `layout_frame()` Paged 排版 | `HtmlNode::Frame` → SVG | **是** |
 
-**排版过程**
+---
 
-[handle()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L140-L154) 对 FrameElem 的处理：
+##### 路径一：HTML 片段转换（Block 级）
+
+触发元素：
+- `HtmlElem` 且 `tag` 默认 display 为 block（如 `<div>`、`<p>`、`<section>`）
+- `BlockElem`（Typst 原生块级盒子）
+
+**BlockElem 处理流程**：[handle_block()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L394-L438)
+
+```rust
+fn handle_block(converter, elem, styles) -> SourceResult<()> {
+    let body = match elem.body.get_ref(styles) {
+        None => None,
+        Some(BlockBody::Content(body)) => Some(body),
+        Some(BlockBody::SingleLayouter(_) | BlockBody::MultiLayouter(_)) =>
+            bail!("blocks with layout routines should not occur in HTML export"),
+    };
+
+    let mut children = EcoVec::new();
+    if let Some(body) = body {
+        // 走 HTML 片段转换：递归 realize + convert，不触发 Paged 排版
+        children = html_block_fragment(
+            converter.engine, body, converter.locator.next(&elem.span()),
+            styles, converter.whitespace,
+        )?;
+
+        // 优化：如果子节点是单个元素/帧，直接提升并设置 block display
+        if let Some(node) = to_lone_element(&mut children)
+            && make_block_level(node).is_ok()
+        {
+            converter.extend(children);
+            return Ok(());
+        }
+    }
+
+    // fallback：包裹为 <div>
+    converter.push(HtmlElement::new(tag::div).with_children(children));
+}
+```
+
+**HtmlElem 块级处理**：[handle_html_elem()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L166-L248) 中 L197-L204
+
+```rust
+if property::Display::default_for(elem.tag) == Some(property::Display::Block) {
+    children = html_block_fragment(
+        converter.engine, body, converter.locator.next(&elem.span()),
+        styles, whitespace,
+    )?;
+    *converter.quoter = SmartQuoter::new(); // 块级元素重置内联状态
+}
+```
+
+特点：
+- 完整走 realize → convert 的 HTML 流水线
+- `to_lone_element()` 优化：如果子节点是单个元素，直接提升并调整 display，避免冗余 `<div>` 包装
+- `make_block_level()` 智能处理 display 属性（见 L444-L486）
+
+---
+
+##### 路径二：HTML 片段转换（Inline 级）
+
+触发元素：
+- `HtmlElem` 且 `tag` 默认 display 为 inline（如 `<span>`、`<a>`、`<em>`）
+- `HtmlElem` 且 `tag` 为 MathML 标签
+- `BoxElem`（Typst 原生内联盒子）
+
+**BoxElem 处理流程**：[handle_box()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L337-L369)
+
+```rust
+fn handle_box(converter, elem, styles) -> SourceResult<()> {
+    let mut children = EcoVec::new();
+    if let Some(body) = elem.body.get_ref(styles) {
+        // 走 HTML 片段转换：内联级别，共享智能引号状态
+        children = html_inline_fragment(
+            converter.engine, body, converter.locator,
+            converter.quoter, styles, converter.whitespace,
+        )?;
+
+        // 优化：如果子节点是单个元素/帧，直接提升并设置 inline display
+        if let Some(node) = to_lone_element(&mut children) {
+            make_inline_level(node);
+            converter.extend(children);
+            return Ok(());
+        }
+    }
+
+    // fallback：包裹为 <span style="display: inline-block">
+    converter.push(
+        HtmlElement::new(tag::span)
+            .with_css(css::Properties::new().with("display", "inline-block"))
+            .with_children(children),
+    );
+}
+```
+
+**HtmlElem 内联处理**：[handle_html_elem()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L166-L248) 中 L211-L229
+
+```rust
+if tag::mathml::is_mathml(elem.tag) {
+    children = html_math_fragment(
+        converter.engine, body, converter.locator,
+        converter.quoter, styles, whitespace,
+    )?;
+} else {
+    children = html_inline_fragment(
+        converter.engine, body, converter.locator,
+        converter.quoter, styles, whitespace,
+    )?;
+}
+```
+
+特点：
+- 共享 `SmartQuoter` 状态（引号匹配跨多个内联元素）
+- `make_inline_level()` 将 block display 降级为 inline（见 L381-L391）
+- 同样有 `to_lone_element()` 优化避免冗余包装
+
+> **重要校准**：`BoxElem` 和 `BlockElem` **完全不触发 Paged 排版**，不走 `layout_frame`，不生成 `HtmlFrame`。之前的描述错误，特此纠正。它们走的是 **HTML 片段递归转换**，产物是普通 `HtmlElement`。
+
+---
+
+##### 路径三：Paged 排版路径（嵌入帧）
+
+**唯一触发元素**：用户显式调用 `#html.frame(...)` 生成的 [FrameElem](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/lib.rs#L137-L142)
+
+**排版过程**：[handle()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L140-L154) 内联处理
 
 ```rust
 } else if let Some(elem) = child.to_packed::<FrameElem>() {
     let locator = converter.locator.next(&elem.span());
     let style = TargetElem::target.set(Target::Paged).wrap();
+    // 显式调用 Paged 排版：这是唯一会触发 layout_frame 的路径
     let frame = (converter.engine.library.routines.layout_frame)(
         converter.engine,
         &elem.body,
@@ -864,6 +991,8 @@ pub fn html(document: &HtmlDocument, options: &HtmlOptions) -> SourceResult<Stri
     )?;
     let mut node = HtmlFrame::new(frame, styles, elem.span()).into();
     make_block_level(&mut node).unwrap();
+    converter.push(node);
+}
 ```
 
 关键特性：
@@ -881,9 +1010,17 @@ rules.register::<FrameElem>(Paged, |elem, _, _| Ok(elem.body.clone()));
 
 即 Paged 目标下 `html.frame(x)` 等价于直接输出 `x`，不产生任何包装。这是因为 Paged 目标下所有内容本身就是排版的，不需要额外的"帧"概念。
 
-**嵌套帧问题**
+**嵌套帧风险**
 
-注释中提到：`show math.equation: html.frame` 可能导致嵌套帧（nested frames）。如果在 Paged 目标的 show rule 中又生成了 FrameElem，而 FrameElem 在 Paged 下是 no-op，就不会造成问题；但如果在 HTML 目标中递归触发 FrameElem → layout_frame → 又遇到 FrameElem，就会产生**嵌套的 HtmlFrame → SVG** 结构，性能和可读性都会下降。
+注释中提到：`show math.equation: html.frame` 可能导致嵌套帧（nested frames）。如果在 HTML 目标中递归触发 `FrameElem → layout_frame → 又遇到 FrameElem`，就会产生**嵌套的 HtmlFrame → SVG** 结构，性能和可读性都会下降。
+
+> 注意：`html.frame(x)` 内的 `x` 如果又包含 `html.frame(y)`，不会触发嵌套，因为 Paged 目标下 FrameElem 是 no-op。只有在 show rule 中显式生成新的 FrameElem 才可能嵌套。
+
+**HtmlFrame 的两条生成路径**
+
+`HtmlNode::Frame` 只有两个来源：
+1. **显式 `#html.frame(...)`** → handle() L140-L154
+2. **show rule 生成 FrameElem** → 如 `show math.equation: html.frame` 在 realize 阶段生成 FrameElem，然后走嵌入帧的 Paged 排版路径
 
 **深度限制**
 
@@ -905,6 +1042,20 @@ HTML 文档中存在两套链接解析器：
 - **帧内链接**：SVG 内的 `<a>` 由 SVGRenderer 自己的 LateLinkResolver 解析
 
 两者使用同一个 introspector，但因为帧内内容是 Paged 排版产物，帧内链接的目标可能在帧外也可能在其他文档中，需要依赖完整的 introspector 才能正确解析。
+
+**to_lone_element() 优化机制**
+
+[to_lone_element()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L493-L497) 是 BoxElem/BlockElem/HtmlElem 共享的优化：
+
+```rust
+fn to_lone_element(nodes: &mut EcoVec<HtmlNode>) -> Option<&mut HtmlNode> {
+    let (start, end) = nodes.split_prefix_suffix(|node| matches!(node, HtmlNode::Tag(_)));
+    matches!(&nodes[start..end], [HtmlNode::Element(_) | HtmlNode::Frame(_)])
+        .then(|| &mut nodes.make_mut()[start])
+}
+```
+
+如果 realize + convert 后的子节点列表中，除了 Tag 标签外只有一个 Element 或 Frame，就直接提升这个节点并调整 display 属性，避免冗余的 `<div>` 或 `<span>` 包装。
 
 ---
 
