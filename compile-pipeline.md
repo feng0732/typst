@@ -769,7 +769,7 @@ pub struct HtmlElement {
 }
 ```
 
-[HtmlFrame](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/dom.rs#L505-L521) 是 HTML 和 Paged 世界的桥梁：无法直接转为 HTML 元素的内容（如复杂排版、图像）会先排版为 Frame，然后以 SVG 形式嵌入 HTML：
+[HtmlFrame](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/dom.rs#L505-L521) 是 HTML 语义化世界与 Paged 排版世界之间的桥梁。**只有通过 `FrameElem` 显式指定的内容**才会走 Paged 排版路径生成 HtmlFrame，然后以 SVG 形式嵌入 HTML：
 
 ```rust
 pub struct HtmlFrame {
@@ -1010,17 +1010,57 @@ rules.register::<FrameElem>(Paged, |elem, _, _| Ok(elem.body.clone()));
 
 即 Paged 目标下 `html.frame(x)` 等价于直接输出 `x`，不产生任何包装。这是因为 Paged 目标下所有内容本身就是排版的，不需要额外的"帧"概念。
 
-**嵌套帧风险**
+**HtmlFrame 的两类来源**
 
-注释中提到：`show math.equation: html.frame` 可能导致嵌套帧（nested frames）。如果在 HTML 目标中递归触发 `FrameElem → layout_frame → 又遇到 FrameElem`，就会产生**嵌套的 HtmlFrame → SVG** 结构，性能和可读性都会下降。
+`HtmlNode::Frame` 只有两个来源，最终都走同一条 Paged 排版路径：
 
-> 注意：`html.frame(x)` 内的 `x` 如果又包含 `html.frame(y)`，不会触发嵌套，因为 Paged 目标下 FrameElem 是 no-op。只有在 show rule 中显式生成新的 FrameElem 才可能嵌套。
+**来源一：显式帧包装 `#html.frame(...)`**
 
-**HtmlFrame 的两条生成路径**
+用户在 Typst 源码中直接调用 `#html.frame[内容]`：
+1. 源码解析阶段：`FrameElem { body: 内容 }` 直接被创建
+2. realize 阶段：原样传递，不经过 show rule 转换
+3. convert 阶段：[handle()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L140-L154) 匹配 `FrameElem` → 调用 `layout_frame` 走 Paged 排版路径
 
-`HtmlNode::Frame` 只有两个来源：
-1. **显式 `#html.frame(...)`** → handle() L140-L154
-2. **show rule 生成 FrameElem** → 如 `show math.equation: html.frame` 在 realize 阶段生成 FrameElem，然后走嵌入帧的 Paged 排版路径
+**来源二：show rule 生成帧 `show ...: html.frame`**
+
+用户定义 show rule `show math.equation: html.frame`（或针对其他元素的类似规则）：
+1. `html.frame` 本质是 `FrameElem::new` 函数（由 `#[elem]` 宏自动生成），接收 `Content` 返回 `FrameElem`
+2. realize 阶段：匹配到目标元素（如 `EquationElem`）时，调用 show rule `html.frame(elem.body)` → 生成 `FrameElem { body: elem.body }`
+3. convert 阶段：与来源一完全相同 → `FrameElem` → `layout_frame` 走 Paged 排版路径
+
+两类来源生成的 `FrameElem` 在 convert 阶段的处理**完全一致**，区别仅在于 `FrameElem` 的创建时机：来源一在解析期创建，来源二在 realize 期由 show rule 函数创建。
+
+**Paged 目标下的 FrameElem no-op 保护**
+
+在 Paged 目标下，[FrameElem 被注册为 no-op](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/rules.rs#L88-L92)：
+
+```rust
+// For the HTML target, `html.frame` is a primitive. In the laid-out target,
+// it should be a no-op so that nested frames don't break (things like `show
+// math.equation: html.frame` can result in nested ones).
+rules.register::<FrameElem>(Paged, |elem, _, _| Ok(elem.body.clone()));
+```
+
+即 Paged 目标下遇到 `FrameElem` 时，直接返回 `elem.body`，不产生任何包装。
+
+**嵌套帧保护机制详解**
+
+注释中提到的 "`show math.equation: html.frame` can result in nested ones" 指的是**潜在风险**而非实际行为，实际因为有 no-op 保护**不会发生嵌套**。完整的保护流程：
+
+```
+HTML 目标
+  ├─ 遇到 EquationElem
+  ├─ realize 阶段应用 show rule: html.frame(elem.body) → FrameElem(body)
+  └─ convert 阶段 FrameElem → layout_frame(Target::Paged)
+      └─ Paged 目标下排版 body
+          ├─ 如果 body 中又有 EquationElem
+          ├─ realize 阶段应用 show rule: html.frame(inner.body) → FrameElem(inner.body)
+          └─ Paged 目标下遇到 FrameElem → no-op！直接返回 inner.body，不递归 layout_frame
+```
+
+如果没有 no-op 保护，步骤 4 的 `FrameElem(inner.body)` 会再次触发 `layout_frame`，形成 `FrameElem → layout_frame → FrameElem → layout_frame` 的无限递归嵌套，最终生成嵌套的 SVG 结构。no-op 保护切断了这个递归链。
+
+> **校准声明**：之前文档中"只有在 show rule 中显式生成新的 FrameElem 才可能嵌套"的说法不准确。实际上无论哪种来源，只要在 Paged 目标下遇到 FrameElem 都会被 no-op 展开，**不会真的发生嵌套**。no-op 保护是无条件的，不区分 FrameElem 的来源。
 
 **深度限制**
 
@@ -1315,7 +1355,7 @@ fn write_virtual_fs(root: &Path, fs: &VirtualFs) -> StrResult<Vec<Output>> {
 |------|-------|------|--------|
 | realize | `RealizationKind::Document` | `RealizationKind::Document` | `RealizationKind::Bundle` |
 | realize 后 | `layout_pages()` → Frame 树 | `convert_to_nodes()` → HtmlNode 树 | `collect()` → 子文档并行编译 |
-| 子内容处理 | 全部排版为 Frame | HtmlElem → DOM；其他 → HtmlFrame(SVG) | 各子文档独立编译（Paged/HTML） |
+| 子内容处理 | 全部排版为 Frame | HtmlElem/BoxElem/BlockElem → HTML 片段转换；FrameElem → HtmlFrame(SVG) | 各子文档独立编译（Paged/HTML） |
 | 内省器 | `PagedIntrospector`（单文档） | `HtmlIntrospector`（单文档） | `BundleIntrospector`（聚合多文档） |
 
 #### 导出阶段差异
