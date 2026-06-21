@@ -836,6 +836,131 @@ pub fn html(document: &HtmlDocument, options: &HtmlOptions) -> SourceResult<Stri
 }
 ```
 
+#### 7.2.6 HTML 嵌入帧排版深度分析
+
+[HtmlFrame](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/dom.rs#L505-L521) 是 HTML 目标中最特殊的存在——它是 HTML 语义化世界与 Paged 排版世界之间的桥梁，其生成和渲染涉及两套完全不同的编译路径。
+
+**触发场景**
+
+在 HTML 目标下，以下元素会被转为 HtmlFrame：
+- 用户显式调用 `#html.frame(...)` 生成的 [FrameElem](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/lib.rs#L137-L142)
+- `BoxElem`、`BlockElem` 等无法直接映射为 HTML 元素的排版内容
+- 其他无法通过 show rule 转为 HtmlElem 的元素（发出警告后忽略，但 box/block 会走排版路径）
+
+**排版过程**
+
+[handle()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/convert.rs#L140-L154) 对 FrameElem 的处理：
+
+```rust
+} else if let Some(elem) = child.to_packed::<FrameElem>() {
+    let locator = converter.locator.next(&elem.span());
+    let style = TargetElem::target.set(Target::Paged).wrap();
+    let frame = (converter.engine.library.routines.layout_frame)(
+        converter.engine,
+        &elem.body,
+        locator,
+        styles.chain(&style),
+        Region::new(Size::splat(Abs::inf()), Axes::splat(false)),
+    )?;
+    let mut node = HtmlFrame::new(frame, styles, elem.span()).into();
+    make_block_level(&mut node).unwrap();
+```
+
+关键特性：
+1. **目标切换**：排版时临时切换到 `Target::Paged`，让内容走 Paged 目标的 show rules
+2. **无限大区域**：`Region::new(Size::splat(Abs::inf()), Axes::splat(false))` 意味着内容按自然尺寸排版，无分页限制
+3. **块级默认**：Frame 默认块级（类似 image），用 box 包裹可取消
+
+**Paged 目标下的 FrameElem**
+
+在 Paged 目标下，[FrameElem 是 no-op](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/rules.rs#L91)：
+
+```rust
+rules.register::<FrameElem>(Paged, |elem, _, _| Ok(elem.body.clone()));
+```
+
+即 Paged 目标下 `html.frame(x)` 等价于直接输出 `x`，不产生任何包装。这是因为 Paged 目标下所有内容本身就是排版的，不需要额外的"帧"概念。
+
+**嵌套帧问题**
+
+注释中提到：`show math.equation: html.frame` 可能导致嵌套帧（nested frames）。如果在 Paged 目标的 show rule 中又生成了 FrameElem，而 FrameElem 在 Paged 下是 no-op，就不会造成问题；但如果在 HTML 目标中递归触发 FrameElem → layout_frame → 又遇到 FrameElem，就会产生**嵌套的 HtmlFrame → SVG** 结构，性能和可读性都会下降。
+
+**深度限制**
+
+HTML 目标有递归深度保护：[engine.route.check_html_depth()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/fragment.rs#L66)。每次进入 HTML 片段（block/inline/math）时检查深度，防止过深嵌套导致栈溢出或性能问题。
+
+**HtmlFrame → SVG 渲染**
+
+导出时，[write_frame()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/encode.rs#L391-L401) 调用 [svg_in_html()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-svg/src/lib.rs#L82-L123)：
+
+1. SVG 尺寸用 em 单位（基于 text_size），实现响应式缩放
+2. SVG 设置 `overflow: visible`，避免内容被裁剪
+3. 与页面 SVG 导出共享 SVGRenderer 代码，但选项不同（无 pretty print、无 bleed）
+4. HtmlFrame 的 anchors 映射为 SVG 内的命名锚点
+
+**两种链接解析器作用域**
+
+HTML 文档中存在两套链接解析器：
+- **DOM 链接**：HTML `<a href>` 元素由 HTML Writer 的 LateLinkResolver 解析
+- **帧内链接**：SVG 内的 `<a>` 由 SVGRenderer 自己的 LateLinkResolver 解析
+
+两者使用同一个 introspector，但因为帧内内容是 Paged 排版产物，帧内链接的目标可能在帧外也可能在其他文档中，需要依赖完整的 introspector 才能正确解析。
+
+---
+
+#### 7.2.7 LateLinkResolver 在三种目标中的应用范围
+
+[LateLinkResolver](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-library/src/model/link.rs#L653-L694) 是**导出阶段**的链接解析器（区别于编译阶段的 EarlyLinkResolver）。它延迟到导出时才解析 Location → URI，这样可以节省一次内省迭代，但代价是在不收敛场景下链接可能静默失效。
+
+三种目标的使用方式对比：
+
+| 目标 | 使用方式 | base 参数 | 链接范围 |
+|------|----------|-----------|----------|
+| **Paged (PDF)** | `Option<Tracked<LateLinkResolver>>`，可选 | 单文档导出 `None`；Bundle 导出 `Some(path)` | 页内锚点 + 跨文档URI |
+| **Paged (PNG)** | 不使用 | — | PNG 无链接概念 |
+| **Paged (SVG)** | `Tracked<LateLinkResolver>`，必传 | 单文档 `None`；Bundle `Some(path)` | SVG `<a>` 元素 |
+| **HTML** | `Tracked<LateLinkResolver>`，必传 | 单文档 `None`；Bundle `Some(path)` | HTML `<a>` 元素 |
+| **Bundle** | 每个子文档独立创建 | `Some(当前文档路径)` | 跨文档相对 URI + 锚点 |
+
+**Paged PDF 的特殊设计**
+
+PDF 目标中 link_resolver 是 `Option` 类型：
+
+- [convert()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-pdf/src/convert.rs#L48-L53) 接受 `link_resolver: Option<Tracked<LateLinkResolver>>`
+- [pdf()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-pdf/src/lib.rs#L36-L38)（单文档导出）不传 link_resolver，直接用命名目标
+- [pdf_in_bundle()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-pdf/src/lib.rs#L48-L54)（Bundle 导出）传入 link_resolver，支持跨文档链接
+
+原因：单文档 PDF 中所有内部链接都可以用 PDF 命名目标（Named Destination）表示，不需要 LateLinkResolver；只有跨文档链接才需要将 Location 解析为相对文件路径。
+
+**SVG 和 HTML 的设计**
+
+SVG 和 HTML 目标中 link_resolver 是必传的（`Tracked<LateLinkResolver>`），即使单文档导出也需要：
+
+- [html()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/encode.rs#L23-L27)：`LateLinkResolver::new(None, introspector)`
+- [svg()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-svg/src/lib.rs#L47-L57)：SVGRenderer 通过 `with_options(Some(link_resolver))` 创建
+
+原因：HTML/SVG 中的内部链接直接表示为 `#anchor` 形式的 fragment，需要 LateLinkResolver 将 Location 转为 anchor 字符串。单文档场景下 `base=None`，所有链接都解析为 `ResolvedLink::Local { anchor }`，即 `#anchor` 形式。
+
+**Bundle 中的跨文档解析**
+
+Bundle 导出时，`base = Some(当前文档路径)`：
+
+```rust
+// bundle/src/export.rs
+let link_resolver = LateLinkResolver::new(Some(path), bundle.introspector.as_ref());
+```
+
+[resolve()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-library/src/model/link.rs#L675-L693) 的四种情况：
+
+| from \ to | None | Some |
+|-----------|------|------|
+| None | Local（同文档） | 失败（罕见） |
+| Some | 失败（目标不在文档中） | 同路径 → Local；不同路径 → Cross |
+
+[ResolvedLink::into_relative_uri()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-library/src/model/link.rs#L724-L747) 最终生成：
+- Local: `#anchor`
+- Cross: `relative/path/to/file#anchor`（路径经过 percent-encode）
+
 [Writer](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/encode.rs#L54-L64) 维护缩进级别和输出缓冲区，[write_node()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-html/src/encode.rs#L89-L97) 按节点类型分派：
 
 | 节点 | 编码方式 |
@@ -1047,14 +1172,62 @@ fn write_virtual_fs(root: &Path, fs: &VirtualFs) -> StrResult<Vec<Output>> {
 | 差异点 | Paged | HTML | Bundle |
 |--------|-------|------|--------|
 | Frame 处理 | 直接转换为 PDF/PNG/SVG 图元 | HtmlFrame → svg_in_html() 嵌入 | 各子文档独立导出 |
-| 链接解析 | 页内链接 + URL | 页内链接 + URL + 跨帧链接 | **跨文档链接** via LateLinkResolver |
+| 链接解析 | 页内链接 + URL（PDF/SVG）；PNG 无链接 | 页内链接 + URL + 跨帧链接 | **跨文档链接** via LateLinkResolver |
 | 锚点 | PDF 命名目标 | HTML fragment ID | 锚点传播到各子文档导出函数 |
 | 并行化 | 页面级并行（排版时） | 无 | 文件级并行（导出时） |
-| 输出形式 | 单文件字节流 | 单文件字符串 | 多文件 VirtualFs → 磁盘目录 |
+| 输出形式 | 单文件（PDF）或多文件（PNG/SVG） | 单文件字符串 | 多文件 VirtualFs → 磁盘目录 |
+| LateLinkResolver | PDF: 可选；SVG: 必传；PNG: 不用 | 必传（`base=None`） | 每个子文档独立创建（`base=Some(path)`） |
 
-#### LateLinkResolver —— 跨文档链接机制
+#### 图像输出对比：Paged 分页 vs Bundle 单页限制
 
-Bundle 独有的 [LateLinkResolver](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-library/src/model/mod.rs) 解决文档间的交叉引用：
+**Paged 目标的图像导出（CLI 层）**
+
+[export_image()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-cli/src/compile.rs#L462-L534) 支持**多页分页输出**：
+
+1. **模板检测**：检查输出路径是否包含 `{p}`、`{0p}`、`{n}` 等索引模板
+2. **多页处理**：
+   - 有模板：每页生成一个文件，文件名用页码替换模板（1-indexed），自动补零
+   - 无模板 + 单页：直接输出到指定路径
+   - 无模板 + 多页：报错，提示使用 `page-{n}.png` 等模板
+3. **逐页渲染**：`document.pages().iter().enumerate()` 遍历，每页独立渲染
+4. **文件名格式化**：[output_template::format()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-cli/src/compile.rs#L543-L562) 支持零填充（`{0p}` 根据总页数自动确定位数）
+
+**Bundle 目标的图像限制**
+
+Bundle 中的 Paged 文档（PNG/SVG 格式）**强制单页限制**：
+
+- 编译时校验：[compile_document()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-bundle/src/lib.rs#L307-L314)
+- 错误信息：
+  > "expected document to have a single page"
+  > hint: "documents exported to an image format only support a single page"
+
+- 导出时直接取第一页：[export_svg()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-bundle/src/export.rs#L119-L124) 中 `doc.pages()[0]`
+- PNG 同理：[export_png()](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-bundle/src/export.rs#L90-L98) → `doc.pages().first()`
+
+**设计差异的原因**
+
+| 维度 | Paged CLI 多页 | Bundle 单页 |
+|------|----------------|-------------|
+| 输出形态 | 多个独立文件，文件名带序号 | 单个文件，路径由 document 的 path 属性指定 |
+| 命名方式 | 模板 `{p}/{n}/{0p}` 自动生成 | 文档元素显式指定 `path: "fig.png"` |
+| 锚点处理 | 不需要（页间无交叉引用） | 需要：所有锚点都在同一页上，用 `doc.introspector().position(loc)?.point` 提取 |
+| 典型用途 | 文档分页输出（每页一张图） | 文档内的图像资源（如图表、插图） |
+
+本质差异：Paged CLI 的图像导出是"**把文档拆成多页图**"，而 Bundle 的图像导出是"**每个 document 元素产生一张图**"。前者是输出格式选择，后者是文档结构设计。
+
+#### LateLinkResolver 应用范围总结
+
+（详见 7.2.7 节的详细分析）
+
+[LateLinkResolver](file:///d:/fz/0601-2/solo-dogfeeding/code/120-typst/crates/typst-library/src/model/link.rs#L653-L694) 在三种目标中的角色差异：
+
+1. **Paged PDF**：可选使用。单文档导出用 PDF 命名目标，不需要 LateLinkResolver；Bundle 导出需要，用于跨文档链接
+2. **Paged SVG**：必传。SVG `<a>` 元素需要 `#anchor` 形式的链接，必须由 LateLinkResolver 生成
+3. **Paged PNG**：不使用。光栅化格式无超链接概念
+4. **HTML**：必传。HTML `<a>` 元素的 href 由 LateLinkResolver 解析
+5. **Bundle**：每个子文档独立创建，base=当前文档路径，支持相对 URI 跨文档引用
+
+**跨文档链接四步机制**：
 
 1. **编译时**：各子文档独立编译，引用指向目标 `Location`
 2. **导出时**：`LateLinkResolver::new(Some(path), &introspector)` 创建，根据 `BundleIntrospector.path()` 和 `BundleIntrospector.anchor()` 将 Location 解析为相对 URI
