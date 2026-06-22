@@ -12,20 +12,30 @@
     │  ├─ T = HtmlDocument   → Target::Html    （HTML 输出）
     │  └─ T = Bundle         → Target::Bundle  （多文件混合输出）
     │
-    ▼  元素定义 (typst-library/visualize/)
-       LineElem / RectElem / SquareElem / EllipseElem / CircleElem
-       PolygonElem / CurveElem / FrameElem (html.frame)
-    │
+    ├──┼───────────────────────────────────────────────────────────────┐
+    │  ▼  基础图形元素 (typst-library/visualize/)                      │
+    │     LineElem / RectElem / SquareElem / EllipseElem / CircleElem  │
+    │     PolygonElem / CurveElem                                      │
+    │                                                                  │
+    │  ▼  HTML 桥接元素 (typst-html/lib.rs)                            │
+    │     FrameElem (html.frame) —— 仅在 Target::Html 下有意义         │
+    │                                                                  │
+    │  ▼  Bundle 编排元素 (typst-library/model/document.rs)            │
+    │     DocumentElem / AssetElem / TagElem —— 仅 Target::Bundle 有用 │
+    └──┬───────────────────────────────────────────────────────────────┘
+       │
     ▼  Show Rule 注册（按 Target 区分）
     │
     │  Target::Paged  [typst-layout/rules.rs:L96-L103]:
     │    LINE_RULE → layout_line
     │    RECT_RULE → layout_rect
-    │    ...所有 7 种图形元素都有 Show Rule
+    │    ...所有 7 种基础图形元素都有 Show Rule
+    │    FrameElem 无 Show Rule（仅用于 Html 目标）
     │
     │  Target::Html  [typst-html/rules.rs:L82-L83]:
     │    IMAGE_RULE （仅图片有 Show Rule）
-    │    其他图形元素无 Show Rule → 在 convert.rs 中被忽略并警告
+    │    7 种基础图形元素 → 无 Show Rule → convert.rs 中被忽略并警告
+    │    FrameElem → 在 convert.rs 中被显式处理（桥接）
     │
     │  Target::Bundle  [typst-bundle/lib.rs]:
     │    无图形 Show Rule（Bundle 不是布局目标，是编排目标）
@@ -92,7 +102,7 @@
 
 所有图形元素都在 [mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/visualize/mod.rs) 的 `define()` 函数中注册到全局作用域。
 
-### 1.1 元素一览
+### 1.1 元素一览：基础图形元素（typst-library/visualize/）
 
 | 元素 | 文件 | 核心字段 |
 |------|------|----------|
@@ -103,6 +113,18 @@
 | `CircleElem` | [shape.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/visualize/shape.rs#L257-L330) | `radius` 与 `width`/`height` 互斥 |
 | `PolygonElem` | [polygon.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/visualize/polygon.rs) | `vertices` (变长参数), `fill`, `stroke`, `fill_rule` |
 | `CurveElem` | [curve.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/visualize/curve.rs#L42-L93) | `components` (变长 CurveComponent), `fill`, `stroke`, `fill_rule` |
+
+### 1.1.1 HTML 桥接元素（typst-html/）
+
+| 元素 | 文件 | 核心字段 | 定位 |
+|------|------|----------|------|
+| `FrameElem`（`html.frame`） | [typst-html/lib.rs:L126-L142](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/lib.rs#L126-L142) | `body: Content` | HTML 专用桥接：临时切 `Target::Paged` 产出 Frame → 内联 SVG |
+
+**关键归属区分**：
+- 基础图形 7 种位于 `typst-library/src/visualize/` → 是跨目标通用的「图形语义」
+- `FrameElem` 位于 `typst-html/src/lib.rs` → 是 HTML 目标专用的「桥接语义」，非图形元素
+- `FrameElem` 在 `Target::Paged` 下无 Show Rule，仅在 `Target::Html` 下由 `convert.rs` 显式匹配处理
+- 同理，`DocumentElem` / `AssetElem` 等位于 `typst-library/model/document.rs` → Bundle 目标专用「编排语义」
 
 ### 1.2 核心数据结构三件套
 
@@ -718,21 +740,22 @@ fn write_frame(w: &mut Writer, frame: &HtmlFrame) {
                     │  #document(path: "b.html", format: "html")│
                     └──────────────────┬──────────────────────┘
                                        │ 解析
-                    ┌──────────────────▼──────────────────────┐
-                    │    元素定义 (typst-library/visualize/)   │
-                    │  LineElem  RectElem  CurveElem           │
-                    │  FrameElem (html.frame)                  │
-                    │  DocumentElem / AssetElem (Bundle 专用)  │
-                    │  Shape { geometry, fill, stroke, rule }  │
-                    │  Geometry { Line, Rect, Curve }          │
-                    │  Curve(Vec<CurveItem>)                   │
-                    │  CurveItem { Move, Line, Cubic, Close }  │
-                    └──────────────────┬──────────────────────┘
+         ┌─────────────────────────────┼──────────────────────────────────────────┐
+         │                             │                                          │
+    ▼  基础图形元素 (typst-library/visualize/)  ▼  HTML 桥接元素 (typst-html/)  ▼  编排元素 (typst-library/model/)
+    LineElem  RectElem  CurveElem        FrameElem (html.frame)                   DocumentElem / AssetElem / TagElem
+    Shape { geometry, fill, stroke, rule }  仅 Target::Html 下有效               仅 Target::Bundle 下有效
+    Geometry { Line, Rect, Curve }
+    Curve(Vec<CurveItem>)
+    CurveItem { Move, Line, Cubic, Close }
+         └─────────────────────────────┬──────────────────────────────────────────┘
                                        │  Show Rule（按 Target 区分）
          ┌─────────────────────────────┼──────────────────────────────┐
          │ Target::Paged               │ Target::Html                 │ Target::Bundle
          │ [typst-layout/rules.rs]    │ [typst-html/rules.rs]        │ （编排，不直接布局）
-         │ 7 种图形元素都有规则        │ 仅 ImageElem 有规则          │ 根层 document/asset/tag
+         │ 7 种图形元素都有规则        │ ImageElem 有 Show Rule       │ 根层 document/asset/tag
+         │ FrameElem 无 Show Rule      │ 7 种基础图形 → 忽略+警告     │
+         │                            │ FrameElem → convert.rs 桥接  │
          ▼                             ▼                              ▼
 ┌─────────────────────────┐  ┌──────────────────────────┐  ┌───────────────────────────────┐
 │ 布局层 (typst-layout/  │  │ convert.rs:L155-L160      │  │ typst-bundle/lib.rs           │
