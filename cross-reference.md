@@ -622,11 +622,25 @@ impl Synthesize for Packed<RefElem> {
 }
 ```
 
+**⚠️ 关键顺序：先无条件生成 citation，BibliographyElem::has 只决定是否查 label 填 element**
+
+按代码执行顺序，Synthesize 分三步：
+
+| 步骤 | 代码行 | 作用 | 是否受 BibliographyElem::has 影响 |
+|---|---|---|---|
+| **Step 1：无条件生成 citation** | L208 `to_citation(self, engine, styles)?` | 无论目标是文献条目还是普通标签，都先尝试把 RefElem 转换为 CiteElem 并存到 `citation` 字段。`to_citation` 内部会自己决定补充文本等内容，不依赖 `BibliographyElem::has` 的结果 | ❌ 不受影响（先执行） |
+| **Step 2：初始化合成字段** | L211 `citation = Some(Some(citation))`<br>L212 `element = Some(None)` | 写入上一步的 citation，并把 element 初始化为 None | ❌ 不受影响 |
+| **Step 3：按条件查询 element** | L214 `if !BibliographyElem::has(engine, elem.target, span)`<br>&& `engine.introspect(QueryLabelIntrospection(...))` | 只有当目标**不在** Bibliography 中时，才去查询文档内的标签；查到则写入 `element` 字段，供 show rule 中 `it.element` 访问；如果目标是 Bibliography 条目则跳过查询，element 保持为 None | ✅ 只控制这一步 |
+
+**两个常见误解对照代码澄清**：
+
+1. ❌ "只有当 BibliographyElem::has 时才生成 citation" — 错。`to_citation` 在 L208 就执行了，先于任何 Bibliography 判断。
+2. ❌ "BibliographyElem::has 决定 citation 或 element 二选一" — 不精确。它只决定 Step 3 是否做；`citation` 字段始终被填。Realize 阶段的分支 B 才决定最终是否渲染为 CiteElem。
+
 **作用：**
-- 在早期阶段尝试查询目标元素
-- 将查询结果存储在 `element` 合成字段中
-- 用于 show rule 中访问被引用元素（如文档中示例：`it.element`）
-- 如果是文献引用，转换为 CiteElem
+- **citation 字段**：无条件提前生成，供 realize 阶段的 Bibliography 分支直接使用（L275 `to_citation(...)` 与这里其实是同一件事的重复调用）
+- **element 字段**：仅当目标不是文献条目时才查询，用于 show rule 中访问被引用元素（如文档中示例：`it.element`）
+- 如果是文献引用，`element` 保持为 None，避免把 Bibliography 里的条目混同为普通文档标签
 
 ### 6.2 Realize 阶段
 
@@ -967,9 +981,12 @@ See @methods for details.
 ```
 解析 @target → RefElem { target: Label }
     ↓
-Synthesize 阶段
-    ↓   BibliographyElem::has(target) ? 是 → to_citation
-    ↓   否 → engine.introspect(QueryLabelIntrospection(target)) → 存 element 字段
+Synthesize 阶段（注意顺序！）
+    ↓ Step 1（无条件）：to_citation(self) → citation = Some(Some(cite_elem))
+    ↓ Step 2：element 初始化为 Some(None)
+    ↓ Step 3：!BibliographyElem::has(target) ?
+    ↓       是 → engine.introspect(QueryLabelIntrospection) → element = Some(Some(found))
+    ↓       否 → element 保持为 Some(None)
     ↓
 Realize 阶段
     ↓ engine.introspect(QueryLabelIntrospection(target))
@@ -982,7 +999,7 @@ Realize 阶段
     │
     ├── 分支 B：BibliographyElem::has(target)
     │       ↓   elem 存在？→ 报错（文档和文献库都有）
-    │       ↓   elem 不存在 → to_citation → CiteElem
+    │       ↓   elem 不存在 → to_citation(...) → CiteElem
     │
     ├── 分支 C：目标是 FootnoteElem
     │       ↓   footnote.into_ref(target) → 脚注编号链接
@@ -1126,13 +1143,13 @@ loop {
 ### 10.5 Synthesize 与 Realize 分离（含 Bibliography / Footnote 分支）
 
 **Synthesize（早期）**：
-- 提供元素信息给 show rule
-- 可以容忍查询失败（element 可能为 None）
-- Bibliography 类的标签在这一步已经转为 CiteElem 的引用
+- **Step 1（无条件）**：`to_citation()` 先被调用，citation 合成字段被填充，无论目标是否在 Bibliography 中
+- **Step 2**：element 字段初始化为 `Some(None)`
+- **Step 3（受 BibliographyElem::has 控制）**：只有目标不在 Bibliography 中时，才调用 `engine.introspect(QueryLabelIntrospection)` 查询文档内标签并写入 element 字段，供 show rule 的 `it.element` 访问
 
 **Realize（晚期）**：
 - 生成最终排版内容
-- 包含 4 条分支：页码引用、Bibliography 引用（冲突检测 + CiteElem 生成）、Footnote 引用（`footnote.into_ref`）、普通 Refable 引用
+- 包含 4 条分支：页码引用、Bibliography 引用（冲突检测 + `to_citation` 第二次调用生成 CiteElem）、Footnote 引用（`footnote.into_ref`）、普通 Refable 引用
 - 查询失败会产生错误
 
 这种分离允许用户在 show rule 中优雅处理尚未发现的元素：
