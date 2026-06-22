@@ -2,9 +2,9 @@
 
 ## 概述
 
-Typst 的 PDF 输出功能由 `typst-pdf` crate 实现，位于 `crates/typst-pdf/` 目录。该模块负责将排版后的 `PagedDocument` 转换为符合 PDF 规范的字节流。核心依赖是 **krilla 0.8.2** 库，一个专门用于 PDF 生成的高级 Rust 库，构建在 `pdf-writer` 底层库之上。
+Typst 的 PDF 输出功能由 `typst-pdf` crate 实现，位于 `crates/typst-pdf/` 目录。该模块负责将排版后的 `PagedDocument` 转换为符合 PDF 规范的字节流。核心依赖是 **krilla 0.8.2** 库，一个专门用于 PDF 生成的高级 Rust 库，构建在 **pdf-writer 0.15.0** 底层库之上。
 
-krilla 源码已下载到 `krilla-src/krilla-0.8.2/` 目录供参考。
+krilla 源码已下载到 `krilla-src/krilla-0.8.2/` 目录，pdf-writer 源码已下载到 `pdf-writer-0.15.0/` 目录供参考。
 
 ## 核心架构
 
@@ -13,7 +13,7 @@ krilla 源码已下载到 `krilla-src/krilla-0.8.2/` 目录供参考。
 ```
 typst-pdf
 ├── krilla 0.8.2      # PDF 生成核心库（高级抽象）
-│   └── pdf-writer    # 底层 PDF 语法生成（krilla 的依赖）
+│   └── pdf-writer 0.15.0  # 底层 PDF 语法生成（字节级写入）
 ├── krilla-svg        # SVG 渲染支持
 ├── subsetter         # 字体子集化（krilla 的依赖）
 ├── typst-layout      # 排版后文档结构
@@ -354,6 +354,18 @@ pub(crate) fn finish(self, sc: &mut SerializeContext) -> KrillaResult<Pdf> {
 }
 ```
 
+**`Chunk::renumber_into()` 实际调用流程** [pdf-writer chunk.rs#L181-L187](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L181-L187)：
+
+```rust
+pub fn renumber_into<F>(&self, target: &mut Chunk, mut mapping: F)
+where
+    F: FnMut(Ref) -> Ref,
+{
+    target.buf.reserve(self.len());
+    crate::renumber::renumber(self, target, &mut mapping);
+}
+```
+
 **重映射目的：**
 - 确保 PDF 中的对象编号是**单调递增**的
 - 提高文件结构的清晰度和可读性
@@ -376,65 +388,417 @@ fn check_validator_limits(&mut self) {
 
 ---
 
-## 四、XRef 表生成 —— 基于源码的分析
+## 四、XRef 表生成与对象偏移 —— 基于 pdf-writer 源码的分析
 
-### 4.1 PDF 写入流程
+### 4.1 对象偏移记录机制
 
-XRef 表的生成由底层的 `pdf-writer` 库自动处理。整体流程在 krilla [chunk_container.rs#L100-L348](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/chunk_container.rs#L100-L348) 的 `finish()` 方法中：
+**Chunk 内部结构** [pdf-writer chunk.rs#L34-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L34-L38)：
 
 ```rust
-pub(crate) fn finish(self, sc: &mut SerializeContext) -> KrillaResult<Pdf> {
-    // 阶段 1: 二次编号重映射（见上节）
-    let mut remapper = HashMap::new();
-    self.visit(sc, &mut |chunk| {
-        for object_ref in chunk.refs() {
-            remapper.insert(object_ref, remapped_ref.bump());
-        }
-    })?;
-
-    // 阶段 2: 创建 PDF 写入器
-    let mut pdf = sc.new_pdf_with_capacity(capacity);
-    sc.serialize_settings().pdf_version().set_version(&mut pdf);
-
-    // 阶段 3: 写入所有 chunk 对象（重编号后）
-    self.visit(sc, &mut |chunk| {
-        chunk.renumber_into(&mut pdf, |old| remapper[&old]);
-    })?;
-
-    // 阶段 4: 写入文档目录 (Catalog)
-    let catalog_ref = remapped_ref.bump();
-    let mut catalog = pdf.catalog(catalog_ref);
-    catalog.pages(remapper[&page_tree_ref]);
-    // ... 其他目录条目 ...
-    catalog.finish();
-
-    // 阶段 5: 返回 Pdf 对象（包含 xref）
-    Ok(pdf)
+pub struct Chunk {
+    pub(crate) buf: Buf,                    // 字节缓冲区
+    pub(crate) offsets: Vec<(Ref, usize)>,  // 对象引用 → 字节偏移
+    pub(crate) settings: Settings,          // 写入配置
 }
 ```
 
-### 4.2 pdf-writer 中的 XRef 生成
+**对象偏移记录发生在 `indirect()` 调用时** [pdf-writer chunk.rs#L193-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L193-L196)：
 
-`pdf_writer::Pdf` 在调用 `finish()` 或转换为字节时自动生成 xref 表。从 krilla 的使用可以推断：
+```rust
+pub fn indirect(&mut self, id: Ref) -> Obj<'_> {
+    self.offsets.push((id, self.buf.len()));  // ← 记录当前字节偏移
+    Obj::indirect(&mut self.buf, id, self.settings)
+}
+```
 
-**`Chunk::renumber_into()`** 方法将对象写入 `Pdf` 时：
-1. 记录每个对象的字节偏移量
-2. 存储对象数据
-3. 维护内部的对象偏移表
+**关键点：**
+- `offsets` 是 `Vec<(Ref, usize)>`，按写入顺序存储
+- 偏移量是对象在 `buf` 中的起始字节位置
+- 每次调用 `indirect()` 或 `stream()` 都会触发偏移记录
 
-**`Pdf` 内部结构（推断自使用模式）：**
-- 字节缓冲区：存储实际的 PDF 语法
-- 对象偏移表：`HashMap<Ref, usize>` 记录每个对象的起始偏移
-- 配置信息：PDF 版本、是否压缩等
+**间接对象写入格式** [pdf-writer object.rs#L666-L676](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/object.rs#L666-L676)：
 
-### 4.3 XRef 表类型
+```rust
+pub(crate) fn indirect(buf: &'a mut Buf, id: Ref, settings: Settings) -> Self {
+    buf.push_int(id.get());
+    buf.extend(b" 0 obj\n");  // 例如: "1 0 obj\n"
+    Self {
+        buf,
+        indirect: true,
+        indent: 0,
+        settings,
+        needs_padding: false,
+    }
+}
+```
 
-根据 krilla [serialize.rs#L54-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L54-L98) 中的 `SerializeSettings` 配置，xref 表可能有两种形式：
+### 4.2 Pdf::finish() —— XRef 表生成入口
 
-| 配置 | XRef 类型 | PDF 版本 |
-|-----|----------|---------|
-| `pdf_version < 1.5` | 传统 xref 表（文本格式） | 1.4 |
-| `pdf_version >= 1.5` | 压缩 xref 流（可能） | 1.5+ |
+在 [pdf-writer lib.rs#L307-L322](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L307-L322) 中：
+
+```rust
+pub fn finish(self) -> Vec<u8> {
+    let Chunk { mut buf, offsets, settings } = self.chunk;
+    let trailer_data = self.trailer_data;
+    let xref_offset = buf.len();  // 记录 xref 表的起始偏移
+
+    // 写入 xref 表（传统文本格式）
+    let mut writer = PlainXRefWriter::new(&mut buf);
+    let xref_len = write_offsets(offsets, &mut writer);
+
+    // 写入 trailer 字典
+    buf.extend(b"trailer\n");
+    let mut trailer = Obj::direct(&mut buf, 0, settings, false).dict();
+    trailer_data.write_into_dict(&mut trailer, xref_len);
+    trailer.finish();
+
+    // 写入 startxref 和 EOF
+    finish_trailer(buf, xref_offset, b"\n")
+}
+```
+
+**执行流程：**
+1. 从 `Chunk` 中提取 `buf`、`offsets` 和 `settings`
+2. 记录当前 `buf.len()` 作为 `xref_offset`（xref 表的起始位置）
+3. 创建 `PlainXRefWriter` 写入传统 xref 表
+4. 调用 `write_offsets()` 处理偏移并写入 xref 条目
+5. 写入 `trailer` 字典
+6. 调用 `finish_trailer()` 写入 `startxref` 和 `%%EOF`
+
+### 4.3 write_offsets() —— 核心偏移处理函数
+
+在 [pdf-writer lib.rs#L437-L478](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L437-L478) 中：
+
+```rust
+fn write_offsets(mut offsets: Vec<(Ref, usize)>, writer: &mut impl XRefWriter) -> i32 {
+    offsets.sort();  // 按 Ref 编号排序
+
+    let xref_len = 1 + offsets.last().map_or(0, |p| p.0.get());
+    writer.prologue(xref_len);
+
+    if offsets.is_empty() {
+        writer.write_free_entry(0, 65535);
+    }
+
+    let mut written = 0;
+    for (i, (object_id, offset)) in offsets.iter().enumerate() {
+        if written > object_id.get() {
+            panic!("duplicate indirect reference id: {}", object_id.get());
+        }
+
+        // 填充空闲对象链表
+        let start = written;
+        for free_id in start..object_id.get() {
+            let mut next = free_id + 1;
+            if next == object_id.get() {
+                // 查找下一个空闲 id
+                for (used_id, _) in &offsets[i..] {
+                    if next < used_id.get() {
+                        break;
+                    } else {
+                        next = used_id.get() + 1;
+                    }
+                }
+            }
+
+            let gen = if free_id == 0 { 65535 } else { 0 };
+            writer.write_free_entry((next % xref_len) as usize, gen);
+            written += 1;
+        }
+
+        writer.write_occupied_entry(*offset, 0);
+        written += 1;
+    }
+
+    xref_len
+}
+```
+
+**关键逻辑：**
+1. **排序**：`offsets.sort()` 确保按对象编号顺序处理
+2. **计算 xref 长度**：`xref_len = 1 + max_id`，包含对象 0
+3. **空闲链表构建**：
+   - 对象 0 的生成号为 65535（表示头节点）
+   - 其他空闲对象的生成号为 0
+   - `next` 指向下一个空闲对象，形成循环链表
+4. **重复检测**：如果 `written > object_id.get()` 说明有重复编号，触发 panic
+
+### 4.4 PlainXRefWriter —— 传统 XRef 表格式
+
+在 [pdf-writer lib.rs#L570-L594](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L570-L594) 中：
+
+```rust
+struct PlainXRefWriter<'a> {
+    buf: &'a mut Buf,
+}
+
+impl<'a> XRefWriter for PlainXRefWriter<'a> {
+    fn prologue(&mut self, xref_len: i32) {
+        self.buf.extend(b"xref\n0 ");
+        self.buf.push_int(xref_len);
+        self.buf.push(b'\n');
+    }
+
+    fn write_free_entry(&mut self, offset: usize, gen_number: u16) {
+        write!(self.buf.inner, "{offset:010} {gen_number:05} f\r\n").unwrap();
+    }
+
+    fn write_occupied_entry(&mut self, offset: usize, gen_number: u16) {
+        write!(self.buf.inner, "{offset:010} {gen_number:05} n\r\n").unwrap();
+    }
+}
+```
+
+**传统 XRef 表格式示例：**
+```
+xref
+0 3
+0000000000 65535 f\r
+0000000016 00000 n\r
+0000000094 00000 n\r
+```
+
+**格式说明：**
+- 偏移量：10 位十进制，前导零
+- 生成号：5 位十进制，前导零
+- 类型：`f` 表示空闲，`n` 表示占用
+- 行尾：`\r\n`（PDF 要求的行结束符）
+
+### 4.5 XRefStreamWriter —— 压缩 XRef 流（PDF 1.5+）
+
+在 [pdf-writer lib.rs#L533-L568](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L533-L568) 中：
+
+```rust
+struct XRefStreamWriter {
+    buf: Vec<u8>,
+    field_width: u32,
+}
+
+impl XRefStreamWriter {
+    fn write(&mut self, entry_type: u8, offset: usize, gen_number: u16) {
+        let offset_bytes = (offset as u64).to_be_bytes();
+
+        self.buf.push(entry_type);  // 1 字节: 0=空闲, 1=占用, 2=对象流
+        self.buf.extend(
+            offset_bytes
+                .iter()
+                .skip(offset_bytes.len() - self.field_width as usize),
+        );  // N 字节: 偏移量
+        self.buf.extend_from_slice(&gen_number.to_be_bytes());  // 2 字节: 生成号
+    }
+}
+
+impl XRefWriter for XRefStreamWriter {
+    fn prologue(&mut self, _: i32) {}
+
+    fn write_free_entry(&mut self, offset: usize, gen_number: u16) {
+        self.write(0, offset, gen_number);
+    }
+
+    fn write_occupied_entry(&mut self, offset: usize, gen_number: u16) {
+        self.write(1, offset, gen_number);
+    }
+}
+```
+
+**压缩 XRef 流条目格式：**
+```
+[类型(1字节)] [偏移量(N字节)] [生成号(2字节)]
+```
+
+**类型值：**
+- `0`: 空闲对象
+- `1`: 普通占用对象
+- `2`: 对象流中的对象（需要额外字段）
+
+### 4.6 XRef 流写入流程（PDF 1.5+）
+
+在 [pdf-writer lib.rs#L365-L415](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L365-L415) 中：
+
+```rust
+fn finish_with_xref_stream_inner(
+    self,
+    xref_id: Ref,
+    filter: impl FnOnce(Vec<u8>) -> (Vec<u8>, Option<XRefFilter>),
+) -> Vec<u8> {
+    let Chunk { mut buf, mut offsets, settings } = self.chunk;
+    let trailer_data = self.trailer_data;
+
+    // 注意：xref 流本身也要加入 offsets！
+    let xref_offset = buf.len();
+    offsets.push((xref_id, xref_offset));
+    let field_width = determine_field_width(xref_offset);
+
+    // 写入 xref 流内容
+    let mut writer = XRefStreamWriter::new(field_width);
+    let xref_len = write_offsets(offsets, &mut writer);
+
+    // 应用过滤器（压缩）
+    let (xref_data, filter) = filter(writer.buf);
+
+    // 写入 xref 流对象
+    let mut stream =
+        Stream::start(Obj::indirect(&mut buf, xref_id, settings), &xref_data);
+
+    stream.pair(Name(b"Type"), Name(b"XRef"));
+
+    // 写入过滤器（如 FlateDecode）
+    if let Some(filter) = filter { ... }
+
+    // 写入 trailer 字段
+    trailer_data.write_into_dict(stream.deref_mut(), xref_len);
+
+    // 写入 /W 数组：[类型字节数, 偏移字节数, 生成号字节数]
+    stream
+        .insert(Name(b"W"))
+        .array()
+        .item(1)
+        .item(field_width as i32)
+        .item(2);
+
+    stream.finish();
+
+    finish_trailer(buf, xref_offset, &[])
+}
+```
+
+**关键点：**
+- xref 流本身也是一个间接对象，需要加入 `offsets` 向量
+- `field_width` 由最大偏移量决定（`determine_field_width()`）
+- `/W` 数组定义每个字段的字节数：[1, field_width, 2]
+
+### 4.7 Trailer 生成
+
+**TrailerData 结构** [pdf-writer lib.rs#L500-L525](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L500-L525)：
+
+```rust
+#[derive(Default)]
+struct TrailerData {
+    catalog_id: Option<Ref>,    // /Root
+    info_id: Option<Ref>,       // /Info
+    file_id: Option<(Vec<u8>, Vec<u8>)>,  // /ID
+}
+
+impl TrailerData {
+    fn write_into_dict(&self, dict: &mut Dict, xref_len: i32) {
+        dict.pair(Name(b"Size"), xref_len);
+
+        if let Some(catalog_id) = self.catalog_id {
+            dict.pair(Name(b"Root"), catalog_id);
+        }
+
+        if let Some(info_id) = self.info_id {
+            dict.pair(Name(b"Info"), info_id);
+        }
+
+        if let Some(file_id) = &self.file_id {
+            let mut ids = dict.insert(Name(b"ID")).array();
+            ids.item(Str(&file_id.0));
+            ids.item(Str(&file_id.1));
+        }
+    }
+}
+```
+
+**Trailer 字典示例：**
+```
+trailer
+<<
+  /Size 10
+  /Root 5 0 R
+  /Info 8 0 R
+  /ID [<0123456789ABCDEF> <0123456789ABCDEF>]
+>>
+```
+
+**Trailer 字段说明：**
+- `/Size`: xref 表中的条目总数（包括对象 0）
+- `/Root`: 文档目录（Catalog）的间接引用
+- `/Info`: 文档信息字典的间接引用（可选）
+- `/ID`: 文件标识符数组，两个相同的字节串（PDF/A 必需）
+
+### 4.8 startxref 与 %%EOF 生成
+
+**finish_trailer() 函数** [pdf-writer lib.rs#L426-L435](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L426-L435)：
+
+```rust
+fn finish_trailer(mut buf: Buf, xref_offset: usize, pad: &[u8]) -> Vec<u8> {
+    buf.extend(pad);
+    // 写入 startxref 指向 xref 表/流的起始偏移
+    buf.extend(b"startxref\n");
+    write!(buf.inner, "{}", xref_offset).unwrap();
+
+    // 写入 EOF 标记
+    buf.extend(b"\n%%EOF");
+    buf.into_vec()
+}
+```
+
+**最终文件尾部示例：**
+```
+startxref
+1234
+%%EOF
+```
+
+**关键点：**
+- `xref_offset` 是 xref 表（或 xref 流）在文件中的字节偏移
+- `startxref` 后面跟着的是十进制偏移量
+- `%%EOF` 是 PDF 文件的标准结束标记
+
+### 4.9 Chunk::extend() —— 偏移调整
+
+当合并多个 Chunk 时，偏移量需要调整 [pdf-writer chunk.rs#L88-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L88-L93)：
+
+```rust
+pub fn extend(&mut self, other: &Chunk) {
+    let base = self.len();
+    self.buf.extend_buf(&other.buf);
+    self.offsets
+        .extend(other.offsets.iter().map(|&(id, offset)| (id, base + offset)));
+}
+```
+
+**偏移调整逻辑：**
+- `base = self.len()`: 当前 chunk 的字节长度
+- `base + offset`: 其他 chunk 的偏移量需要加上这个基址
+
+### 4.10 XRef 表生成完整流程图
+
+```
+krilla chunk_container.finish()
+    │
+    ├─ 第一遍：二次编号重映射（见 3.4 节）
+    │   └─ 建立 old_ref → new_ref 映射
+    │
+    ├─ 第二遍：renumber_into 写入所有对象
+    │   └─ Chunk::renumber_into()  [pdf-writer chunk.rs#L181]
+    │       └─ renumber::renumber() 重写所有引用
+    │           └─ 调用 target.indirect(new_ref) 写入对象
+    │               └─ target.offsets.push((new_ref, buf.len()))  ← 记录偏移!
+    │
+    └─ pdf.finish()  [pdf-writer lib.rs#L307]
+        │
+        ├─ xref_offset = buf.len()  ← 记录 xref 起始位置
+        │
+        ├─ write_offsets(offsets, writer)  [pdf-writer lib.rs#L437]
+        │   ├─ offsets.sort()
+        │   ├─ xref_len = 1 + max_id
+        │   ├─ writer.prologue(xref_len)  →  "xref\n0 N\n"
+        │   ├─ 填充空闲对象链表
+        │   └─ 写入占用对象条目
+        │
+        ├─ 写入 trailer 字典
+        │   ├─ /Size: xref_len
+        │   ├─ /Root: catalog_ref
+        │   ├─ /Info: info_ref (可选)
+        │   └─ /ID: [file_id file_id] (可选)
+        │
+        └─ finish_trailer(buf, xref_offset, pad)
+            ├─ "startxref\n"
+            ├─ xref_offset (十进制)
+            └─ "\n%%EOF"
+```
 
 ---
 
@@ -956,6 +1320,9 @@ SerializeContext::finish(chunk_container)
       ├─ 第二遍：重写所有对象到 Pdf
       │   └─ visit all chunks:
       │       chunk.renumber_into(&mut pdf, |old| remapper[&old])
+      │       └─ pdf-writer renumber.rs 重写所有引用
+      │           └─ target.indirect(new_ref) 写入对象
+      │               └─ target.offsets.push((new_ref, buf.len()))  ← 记录偏移!
       │
       ├─ 写入文档信息 (DocumentInfo)
       ├─ 生成文件 ID (stable_hash_base64)
@@ -969,26 +1336,30 @@ SerializeContext::finish(chunk_container)
           └─ /Lang, /ViewerPreferences 等
       
       └─ 返回 Pdf 对象
-          └─ pdf_writer 在内部生成 xref 表
+          └─ pdf.finish() 生成 xref 表和 trailer
 ```
 
 ### 7.5 阶段 5：PDF 字节生成
 
-当 `Pdf` 对象被转换为 `Vec<u8>` 时，`pdf-writer` 库自动：
+当 `Pdf` 对象调用 `finish()` 时，`pdf-writer` 库自动执行以下步骤 [pdf-writer lib.rs#L307-L322](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L307-L322)：
 
 1. **写入头部**：`%PDF-1.7\n%\xe2\xe3\xcf\xd3\n`
-2. **写入所有间接对象**：按编号顺序，记录偏移量
-3. **构建 xref 表**：
-   - 每个对象的字节偏移位置
-   - 每个对象的生成号（通常为 0）
-   - 标记空闲对象
-4. **写入 trailer**：
-   - `/Size`：对象总数
+2. **从 Chunk 提取数据**：`buf`, `offsets`, `settings`
+3. **记录 xref 起始偏移**：`xref_offset = buf.len()`
+4. **构建 xref 表**：
+   - 调用 `write_offsets(offsets, &mut writer)` [pdf-writer lib.rs#L437-L478](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L437-L478)
+   - 排序 offsets，按编号顺序处理
+   - 填充空闲对象链表
+   - 写入每个对象的字节偏移位置（10 位十进制）
+   - 写入每个对象的生成号（5 位十进制，通常为 0）
+5. **写入 trailer** [pdf-writer lib.rs#L508-L525](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L508-L525)：
+   - `/Size`：对象总数（包含对象 0）
    - `/Root`：Catalog 引用
-   - `/Info`：DocumentInfo 引用
-   - `/ID`：文件 ID 数组
-5. **写入 startxref**：xref 表的起始偏移
-6. **写入 `%%EOF`**
+   - `/Info`：DocumentInfo 引用（可选）
+   - `/ID`：文件 ID 数组（可选）
+6. **写入 startxref** [pdf-writer lib.rs#L426-L435](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L426-L435)：
+   - `startxref\n` + xref 表的起始偏移（十进制）
+7. **写入 `%%EOF`**：文件结束标记
 
 ### 7.6 完整数据流图
 
@@ -1117,16 +1488,20 @@ if self.font.font_ref().os2()
 
 ## 十、关键代码引用汇总
 
-| 功能 | krilla 源码位置 | typst-pdf 调用位置 |
+| 功能 | krilla 源码位置 | pdf-writer 源码位置 |
 |-----|----------------|-------------------|
-| 资源字典构建 | [resource.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs) | [paint.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/paint.rs) |
-| 引用编号分配 | [serialize.rs#L368-L370](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L368-L370) | [convert.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs) |
-| 二次编号重映射 | [chunk_container.rs#L100-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/chunk_container.rs#L100-L120) | `document.finish()` 内部 |
-| XRef 表生成 | pdf-writer 内部 | `chunk_container.finish()` 返回 |
-| 字形收集 | [text/cid.rs#L154-L170](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L154-L170) | [text.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/text.rs) |
-| 字体子集化 | [text/cid.rs#L436-L458](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L436-L458) | `serialize_fonts()` 内部 |
-| ToUnicode 生成 | [text/cid.rs#L378-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L378-L398) | `serialize_fonts()` 内部 |
-| 码位验证 | [text/cid.rs#L40-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L40-L98) | `write_cmap_entry()` 内部 |
+| 资源字典构建 | [resource.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs) | - |
+| 引用编号分配 | [serialize.rs#L368-L370](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L368-L370) | - |
+| 二次编号重映射 | [chunk_container.rs#L100-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/chunk_container.rs#L100-L120) | [chunk.rs#L181-L187](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L181-L187) |
+| 对象偏移记录 | - | [chunk.rs#L34-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L34-L38), [chunk.rs#L193-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L193-L196) |
+| XRef 表生成 | - | [lib.rs#L307-L322](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L307-L322), [lib.rs#L437-L478](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L437-L478) |
+| XRef 流生成 | - | [lib.rs#L365-L415](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L365-L415) |
+| Trailer 生成 | - | [lib.rs#L500-L525](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L500-L525) |
+| startxref 生成 | - | [lib.rs#L426-L435](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L426-L435) |
+| 字形收集 | [text/cid.rs#L154-L170](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L154-L170) | - |
+| 字体子集化 | [text/cid.rs#L436-L458](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L436-L458) | - |
+| ToUnicode 生成 | [text/cid.rs#L378-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L378-L398) | - |
+| 码位验证 | [text/cid.rs#L40-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L40-L98) | - |
 
 ---
 
@@ -1167,8 +1542,35 @@ CIDFont::serialize() [text/cid.rs#L187]
      └─ (可选) 写入 CIDSet 流
      │
      ▼  chunk_container.finish() [chunk_container.rs#L100]
-二次编号重映射 → 写入所有对象 → xref 生成
+二次编号重映射 → 写入所有对象 → xref 生成 (pdf-writer)
+     │
+     ├─ Chunk::indirect() → offsets.push((ref, buf.len()))
+     ├─ write_offsets() → 排序 + 空闲链表 + xref 条目
+     ├─ TrailerData::write_into_dict() → /Size, /Root, /Info, /ID
+     ├─ finish_trailer() → startxref + %%EOF
      │
      ▼
 PDF 字节流
+```
+
+### XRef 生成核心机制（基于 pdf-writer 源码）
+
+```
+对象写入阶段:
+  Chunk::indirect(id)
+    → offsets.push((id, buf.len()))  ← 记录偏移
+
+最终生成阶段:
+  Pdf::finish()
+    ├─ xref_offset = buf.len()
+    ├─ write_offsets(offsets, PlainXRefWriter)
+    │   ├─ offsets.sort()
+    │   ├─ 写入 "xref\n0 N\n"
+    │   ├─ 为每个空闲对象写入: "0000000000 65535 f\r\n"
+    │   └─ 为每个占用对象写入: "0000000016 00000 n\r\n"
+    ├─ 写入 "trailer\n<< /Size N /Root X 0 R ... >>\n"
+    └─ finish_trailer()
+        ├─ "startxref\n"
+        ├─ xref_offset (十进制)
+        └─ "\n%%EOF"
 ```
