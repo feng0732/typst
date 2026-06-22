@@ -1,372 +1,404 @@
 # 增量编译缓存机制详解
 
-本文档梳理 Typst 增量编译缓存的失效与重算机制，重点解释依赖追踪与缓存命中的关系，以及整个缓存系统是如何运作的。
+本文档沿着 Typst 代码的缓存重算链路，详细解释 **tracked 依赖记录怎样参与缓存命中验证**，以及 **文件变化后哪些计算会重跑、哪些结果仍能复用**。
 
-## 1. 概述
+---
 
-Typst 的增量编译建立在 [`comemo`](https://github.com/typst/comemo/) 框架之上。核心思想是：**将编译过程拆分为多个可记忆化的函数，通过追踪函数的输入依赖来决定缓存是否仍然有效**。当输入未变化时，直接复用缓存结果；当输入变化时，只重新计算受影响的部分。
+## 1. 缓存命中验证的两层机制
 
-增量编译发生在编译的各个阶段：
-- **解析阶段**：增量语法解析
-- **求值阶段**：模块级和闭包级缓存
-- **布局阶段**：元素级布局缓存
-- **渲染/导出阶段**：各种细粒度缓存
+一个 `#[comemo::memoize]` 函数的缓存是否命中，需要经过 **两层验证**。理解这两层验证是看懂整条链路的关键。
 
-## 2. 核心框架：comemo
+### 1.1 第一层：参数哈希匹配
 
-### 2.1 核心概念
+所有非 `Tracked`/`TrackedMut` 的参数通过 `Hash + Eq` 比较。这是快速路径：如果参数不同，直接缓存失效，无需进入第二层验证。
 
-comemo 提供了三个核心原语：
+**关键数据结构的哈希实现**：
 
-| 原语 | 作用 |
-|------|------|
-| `#[comemo::memoize]` | 标记函数为可记忆化的，其结果会被缓存 |
-| `#[comemo::track]` | 标记 trait/impl 为可追踪的，其方法调用会被记录为依赖 |
-| `Tracked<T>` / `TrackedMut<T>` | 被追踪的值包装器，作为 memoized 函数的参数 |
+| 类型 | 哈希依据 | 代码位置 |
+|------|---------|---------|
+| `Source` | `Arc<LazyHash<SourceInner>>`，哈希值是 `(id, root, text)` 的内容哈希（延迟计算） | `crates/typst-syntax/src/source.rs:23-32` |
+| `LazyHash<T>` | 首次访问时计算并缓存 `T` 的 128 位哈希，后续直接比较 | `crates/typst-utils/src/hash.rs:72-129` |
+| `Content` | 元素内容 + 样式的内容哈希（derive） | `crates/typst-library/src/foundations/content/mod.rs:81-84` |
+| `Closure` | `ClosureNode(SyntaxNode)` + `defaults` + `captured(Scope)` 的内容哈希（derive） | `crates/typst-library/src/foundations/func.rs:702-721` |
+| `SyntaxNode` | `Node` 数据 + `Span`（derive） | `crates/typst-syntax/src/node.rs:17-25` |
+| `Scope` | 绑定数量 + 逐个绑定的内容哈希 | `crates/typst-library/src/foundations/scope.rs:226-235` |
+| `Route` | 路径栈 + 栈深度（derive） | `crates/typst-library/src/engine.rs:396-429` |
 
-### 2.2 记忆化函数（memoize）
+### 1.2 第二层：Tracked 依赖回放
 
-使用 `#[comemo::memoize]` 标记的函数会：
-- 第一次调用时执行函数体，缓存结果
-- 后续调用时，如果输入相同且所有依赖都未变化，直接返回缓存结果
-- 如果依赖发生变化，重新执行函数体，更新缓存
+对于 `Tracked<T>` 参数，即使参数对象本身不同，只要 **之前记录的所有方法调用都返回相同结果**，缓存仍然命中。
 
-典型的 memoized 函数示例：
-
-- 模块求值：[`eval`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-eval/src/lib.rs#L38-L97)
-- 闭包调用：[`eval_closure`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-eval/src/call.rs#L598-L700)
-- 布局片段：[`layout_fragment_impl`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-layout/src/flow/mod.rs#L108-L150)
-
-### 2.3 可追踪类型（track）
-
-使用 `#[comemo::track]` 标记的 trait 或 impl 块，其方法调用会被记录为依赖。当这些方法的返回值变化时，依赖它们的 memoized 函数缓存会失效。
-
-Typst 中主要的可追踪类型：
-
-| 类型 | 位置 | 作用 |
-|------|------|------|
-| `World` | [`lib.rs`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/lib.rs#L59-L98) | 编译环境（文件、字体、日期等） |
-| `Introspector` | [`introspector.rs`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/introspection/introspector.rs#L28-L89) | 文档内省查询 |
-| `Locator` | [`locator.rs`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/introspection/locator.rs#L208-L223) | 元素定位器 |
-| `Traced` | [`engine.rs`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/engine.rs#L133-L143) | 追踪的 span |
-| `Sink` | [`engine.rs`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/engine.rs#L204-L254) | 诊断信息接收器 |
-| `Route` | [`engine.rs`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/engine.rs#L396-L429) | 编译路径/栈深度 |
-| `Context` | [`context.rs`] | 求值上下文 |
-
-## 3. 依赖追踪与缓存命中的关系
-
-### 3.1 基本原理
-
-依赖追踪是缓存命中的基础。当一个 memoized 函数被调用时：
-
-1. **参数哈希**：函数的所有输入参数（包括 `Tracked` 值）会被哈希，作为缓存键的一部分
-2. **依赖记录**：函数执行过程中，所有对 `Tracked` 值的方法调用都会被记录为依赖
-3. **缓存存储**：函数结果连同其依赖列表一起被缓存
-4. **缓存验证**：下次调用时，先检查参数是否相同，再验证所有依赖是否仍然有效
-
-### 3.2 World 的核心作用
-
-[`World`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/lib.rs#L59-L98) trait 是最核心的依赖来源，因为：
-- 它提供了所有外部输入（源文件、图像、字体、日期等）
-- 它被 `#[comemo::track]` 标记，所有方法调用都会被追踪
-- 当文件内容变化时，`world.source(id)` 的返回值会变化，导致所有依赖该文件的缓存失效
+**验证流程**：
 
 ```
-文件变化 → World 方法返回值变化 → 依赖该方法的缓存失效 → 相关函数重算
+第一次调用 memoized 函数时：
+  1. 执行函数体
+  2. 记录过程中对 Tracked 值的所有方法调用（方法名 + 参数 + 返回值）
+  3. 将调用记录与结果一起存入缓存
+
+后续调用时：
+  1. 参数哈希匹配 → 进入第二层
+  2. 用新的 Tracked 值，按相同顺序、相同参数重新执行所有记录的方法调用
+  3. 比较每次调用的返回值是否与上次一致
+  4. 全部一致 → 缓存命中；任意一个不同 → 缓存失效，重算
 ```
 
-### 3.3 缓存命中的条件
-
-一个 memoized 函数的缓存命中需要满足：
-1. 所有非 `Tracked` 参数值完全相同（通过 `Hash` + `Eq` 比较）
-2. 所有 `Tracked` 参数的依赖集合并未发生变化
-3. 缓存条目未被驱逐（evict）
-
-## 4. 缓存层级与粒度
-
-Typst 的缓存是分层的，不同阶段有不同的缓存粒度：
-
-### 4.1 解析层：增量解析
-
-**粒度**：语法节点级
-
-通过 [`reparse`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-syntax/src/reparser.rs#L15-L29) 函数实现：
-- 只重新解析受编辑影响的最小范围
-- 优先尝试在子块内重解析
-- 如果失败则向外扩展，直到顶层
-- 保持尽可能多的 span 编号稳定
-
-**关键优化**：[`Source::edit`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-syntax/src/source.rs#L104-L112) 方法在原地修改语法树，而不是重新创建，这使得 span 编号尽可能保持稳定，从而提高后续阶段的缓存命中率。
-
-### 4.2 求值层：模块与闭包
-
-**粒度**：模块级 + 闭包级
-
-- **模块缓存**：[`eval`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-eval/src/lib.rs#L38-L97) 函数缓存整个源文件的求值结果
-- **闭包缓存**：[`eval_closure`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-eval/src/call.rs#L598-L700) 函数缓存闭包调用的结果
-
-闭包缓存的精妙之处在于：即使模块被重新求值，只要闭包的语法和捕获变量不变，之前的闭包调用结果仍然可以复用。
-
-### 4.3 布局层：元素级缓存
-
-**粒度**：布局片段级
-
-[`layout_fragment_impl`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-layout/src/flow/mod.rs#L108-L150) 是布局缓存的核心入口：
-- 缓存内容在特定区域中的布局结果
-- 依赖 content、locator、styles、regions 等参数
-- 通过 Locator 的设计优化缓存命中率（见下文）
-
-### 4.4 细粒度缓存
-
-除了上述主要层级，还有大量细粒度的 memoized 函数，例如：
-- 文本塑形（shaping）
-- 图像解码
-- 数学公式布局
-- 书目处理
-- 计数器/状态查询
-
-## 5. 缓存边界优化：Locator 的设计
-
-[`Locator`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/introspection/locator.rs) 是 Typst 增量编译设计中最精妙的部分之一，它展示了如何通过精心设计数据结构来提高缓存命中率。
-
-### 5.1 问题背景
-
-如果布局函数直接接收完整的位置信息作为参数，那么同一段内容在文档的不同位置布局时，缓存会完全失效，因为参数不同。
-
-但实际上，很多内容的布局并不依赖于它在文档中的具体位置（例如，不包含任何需要编号的元素）。对于这些内容，我们希望能够复用缓存。
-
-### 5.2 分层设计
-
-Locator 采用了分层设计：
-
-```
-Locator {
-    local: u128,      // 本地哈希（当前层的信息）
-    outer: Option<&LocatorLink>  // 外层链接（延迟解析）
-}
-```
-
-- **local**：只包含当前 memoization 边界内的信息
-- **outer**：指向更外层的 locator，但通过 `LocatorLink` 间接访问
-
-### 5.3 延迟解析
-
-只有当真正需要生成 `Location`（即调用 `next_location`）时，才会通过 `resolve()` 方法去访问 outer 信息。
-
-这意味着：
-- 如果一段内容布局不需要生成任何 Location（不包含可定位元素），它就不会访问 outer
-- 不访问 outer 意味着不会产生对 outer 的依赖
-- 没有对 outer 的依赖意味着：同一段内容在不同位置布局时，缓存仍然有效！
-
-### 5.4 LocatorLink 的作用
-
-[`LocatorLink`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/introspection/locator.rs#L343-L395) 作为缓存边界：
-- 将 `Tracked<Locator>` 包装起来
-- 缓存 resolve 的结果
-- 只有在真正需要时才 traverse 到外层
-
-## 6. 缓存失效机制
-
-### 6.1 自动失效（依赖驱动）
-
-这是最主要的失效方式。当被追踪的依赖发生变化时，相关缓存自动失效。
-
-**典型场景**：
-1. 源文件内容变化 → `world.source(id)` 返回新的 `Source` → 依赖该文件的 `eval` 缓存失效
-2. 内省结果变化 → `introspector.query(...)` 返回不同结果 → 依赖该查询的布局缓存失效
-3. 日期变化 → `world.today(...)` 返回不同值 → 依赖日期的函数缓存失效
-
-### 6.2 手动驱逐（evict）
-
-[`comemo::evict(n)`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-cli/src/watch.rs#L82) 用于手动驱逐旧的缓存条目。
-
-**在 watch 模式下**：
-```rust
-loop {
-    // ... 等待文件变化 ...
-    compile_once(world, &mut config)?;  // 重新编译
-    comemo::evict(10);  // 驱逐旧缓存，保留最近 10 个版本
-}
-```
-
-参数 `10` 的含义：保留每个 memoized 函数最近的 10 个缓存版本。这是为了控制内存使用，防止无限制增长。
-
-### 6.3 FileStore 的 reset 机制
-
-[`FileStore::reset()`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-kit/src/files.rs#L111-L116) 是文件层面的重置：
-
-```rust
-pub fn reset(&mut self) {
-    for slot in self.slots.get_mut().values_mut() {
-        slot.reset();
-    }
-}
-```
-
-重置后：
-- 所有文件槽位变为 `Empty` 状态
-- 但保留旧的 `Source` 作为 `stale`（陈旧）状态
-- 下次访问时，会重新加载文件内容
-- 如果有 stale source，会尝试用 `source.replace(new_text)` 进行增量更新，而不是从头解析
-
-**这很重要**：通过保留 stale source 并进行增量更新，span 编号尽可能保持稳定，从而提高后续编译阶段的缓存命中率。
-
-## 7. Introspection 循环与 Constraint
-
-### 7.1 为什么需要循环
-
-文档布局存在循环依赖：
-- 布局依赖于内省信息（如页码、计数器、章节号等）
-- 内省信息又来自于布局结果
-
-为了解决这个问题，Typst 采用迭代的方式：
-1. 用空的/上一轮的内省结果开始布局
-2. 布局完成后得到新的内省结果
-3. 检查内省结果是否稳定
-4. 如果不稳定，用新的内省结果再次布局
-5. 最多迭代 5 次
-
-### 7.2 Constraint 的作用
-
-[`comemo::Constraint`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst/src/lib.rs#L144-L158) 用于验证内省结果是否稳定，而无需完全重新计算。
-
-工作流程：
+**代码证据**：Constraint 机制直接展示了这种"记录→回放→比较"的模式（`crates/typst/src/lib.rs:144-161`）：
 
 ```rust
 let constraint = comemo::Constraint::new();
-let introspector = history.last()
-    .map(|doc| doc.introspector())
-    .unwrap_or(&empty_introspector);
-
-// 使用 constraint 来追踪 introspector
-let tracked_introspector = introspector.track_with(&constraint);
-
-// ... 执行布局 ...
-document = T::create(&mut engine, &content, styles)?;
-
-// 验证：新的 introspector 是否与 constraint 兼容
-if constraint.validate(document.introspector()) {
-    // 稳定了，退出循环
-    break;
+// track_with 将 constraint 与 introspector 关联，后续的方法调用会被记录
+let tracked_intr = introspector.track_with(&constraint);
+// ...布局过程中对 tracked_intr 的查询会被记录...
+// 回放验证：用新的 introspector 重新执行所有记录的查询
+if constraint.validate(new_introspector) {
+    // 所有查询结果相同 → 缓存仍有效
 }
 ```
 
-**原理**：
-- `track_with` 将 constraint 与 tracked value 关联
-- 在布局过程中，所有对 introspector 的查询都会记录到 constraint 中
-- `validate` 检查：如果用新的 introspector 重新执行所有记录的查询，结果是否相同
-- 如果所有查询结果都相同，说明内省结果对本次布局没有影响，可以认为稳定了
+Constraint 是 Tracked 依赖验证机制的显式暴露：普通 memoize 函数的缓存验证内部使用的是完全相同的逻辑。
 
-**关键优势**：不是比较整个 introspector 是否相同，而是只比较实际被访问过的查询结果。这大大提高了收敛速度。
+---
 
-## 8. Watch 模式下的完整流程
+## 2. 编译入口：Tracked 值的产生与传递
 
-让我们通过 watch 模式的完整流程来串联所有机制：
+### 2.1 `compile` 函数的 Tracked 链
 
-### 8.1 初始编译
+从 `crates/typst/src/lib.rs:74-82` 开始：
 
-```
-1. 创建 SystemWorld
-2. 调用 typst::compile()
-   ├─ world.track() → 创建 Tracked<dyn World>
-   ├─ 调用 eval() 求值主模块（memoized）
-   │   └─ 依赖：world.source(main)
-   ├─ 进入 introspection 循环
-   │   ├─ 用空 introspector 开始
-   │   ├─ 调用 layout_fragment_impl()（memoized）
-   │   │   └─ 依赖：world, introspector, locator, content, styles, ...
-   │   ├─ 生成 document 和新的 introspector
-   │   └─ 检查是否稳定，不稳定则继续迭代
-   └─ 返回最终结果
-3. 收集依赖：world.dependencies()
-4. 监听依赖文件变化
+```rust
+pub fn compile<T>(world: &dyn World) -> Warned<SourceResult<T>>
+where T: Output,
+{
+    let mut sink = Sink::new();
+    let output = compile_impl::<T>(
+        world.track(),          // Tracked<dyn World>
+        Traced::default().track(), // Tracked<Traced>
+        &mut sink,
+    ).map_err(deduplicate);
+    Warned { output, warnings: sink.warnings() }
+}
 ```
 
-### 8.2 文件变化后重新编译
+`world.track()`（来自 `comemo::Track` trait）将 `&dyn World` 包装为 `Tracked<dyn World>`。这个 `Tracked` 值会沿着调用链传递给所有 memoized 函数。
+
+### 2.2 `compile_impl` 的内部流程
+
+`crates/typst/src/lib.rs:99-194`：
+
+1. **获取主文件**（`L117-120`）：调用 `world.source(main)` —— 这是 Tracked 依赖，返回值变化会使后续依赖该结果的缓存失效
+2. **求值主模块**（`L123-131`）：调用 `typst_eval::eval(world, library, traced, sink.track_mut(), Route::default().track(), &main)`
+3. **introspection 循环**（`L138-185`）：最多迭代 5 次，每次用 `track_with` 绑定 Constraint 来验证稳定性
+
+---
+
+## 3. 逐层分析：文件变化后的重算判定
+
+假设用户编辑了源文件 A 的某一行（该文件 `#import "B.typ"`，B 未变化）。让我们逐层追踪哪些计算重跑、哪些复用。
+
+### 3.0 前置：文件重置与增量解析
+
+`crates/typst-cli/src/watch.rs:78-83` 触发重新编译前，先调用 `SystemWorld::reset()`（`crates/typst-cli/src/world.rs`）：
+
+```rust
+pub fn reset(&mut self) {
+    self.store.reset();  // FileStore 重置
+    self.now = Some(OffsetDateTime::now_utc());
+}
+```
+
+`FileStore::reset()`（`crates/typst-kit/src/files.rs:111-116`）：
+- 每个 `FileSlot` 从 `Parsed(Ok(source), _)` 转为 `Empty(Some(source))` —— 保留旧 source 作为 `stale`
+- 下次访问时走 `FileSlot::source()` 逻辑（`crates/typst-kit/src/files.rs:190-218`）：
+  - 重新加载文件字节
+  - 如果有 `stale` source，调用 `source.replace(new_text)` 做增量更新（`crates/typst-syntax/src/source.rs:85-96`）
+  - `replace` 内部调用 `edit` → `reparse`（`crates/typst-syntax/src/reparser.rs`）实现增量语法解析
+
+**增量解析的效果**：
+- 未被编辑影响的语法节点，其 `SyntaxNode` 对象的内存表示和 Hash **完全不变**
+- 受影响的节点被重新解析，得到新的 Span 编号
+
+这决定了后续各层缓存的命运。
+
+---
+
+### 3.1 第一层：模块求值 `eval`
+
+`crates/typst-eval/src/lib.rs:38-97`
+
+```rust
+#[comemo::memoize]
+pub fn eval(
+    world: Tracked<dyn World + '_>,      // Tracked
+    library: &LazyHash<Library>,          // 非 Tracked：Library 全局不变
+    traced: Tracked<Traced>,              // Tracked
+    sink: TrackedMut<Sink>,               // TrackedMut
+    route: Tracked<Route>,                // Tracked
+    source: &Source,                      // 非 Tracked：直接影响缓存键
+) -> SourceResult<Module>
+```
+
+**判定逻辑**：
+
+| 参数 | 变化情况 | 结果 |
+|------|---------|------|
+| `source`（文件 A） | 内容变了 → `Source` 的 `LazyHash` 重算 → 哈希不同 | **第一层参数不匹配** → 缓存失效，重算 |
+| `source`（文件 B） | B 未编辑，即使经过增量解析，内容哈希不变 | **第一层匹配** → 进入第二层验证 |
+| `world`（文件 B） | `world.source(B_id)` 返回的 Source 与上次相同 | 依赖回放通过 → **缓存命中** ✅ |
+| `route` | 初始调用总是 `Route::default().track()`，不含任何 id | 回放通过 |
+
+**结论**：
+- 文件 A 的 `eval` **重算**（source 参数哈希变了）
+- 文件 B 的 `eval` **完全命中**（source 哈希未变，world 依赖回放通过）
+
+---
+
+### 3.2 第二层：闭包调用 `eval_closure`
+
+`crates/typst-eval/src/call.rs:598-707`
+
+```rust
+#[comemo::memoize]
+pub fn eval_closure(
+    func: &Func,
+    closure: &LazyHash<Closure>,       // 非 Tracked：决定缓存键
+    world: Tracked<dyn World + '_>,
+    library: &LazyHash<Library>,
+    introspector: Tracked<dyn Introspector + '_>,
+    traced: Tracked<Traced>,
+    sink: TrackedMut<Sink>,
+    route: Tracked<Route>,
+    context: Tracked<Context>,
+    args: Args,                         // 非 Tracked：调用参数
+) -> SourceResult<Value>
+```
+
+`Closure` 的哈希结构（`crates/typst-library/src/foundations/func.rs:702-721`）：
+```rust
+pub struct Closure {
+    pub node: ClosureNode,       // SyntaxNode 引用（derive Hash）
+    pub defaults: Vec<Value>,    // 默认参数值
+    pub captured: Scope,         // 捕获的外部变量
+    pub num_pos_params: usize,
+}
+```
+
+**判定逻辑**：
+
+| 场景 | `closure` 哈希 | `args` | `world/introspector` 回放 | 结果 |
+|------|---------------|--------|--------------------------|------|
+| A 中未被修改的闭包 | 语法节点未变 + 捕获变量值未变 → 哈希相同 | 相同调用参数 | 通过（假设外部文件没变化） | **缓存命中** ✅ |
+| A 中被修改的闭包 | 语法节点变了 → 哈希不同 | - | - | **重算** ❌ |
+| B 中所有闭包 | B 整个模块 eval 命中，闭包对象与上次完全相同 | 相同 | 通过 | **缓存命中** ✅ |
+| 同一闭包，不同调用参数 | 相同 | 参数值不同 → 哈希不同 | - | **重算** ❌ |
+
+**关键洞察**：闭包缓存的粒度比模块缓存更细。即使整个模块被重求值，只要某个闭包的**语法节点和捕获变量都没变**，它的调用结果仍然可以直接复用。这是通过 `LazyHash<Closure>` 的内容哈希实现的。
+
+---
+
+### 3.3 第三层：布局片段 `layout_fragment_impl`
+
+`crates/typst-layout/src/flow/mod.rs:108-123`
+
+```rust
+#[comemo::memoize]
+fn layout_fragment_impl(
+    world: Tracked<dyn World + '_>,
+    library: &LazyHash<Library>,
+    introspector: Tracked<dyn Introspector + '_>,
+    traced: Tracked<Traced>,
+    sink: TrackedMut<Sink>,
+    route: Tracked<Route>,
+    content: &Content,               // 非 Tracked：内容决定缓存键
+    locator: Tracked<Locator>,       // Tracked：但延迟访问 outer
+    styles: StyleChain,              // 非 Tracked
+    regions: Regions,                // 非 Tracked
+    columns: NonZeroUsize,           // 非 Tracked
+    column_gutter: Rel<Abs>,         // 非 Tracked
+) -> SourceResult<Fragment>
+```
+
+**判定逻辑**：
+
+| 场景 | `content` 哈希 | `styles` | `locator` 依赖 | `introspector` 依赖 | 结果 |
+|------|---------------|----------|---------------|--------------------|------|
+| B 文件中的内容元素 | Content 对象完全相同（B 未变化） | 相同 | 外层位置可能变，但如果元素不生成 Location（不访问 outer）则不产生依赖 | 不查询或查询结果相同 | **缓存命中** ✅ |
+| A 中未修改段落对应的 Content | Content 哈希相同（语法节点未变） | 相同 | 同上 | 同上 | **缓存命中** ✅ |
+| A 中修改段落对应的 Content | Content 哈希不同 | - | - | - | **重算** ❌ |
+| 带编号的章节元素（counter） | Content 哈希相同 | 相同 | 位置变了 → `next_location` 访问 outer → Locator 依赖不同 | `introspector.query(counter)` 返回值可能变 | **重算** ❌ |
+
+**Locator 分层设计的作用**（`crates/typst-library/src/introspection/locator.rs`）：
+
+`Locator` 本身实现了 `#[comemo::track]`（`crates/typst-library/src/introspection/locator.rs:208-223`）。它的 `local` 哈希只包含当前 memoization 边界内的信息，`outer` 通过 `LocatorLink` 延迟访问：
+
+- 如果元素布局过程中**不调用** `locator.next_location()` → 不产生对 `outer` 的依赖 → 同一段内容在文档不同位置也能命中缓存
+- 如果元素需要编号/定位 → 必须调用 `next_location()` → 依赖 `outer` → 位置变化时缓存失效
+
+这是 Typst 增量布局命中率高的核心原因。
+
+---
+
+### 3.4 其他布局级缓存
+
+| 函数 | 位置 | 关键参数 | 何时重算 |
+|------|------|---------|---------|
+| `layout_par_impl` | `crates/typst-layout/src/inline/mod.rs:70` | `elem: &Packed<ParElem>`, `locator`, `styles`, `regions` | 段落内容变了，或位置变了（若段落需要定位） |
+| `layout_single_impl` | `crates/typst-layout/src/flow/collect.rs:413` | `content`, `locator`, `styles`, `region` | 单元素内容或定位变了 |
+| `layout_multi_impl` | `crates/typst-layout/src/flow/collect.rs:513` | `children`, `locator`, `styles`, `regions` | 子元素列表或定位变了 |
+| `layout_document_impl` | `crates/typst-layout/src/pages/mod.rs:51` | `content`, `introspector`, `styles` | 整文档内容或全局内省结果变了 |
+| `layout_page_run_impl` | `crates/typst-layout/src/pages/run.rs:77` | 页面配置、内容、introspector | 页面级配置变了 |
+
+---
+
+### 3.5 细粒度缓存
+
+| 函数 | 位置 | 关键参数 | 何时重算 |
+|------|------|---------|---------|
+| `create_shape_plan` | `crates/typst-layout/src/inline/shaping.rs:1219` | `font`, `direction`, `text`, `features`, ... | 文本内容、字体、排版特征变了 |
+| `planned`（数学字形） | `crates/typst-layout/src/math/fragment/glyph.rs:108` | `world`, `styles`, `glyph`, `italic_correction` | 字形或样式变了 |
+| `base`（数学字形） | `crates/typst-layout/src/math/fragment/glyph.rs:146` | `world`, `styles`, `family`, `c` | 字符或字体族变了 |
+| `eval_string` | `crates/typst-eval/src/lib.rs:101` | `string`, `scope`, `world`, ... | 字符串内容或作用域变了 |
+
+细粒度缓存的特点：参数中通常不包含 `locator`，也不依赖 `introspector`，因此只要内容本身不变，即使全局位置变化也能命中。例如某段文字的塑形结果在整篇文档中是可复用的。
+
+---
+
+## 4. 完整的重算链路图
+
+以"编辑文件 A 中的一行文字"为例：
 
 ```
-1. 文件变化 → 触发重新编译
-2. world.reset()
-   ├─ FileStore.reset() → 所有文件标记为空（但保留 stale source）
-   └─ 重置日期
-3. 调用 typst::compile()
-   ├─ world.track() → 新的 Tracked<dyn World>
-   ├─ 访问 world.source(main)
-   │   └─ 重新加载文件，尝试增量解析
-   ├─ 调用 eval() 求值主模块
-   │   ├─ 如果 source 没变 → 缓存命中，直接返回
-   │   └─ 如果 source 变了 → 缓存失效，重新求值
-   ├─ 进入布局阶段
-   │   ├─ 对于没变的内容部分 → 缓存命中
-   │   └─ 对于变化的内容部分 → 重新计算
-   └─ ...
-4. comemo::evict(10) → 清理旧缓存
-5. 更新依赖监听列表
+文件 A 磁盘内容变化
+    │
+    ▼
+FileStore.reset()
+  └─ A 的 FileSlot: Parsed → Empty(Some(stale_source))
+     B 的 FileSlot: Parsed → Empty(Some(stale_source))
+    │
+    ▼
+world.source(A_id)
+  └─ 重新加载字节
+     └─ stale_source.replace(new_text) → 增量解析
+        └─ 受影响的 SyntaxNode 被重建，Hash 变化
+        └─ 未受影响的 SyntaxNode 保持不变，Hash 相同
+    │
+    ▼
+eval(world, ..., &source_A)
+  ├─ source_A 的 LazyHash 已变化
+  └─ 第一层参数不匹配 → 重算模块 A
+     ├─ 模块 A 求值过程中，创建新的 Closure 对象
+     │   ├─ 未修改函数的 ClosureNode 指向未变的 SyntaxNode
+     │   │   └─ captured Scope 哈希不变 → Closure 哈希不变
+     │   └─ 修改函数的 ClosureNode 指向新 SyntaxNode
+     │       └─ Closure 哈希变化
+     │
+     ▼ eval(world, ..., &source_B)
+       ├─ source_B 的 LazyHash 没变（B 文件内容相同）
+       └─ 第一层匹配 → 第二层验证
+          └─ world.source(B_id) 返回值与上次相同 → 回放通过
+          └─ ✅ 缓存命中，整个模块 B 不复用
+    │
+    ▼ realize → layout_fragment_impl(...)
+  对每个 Content 元素：
+    ├─ B 文件产生的 Content
+    │   └─ Content 哈希完全相同
+    │   └─ styles 相同
+    │   └─ locator：若不生成 Location → 无 outer 依赖
+    │   └─ ✅ 缓存命中
+    │
+    ├─ A 文件未修改段落的 Content
+    │   └─ SyntaxNode 未变 → Content 哈希相同
+    │   └─ ✅ 缓存命中
+    │
+    └─ A 文件修改段落的 Content
+        └─ SyntaxNode 重建 → Content 哈希不同
+        └─ ❌ 重算布局
+           └─ 内部子元素若 Content 不变，仍可能逐层命中
+    │
+    ▼ 细粒度计算（文本塑形、数学字形等）
+    ├─ 未修改的文本字符串 → create_shape_plan 参数相同 → ✅ 命中
+    └─ 修改的文本字符串 → ❌ 重新塑形
+    │
+    ▼
+  comemo::evict(10) → 每个 memoized 函数保留最近 10 个缓存版本
 ```
 
-### 8.3 缓存复用的层次
+---
 
-当只有一小部分内容变化时，缓存复用是分层的：
+## 5. 关键代码索引
 
-1. **未变化的源文件** → `eval` 缓存完全命中
-2. **变化文件中未变化的闭包** → `eval_closure` 缓存可能命中
-3. **未变化的内容元素** → `layout_fragment_impl` 缓存可能命中
-4. **更细粒度的计算** → 文本塑形、图像解码等缓存可能命中
+### 5.1 Memoized 函数清单
 
-## 9. 关键数据结构与代码路径总结
+| 函数 | 仓库相对路径 |
+|------|------------|
+| `eval` | `crates/typst-eval/src/lib.rs:38` |
+| `eval_string` | `crates/typst-eval/src/lib.rs:101` |
+| `eval_closure` | `crates/typst-eval/src/call.rs:598` |
+| `layout_fragment_impl` | `crates/typst-layout/src/flow/mod.rs:108` |
+| `layout_single_impl` | `crates/typst-layout/src/flow/collect.rs:413` |
+| `layout_multi_impl` | `crates/typst-layout/src/flow/collect.rs:513` |
+| `layout_par_impl` | `crates/typst-layout/src/inline/mod.rs:70` |
+| `layout_document_impl` | `crates/typst-layout/src/pages/mod.rs:51` |
+| `layout_document_for_bundle_impl` | `crates/typst-layout/src/pages/mod.rs:98` |
+| `layout_page_run_impl` | `crates/typst-layout/src/pages/run.rs:77` |
+| `create_shape_plan` | `crates/typst-layout/src/inline/shaping.rs:1219` |
+| `planned` (math glyph) | `crates/typst-layout/src/math/fragment/glyph.rs:108` |
+| `base` (math glyph) | `crates/typst-layout/src/math/fragment/glyph.rs:146` |
 
-### 9.1 核心 memoized 函数
+### 5.2 Tracked Trait 清单
 
-| 函数 | 位置 | 缓存粒度 |
-|------|------|----------|
-| `eval` | [typst-eval/src/lib.rs:38](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-eval/src/lib.rs#L38) | 源文件/模块 |
-| `eval_string` | [typst-eval/src/lib.rs:101](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-eval/src/lib.rs#L101) | 字符串求值 |
-| `eval_closure` | [typst-eval/src/call.rs:598](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-eval/src/call.rs#L598) | 闭包调用 |
-| `layout_fragment_impl` | [typst-layout/src/flow/mod.rs:108](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-layout/src/flow/mod.rs#L108) | 布局片段 |
-| `layout_pages` | [typst-layout/src/pages/mod.rs:51](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-layout/src/pages/mod.rs#L51) | 页面布局 |
+| Trait | 仓库相对路径 |
+|-------|------------|
+| `World` | `crates/typst-library/src/lib.rs:59` |
+| `Introspector` | `crates/typst-library/src/introspection/introspector.rs:28` |
+| `Locator` | `crates/typst-library/src/introspection/locator.rs:208` |
+| `Traced` | `crates/typst-library/src/engine.rs:133` |
+| `Sink` | `crates/typst-library/src/engine.rs:204` |
+| `Route` | `crates/typst-library/src/engine.rs:396` |
+| `Context` | `crates/typst-library/src/engine/context.rs` |
 
-### 9.2 核心 tracked trait
+### 5.3 关键基础类型
 
-| Trait | 位置 | 依赖内容 |
-|-------|------|----------|
-| `World` | [typst-library/src/lib.rs:59](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/lib.rs#L59) | 文件、字体、日期等所有外部输入 |
-| `Introspector` | [typst-library/src/introspection/introspector.rs:28](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/introspection/introspector.rs#L28) | 文档内省查询 |
-| `Locator` | [typst-library/src/introspection/locator.rs:208](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/introspection/locator.rs#L208) | 元素位置/编号 |
-| `Traced` | [typst-library/src/engine.rs:133](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/engine.rs#L133) | 追踪的 span |
-| `Sink` | [typst-library/src/engine.rs:204](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/engine.rs#L204) | 诊断信息 |
-| `Route` | [typst-library/src/engine.rs:396](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst-library/src/engine.rs#L396) | 编译路径/栈深度 |
+| 类型 | 仓库相对路径 | 说明 |
+|------|------------|------|
+| `Source` | `crates/typst-syntax/src/source.rs:24` | `Arc<LazyHash<SourceInner>>`，基于内容的 Hash/Eq |
+| `LazyHash<T>` | `crates/typst-utils/src/hash.rs:72` | 延迟计算并缓存 128 位哈希，直接比较哈希值 |
+| `Content` | `crates/typst-library/src/foundations/content/mod.rs:84` | 类型擦除的内容元素，derive Hash/PartialEq |
+| `Closure` | `crates/typst-library/src/foundations/func.rs:712` | 闭包节点+默认值+捕获作用域，derive Hash |
+| `SyntaxNode` | `crates/typst-syntax/src/node.rs:18` | 语法节点，derive Hash/Eq/PartialEq |
+| `Scope` | `crates/typst-library/src/foundations/scope.rs:105` | 变量绑定表，手动实现 Hash |
+| `FileSlot` | `crates/typst-kit/src/files.rs:129` | 文件状态机：Empty/Loaded/Parsed，保留 stale Source |
+| `FileStore` | `crates/typst-kit/src/files.rs:30` | 全局文件缓存，reset 时保留 stale source |
 
-### 9.3 编译主入口
+### 5.4 编译主流程
 
-[`compile`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst/src/lib.rs#L74-L82) 函数是编译的主入口，内部的 [`compile_impl`](file:///d:/fz/0601-2/solo-dogfeeding/code/131-typst/crates/typst/src/lib.rs#L99-L194) 包含了完整的编译流程和 introspection 循环。
+| 函数 | 仓库相对路径 | 说明 |
+|------|------------|------|
+| `compile` | `crates/typst/src/lib.rs:74` | 编译入口，创建 Tracked 值 |
+| `compile_impl` | `crates/typst/src/lib.rs:99` | 内部实现，包含 eval + introspection 循环 |
+| `replace` | `crates/typst-syntax/src/source.rs:85` | 增量更新 Source 文本 |
+| `edit` | `crates/typst-syntax/src/source.rs:104` | 原地编辑语法树，保持 span 稳定 |
+| `reparse` | `crates/typst-syntax/src/reparser.rs:15` | 增量语法解析核心 |
+| `comemo::evict` | `crates/typst-cli/src/watch.rs:82` | watch 模式下驱逐旧缓存 |
 
-## 10. 设计思想总结
+---
 
-### 10.1 纯度假设
+## 6. 设计思想总结
 
-comemo 的缓存机制建立在一个重要假设之上：**所有 memoized 函数都是纯函数**。
+### 6.1 两层验证 = 快速过滤 + 精确判定
 
-- 相同的输入总是产生相同的输出
-- 函数没有副作用（或者副作用通过 `TrackedMut` 显式管理）
-- 所有外部依赖都通过 `Tracked` 参数传入
+- **第一层（参数哈希）**：快速排除大部分必然失效的情况。例如文件内容变了，`Source` 的哈希直接不同，无需再回放依赖。
+- **第二层（Tracked 依赖回放）**：精确捕获"实际用到了什么"。即使 `World` 对象整体不同（每次编译都重新创建），只要具体调用过的方法返回值不变，缓存就有效。这是增量编译能跨编译轮次复用缓存的根本原因。
 
-这就是为什么 `World` 必须是唯一的外部依赖入口，以及为什么所有可变状态都要用 `TrackedMut` 包装。
+### 6.2 稳定性设计：让 Hash 尽可能不变
 
-### 10.2 细粒度 vs 粗粒度
+整个系统的设计目标是：**编辑后让尽可能多的值保持 Hash 不变**。
 
-Typst 采用了多层次的缓存策略：
-- **粗粒度**：模块级缓存，命中率高但失效代价大
-- **细粒度**：元素级缓存，命中率低但失效代价小
+1. **增量解析**：只重建受影响的语法子树，未受影响的 `SyntaxNode` 对象哈希不变
+2. **LazyHash**：基于内容的延迟哈希，只要内容没变，即使对象重新创建，哈希也相同
+3. **Closure 内容哈希**：即使模块重求值，只要闭包语法和捕获变量没变，`Closure` 哈希就不变
+4. **Locator 分层**：内容不依赖位置时，不产生位置依赖，位置变化不影响缓存
 
-两者结合，既保证了大部分未变化内容的快速复用，又能在变化发生时将重算范围控制在最小。
+### 6.3 纯度假设
 
-### 10.3 稳定性设计
-
-整个系统的设计都在追求一个目标：**让尽可能多的东西在编辑后保持稳定**。
-
-- 增量解析 → 保持语法树和 span 编号的稳定
-- 基于哈希的 location → 保持元素标识的稳定
-- Locator 的分层设计 → 最大化布局缓存的复用
-- Constraint 验证 → 加速内省循环的收敛
-
-这些设计共同作用，使得 Typst 在编辑文档时能够实现近乎实时的增量编译。
+comemo 的所有机制建立在纯函数假设上：memoized 函数的输出完全由其参数（包括 Tracked 依赖）决定，没有隐式副作用。这就是为什么所有外部输入必须通过 `Tracked<dyn World>` 传入，以及为什么可变状态要用 `TrackedMut` 显式包装。
