@@ -8,7 +8,7 @@
 
 ### 1.1 插件加载入口
 
-插件加载的唯一入口是全局 `plugin()` 函数，定义于 [plugin.rs#L148-L156](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L148-L156)。
+插件加载的唯一入口是全局 `plugin()` 函数，定义于 [crates/typst-library/src/foundations/plugin.rs#L148-L156](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L148-L156)。
 
 ```rust
 #[func(scope)]
@@ -25,10 +25,10 @@ pub fn plugin(
 
 | 步骤 | 说明 | 关键代码 |
 |------|------|----------|
-| 1 | 接收 `Spanned<DataSource>`，即带位置信息的数据源（路径或原始字节） | `DataSource` 枚举定义于 [loading/mod.rs#L48-L53](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/loading/mod.rs#L48-L53) |
-| 2 | `source.load(engine.world)` 通过 `World` trait 读取字节 | `Load` trait 实现在 [loading/mod.rs#L82-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/loading/mod.rs#L82-L112) |
+| 1 | 接收 `Spanned<DataSource>`，即带位置信息的数据源（路径或原始字节） | `DataSource` 枚举定义于 [crates/typst-library/src/loading/mod.rs#L48-L53](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/loading/mod.rs#L48-L53) |
+| 2 | `source.load(engine.world)` 通过 `World` trait 读取字节 | `Load` trait 实现在 [crates/typst-library/src/loading/mod.rs#L82-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/loading/mod.rs#L82-L112) |
 | 3 | `Plugin::module(bytes)` 编译 WASM 并包装为 `Module` | 带 `#[comemo::memoize]` 缓存 |
-| 4 | 返回值为 `Module`，内含所有 WASM 导出函数作为 `PluginFunc` | `Plugin::into_module()` 于 [plugin.rs#L365-L380](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L365-L380) |
+| 4 | 返回值为 `Module`，内含所有 WASM 导出函数作为 `PluginFunc` | `Plugin::into_module()` 于 [crates/typst-library/src/foundations/plugin.rs#L365-L380](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L365-L380) |
 
 ### 1.2 模块构建：从 WASM 导出到 Typst 函数
 
@@ -76,7 +76,7 @@ WASM 模块**必须**从 `"typst_env"` 模块导入以下两个函数：
     (func (param i32 i32)))
 ```
 
-这两个函数在 Rust 侧的注册位于 [plugin.rs#L283-L297](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L283-L297)：
+这两个函数在 Rust 侧的注册位于 [crates/typst-library/src/foundations/plugin.rs#L283-L297](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L283-L297)：
 
 ```rust
 let mut linker = wasmi::Linker::new(&engine);
@@ -103,7 +103,7 @@ linker.func_wrap(
 
 由于 Typst 要求函数纯净化（`PluginFunc::call` 被 `#[comemo::memoize]` 标记），插件不能通过普通调用来修改内部状态。Transition API 是为此设计的受控"逃逸口"。
 
-定义于 [plugin.rs#L192-L201](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L192-L201)：
+定义于 [crates/typst-library/src/foundations/plugin.rs#L192-L201](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L192-L201)：
 
 ```rust
 #[func]
@@ -153,7 +153,7 @@ fn transition(&self, func: &str, args: Vec<Bytes>) -> StrResult<Plugin> {
 │  层级关系与相等性策略                                        │
 │                                                                 │
 │  Plugin (私有结构相等)                                              │
-│  ├─ 定义：[plugin.rs#L389-L399](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L389-L399) │
+│  ├─ 定义：plugin.rs#L389-L399                                     │
 │  ├─ PartialEq: self.base.bytes == other.base.bytes          │
 │  │             && self.fingerprint == other.fingerprint             │
 │  └─ Hash:      self.base.bytes.hash(state)                       │
@@ -163,7 +163,7 @@ fn transition(&self, func: &str, args: Vec<Bytes>) -> StrResult<Plugin> {
 │      │ Arc<Plugin> 会 deref 到 Plugin::eq                       │
 │      │                                                           │
 │  PluginFunc (derive PartialEq/Hash)                                  │
-│  ├─ 定义：[plugin.rs#L205](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L205) │
+│  ├─ 定义：plugin.rs#L205                                         │
 │  ├─ 字段: plugin: Arc<Plugin>                                  │
 │  └─ 字段: name: EcoString                                     │
 │  └─ 相等: *self.plugin == *other.plugin && self.name == other.name │
@@ -180,18 +180,23 @@ fn transition(&self, func: &str, args: Vec<Bytes>) -> StrResult<Plugin> {
 │      │ 命中缓存时返回同一个对象                                     │
 │      │                                                           │
 │  Module (指针相等 Arc::ptr_eq)                                       │
-│  ├─ 定义：[module.rs#L177-L181](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/module.rs#L177-L181) │
+│  ├─ 定义：module.rs#L177-L181                                     │
 │  └─ PartialEq: self.name == other.name                           │
 │             && Arc::ptr_eq(&self.inner, &other.inner)                    │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
+
+**图中代码位置引用**：
+- [crates/typst-library/src/foundations/plugin.rs#L389-L399](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L389-L399)
+- [crates/typst-library/src/foundations/plugin.rs#L205](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L205)
+- [crates/typst-library/src/foundations/module.rs#L177-L181](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/module.rs#L177-L181)
 
 #### 1.5.1 fingerprint 计算的正确理解
 
 **之前的错误理解**：`fingerprint = hash(base.bytes, func, args)` 链式哈希
 
 **代码实际计算**：
-[plugin.rs#L330](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L330)
+[crates/typst-library/src/foundations/plugin.rs#L330](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L330)
 
 ```rust
 // 初始 Plugin::new() 中：fingerprint = 0
@@ -213,7 +218,7 @@ fingerprint 是**纯哈希链**，仅包含：
 
 #### 1.5.2 测试用例为什么 `hello == hello2` 返回 true
 
-看测试 [plugin.typ#L39-L41](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/tests/suite/foundations/plugin.typ#L39-L41)
+看测试 [tests/suite/foundations/plugin.typ#L39-L41](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/tests/suite/foundations/plugin.typ#L39-L41)
 
 ```typst
 #let hello = plugin.transition(empty.add, bytes("hello"))
@@ -223,19 +228,19 @@ fingerprint 是**纯哈希链**，仅包含：
 
 **相等性链条**：
 
-1. `hello` 和 `hello2` 是 `Module` 类型，`Module::eq` 使用 `Arc::ptr_eq`（比较内部 Arc 指针是否相同
+1. `hello` 和 `hello2` 是 `Module` 类型，`Module::eq` 使用 `Arc::ptr_eq`（比较内部 Arc 指针是否相同）
 
-2. 第一次调用 `plugin.transition(empty.add, bytes("hello"))：
-   - 参数：`func = empty.add`（`PluginFunc { plugin: Arc<empty_plugin>, name: "add" }`
+2. 第一次调用 `plugin.transition(empty.add, bytes("hello"))`
+   - 参数：`func = empty.add`（`PluginFunc { plugin: Arc<empty_plugin>, name: "add" }`）
    - `args = [bytes("hello")]`
    - 进入 `#[comemo::memoize]` 的 `PluginFunc::transition(self, args)`
    - comemo 计算 key：`(self, args)`
    - 未命中缓存，实际执行 transition，返回新 Module，存入缓存
 
-3. 第二次调用 `plugin.transition(empty.add, bytes("hello"))：
+3. 第二次调用 `plugin.transition(empty.add, bytes("hello"))`
    - `func = empty.add` 与第一次的 empty.add 来自同一个 empty 插件，`PluginFunc` 相等（相同的 `Plugin` 部分 + 相同 name "add"）
    - `args = [bytes("hello")]` 内容相同
-   - comemo 命中缓存，**返回同一个 Module**（clone 出的 Arc 指针相同
+   - comemo 命中缓存，**返回同一个 Module**（clone 出的 Arc 指针相同）
 
 4. `hello == hello2` 比较 `Arc::ptr_eq`，返回 true
 
@@ -248,7 +253,7 @@ fingerprint 是**纯哈希链**，仅包含：
 ```
 
 **不相等的原因**：
-- `args` 分别是 `bytes("hello") vs `bytes("world")`，内容不同
+- `args` 分别是 `bytes("hello")` vs `bytes("world")`，内容不同
 - comemo 不命中缓存，返回两个**不同的 Module**
 - `Arc::ptr_eq` 比较两个不同的 Arc 指针，返回 false
 
@@ -326,7 +331,7 @@ fingerprint 是**纯哈希链**，仅包含：
 
 ### 2.2 参数提取：`Args::all::<Bytes>()`
 
-在 [func.rs#L353-L358](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/func.rs#L353-L358)：
+在 [crates/typst-library/src/foundations/func.rs#L353-L358](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/func.rs#L353-L358)：
 
 ```rust
 FuncInner::Plugin(func) => {
@@ -337,7 +342,7 @@ FuncInner::Plugin(func) => {
 }
 ```
 
-**`args.all::<Bytes>()` 的语义**（[args.rs#L192-L210](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/args.rs#L192-L210)）：
+**`args.all::<Bytes>()` 的语义**（[crates/typst-library/src/foundations/args.rs#L192-L210](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/args.rs#L192-L210)）：
 - 遍历所有**位置参数**（忽略命名参数）
 - 对每个参数尝试 `T::castable(&value)` 和 `T::from_value(value)`
 - 任何一个位置参数无法 cast 为 `Bytes`，就报错并带 span
@@ -368,7 +373,7 @@ WASM 插件需要自行：
 
 ### 2.4 宿主-插件通信的核心：`CallData`
 
-每个 wasmi `Store` 携带一份用户数据，类型为 `CallData`，定义于 [plugin.rs#L557-L566](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L557-L566)：
+每个 wasmi `Store` 携带一份用户数据，类型为 `CallData`，定义于 [crates/typst-library/src/foundations/plugin.rs#L557-L566](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L557-L566)：
 
 ```rust
 #[derive(Default)]
@@ -625,7 +630,7 @@ match code {
 
 5. **fingerprint 的构成（易错点）**：
    - ❌ 错误：`fingerprint = hash(base.bytes, func, args)` 链式
-   - ✅ 正确：`fingerprint` 是纯哈希链 `h_n = hash128(&(h_{n-1}, func, args)`，`h_0 = 0`
+   - ✅ 正确：`fingerprint` 是纯哈希链 `h_n = hash128(&(h_{n-1}, func, args))`，`h_0 = 0`
    - `base.bytes` 只在 `Plugin::PartialEq` 和 `Plugin::Hash` 中使用，不在 fingerprint 内部
 
 6. **四层相等性策略（易错点）**：
@@ -647,20 +652,20 @@ match code {
 
 | 功能 | 文件 | 行号范围 |
 |------|------|----------|
-| 插件加载入口 `plugin()` | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L148-L156 |
-| Transition 函数 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L192-L201 |
-| `Plugin` 结构与实例池 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L242-L400 |
-| `Plugin::transition` 指纹计算 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L328-L352 |
-| `Plugin::PartialEq` 和 `Hash` | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L389-L399 |
-| `PluginFunc` derive(PartialEq,Hash) | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L205 |
-| `PluginFunc::call` memoize | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L219-L224 |
-| `PluginFunc::transition` memoize | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L226-L231 |
-| `Module::PartialEq` ptr_eq | [module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/module.rs) | L177-L181 |
-| `PluginInstance::call` 核心调用 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L447-L520 |
-| 快照/恢复机制 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L524-L545 |
-| 宿主导入函数实现 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L577-L612 |
-| `Func` 对 Plugin 的分发 | [func.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/func.rs) | L353-L358 |
-| `DataSource` 与 `Load` trait | [loading/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/loading/mod.rs) | L46-L154 |
-| `Args::all::<T>()` 参数提取 | [args.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/args.rs) | L191-L210 |
-| 插件测试用例（含 transition 相等性） | [plugin.typ](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/tests/suite/foundations/plugin.typ) | L23-L41 |
-| `typst_utils::hash128` | [hash.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-utils/src/hash.rs) | L10-L30 |
+| 插件加载入口 `plugin()` | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L148-L156 |
+| Transition 函数 | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L192-L201 |
+| `Plugin` 结构与实例池 | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L242-L400 |
+| `Plugin::transition` 指纹计算 | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L328-L352 |
+| `Plugin::PartialEq` 和 `Hash` | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L389-L399 |
+| `PluginFunc` derive(PartialEq,Hash) | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L205 |
+| `PluginFunc::call` memoize | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L219-L224 |
+| `PluginFunc::transition` memoize | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L226-L231 |
+| `Module::PartialEq` ptr_eq | [crates/typst-library/src/foundations/module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/module.rs) | L177-L181 |
+| `PluginInstance::call` 核心调用 | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L447-L520 |
+| 快照/恢复机制 | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L524-L545 |
+| 宿主导入函数实现 | [crates/typst-library/src/foundations/plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L577-L612 |
+| `Func` 对 Plugin 的分发 | [crates/typst-library/src/foundations/func.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/func.rs) | L353-L358 |
+| `DataSource` 与 `Load` trait | [crates/typst-library/src/loading/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/loading/mod.rs) | L46-L154 |
+| `Args::all::<T>()` 参数提取 | [crates/typst-library/src/foundations/args.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/args.rs) | L191-L210 |
+| 插件测试用例（含 transition 相等性） | [tests/suite/foundations/plugin.typ](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/tests/suite/foundations/plugin.typ) | L23-L41 |
+| `typst_utils::hash128` | [crates/typst-utils/src/hash.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-utils/src/hash.rs) | L10-L30 |
