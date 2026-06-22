@@ -17,7 +17,7 @@ StyleChain (链表式作用域)
               └── Revocation    ← 撤销特定 Recipe
 ```
 
-代码位置：[crates/typst-library/src/foundations/styles.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs)
+代码位置：[crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs)
 
 ---
 
@@ -25,7 +25,7 @@ StyleChain (链表式作用域)
 
 ### 2.1 Set 规则的求值
 
-Set 规则的求值入口在 [crates/typst-eval/src/rules.rs#L11-L35](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs#L11-L35)：
+Set 规则的求值入口在 [crates/typst-eval/src/rules.rs#L11-L35](crates/typst-eval/src/rules.rs#L11-L35)：
 
 ```rust
 impl Eval for ast::SetRule<'_> {
@@ -62,7 +62,7 @@ impl Eval for ast::SetRule<'_> {
 
 ### 2.2 Show 规则的求值
 
-Show 规则的求值同样在 [crates/typst-eval/src/rules.rs#L37-L64](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs#L37-L64)：
+Show 规则的求值同样在 [crates/typst-eval/src/rules.rs#L37-L64](crates/typst-eval/src/rules.rs#L37-L64)：
 
 ```rust
 impl Eval for ast::ShowRule<'_> {
@@ -90,7 +90,7 @@ impl Eval for ast::ShowRule<'_> {
 }
 ```
 
-**Recipe 结构**（[crates/typst-library/src/foundations/styles.rs#L447-L461](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs#L447-L461)）：
+**Recipe 结构**（[crates/typst-library/src/foundations/styles.rs#L447-L461](crates/typst-library/src/foundations/styles.rs#L447-L461)）：
 ```rust
 pub struct Recipe {
     selector: Option<Selector>,    // None = everything show rule
@@ -107,7 +107,7 @@ pub struct Recipe {
 
 ### 2.3 规则在 Markup/Code 流中的挂载
 
-规则求值后，如何作用于后续内容？关键在 [crates/typst-eval/src/markup.rs#L26-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/markup.rs#L26-L87) 和 [crates/typst-eval/src/code.rs#L24-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/code.rs#L24-L72) 的递归求值：
+规则求值后，如何作用于后续内容？关键在 [crates/typst-eval/src/markup.rs#L26-L87](crates/typst-eval/src/markup.rs#L26-L87) 和 [crates/typst-eval/src/code.rs#L24-L72](crates/typst-eval/src/code.rs#L24-L72) 的递归求值：
 
 **Markup 模式**：
 ```rust
@@ -133,7 +133,7 @@ fn eval_markup(vm: &mut Vm, exprs: &mut impl Iterator<Item = ast::Expr>) {
 }
 ```
 
-**`styled_with_recipe` 的特殊处理**（[crates/typst-library/src/foundations/content/mod.rs#L321-L333](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/content/mod.rs#L321-L333)）：
+**`styled_with_recipe` 的特殊处理**（[crates/typst-library/src/foundations/content/mod.rs#L321-L333](crates/typst-library/src/foundations/content/mod.rs#L321-L333)）：
 ```rust
 pub fn styled_with_recipe(self, engine, context, recipe) -> SourceResult<Self> {
     if recipe.selector().is_none() {
@@ -156,7 +156,7 @@ pub fn styled_with_recipe(self, engine, context, recipe) -> SourceResult<Self> {
 
 `StyleChain` 是一个**不可变的链表结构**，用于高效表达嵌套作用域而无需复制样式：
 
-[crates/typst-library/src/foundations/styles.rs#L557-L770](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs#L557-L770)
+[crates/typst-library/src/foundations/styles.rs#L557-L770](crates/typst-library/src/foundations/styles.rs#L557-L770)
 
 ```rust
 pub struct StyleChain<'a> {
@@ -179,7 +179,7 @@ chain2 = StyleChain { head: local_styles.0.as_slice(), tail: Some(&chain1) }
 
 `StyleChain::entries()` 迭代器按 **从内到外**（优先级从高到低）遍历：
 
-[crates/typst-library/src/foundations/styles.rs#L825-L846](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs#L825-L846)
+[crates/typst-library/src/foundations/styles.rs#L825-L846](crates/typst-library/src/foundations/styles.rs#L825-L846)
 ```rust
 impl<'a> Iterator for Entries<'a> {
     fn next(&mut self) -> Option<Self::Item> {
@@ -209,7 +209,7 @@ impl<'a> Iterator for Entries<'a> {
 
 对于需要合并的属性（如 stroke 的 thickness + color），使用 `Fold` trait：
 
-[crates/typst-library/src/foundations/styles.rs#L652-L664](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs#L652-L664)
+[crates/typst-library/src/foundations/styles.rs#L652-L664](crates/typst-library/src/foundations/styles.rs#L652-L664)
 
 ```rust
 fn get_folded<T>(self, func, id, fold, default) -> T {
@@ -226,7 +226,7 @@ fn get_folded<T>(self, func, id, fold, default) -> T {
 
 ### 4.1 Selector 类型体系
 
-[crates/typst-library/src/foundations/selector.rs#L74-L104](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/selector.rs#L74-L104)
+[crates/typst-library/src/foundations/selector.rs#L74-L104](crates/typst-library/src/foundations/selector.rs#L74-L104)
 
 ```rust
 pub enum Selector {
@@ -245,7 +245,7 @@ pub enum Selector {
 
 并非所有 Selector 都可用于 show 规则。`ShowableSelector` 做了验证：
 
-[crates/typst-library/src/foundations/selector.rs#L508-L544](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/selector.rs#L508-L544)
+[crates/typst-library/src/foundations/selector.rs#L508-L544](crates/typst-library/src/foundations/selector.rs#L508-L544)
 
 ```rust
 fn validate(selector: &Selector, nested: bool) -> Result {
@@ -264,7 +264,7 @@ fn validate(selector: &Selector, nested: bool) -> Result {
 
 ### 4.3 matches 方法实现
 
-[crates/typst-library/src/foundations/selector.rs#L131-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/selector.rs#L131-L155)
+[crates/typst-library/src/foundations/selector.rs#L131-L155](crates/typst-library/src/foundations/selector.rs#L131-L155)
 
 ```rust
 pub fn matches(&self, target: &Content, styles: Option<StyleChain>) -> bool {
@@ -293,7 +293,7 @@ pub fn matches(&self, target: &Content, styles: Option<StyleChain>) -> bool {
 
 正则选择器 `Regex` 不在 `Selector::matches` 中处理，而是在 realization 的 **TEXTUAL 分组**阶段特殊处理：
 
-[crates/typst-realize/src/lib.rs#L1019-L1043](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L1019-L1043)
+[crates/typst-realize/src/lib.rs#L1019-L1043](crates/typst-realize/src/lib.rs#L1019-L1043)
 
 流程：
 1. `TEXTUAL` 分组规则收集连续的 `TextElem / LinebreakElem / SmartQuoteElem`（中间可穿插 `SpaceElem`）
@@ -305,7 +305,7 @@ pub fn matches(&self, target: &Content, styles: Option<StyleChain>) -> bool {
 
 ## 五、Realization 阶段的递归处理
 
-Realization 是整个规则系统的核心执行阶段。入口在 [crates/typst-realize/src/lib.rs#L44-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L44-L76)。
+Realization 是整个规则系统的核心执行阶段。入口在 [crates/typst-realize/src/lib.rs#L44-L76](crates/typst-realize/src/lib.rs#L44-L76)。
 
 ### 5.1 整体遍历流程
 
@@ -327,7 +327,7 @@ visit(content, styles)
 
 ### 5.2 verdict：选择要应用的规则
 
-[crates/typst-realize/src/lib.rs#L438-L531](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L438-L531)
+[crates/typst-realize/src/lib.rs#L438-L531](crates/typst-realize/src/lib.rs#L438-L531)
 
 这是整个匹配逻辑的核心：
 
@@ -391,7 +391,7 @@ fn verdict<'a>(engine, elem, styles) -> Option<Verdict<'a>> {
 
 ### 5.3 visit_show_rules：递归应用
 
-[crates/typst-realize/src/lib.rs#L354-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L354-L434)
+[crates/typst-realize/src/lib.rs#L354-L434](crates/typst-realize/src/lib.rs#L354-L434)
 
 ```rust
 fn visit_show_rules(s, content, styles) -> Result<bool> {
@@ -449,7 +449,7 @@ fn visit_show_rules(s, content, styles) -> Result<bool> {
 
 ### 5.4 prepare：元素的"第一次初始化"
 
-[crates/typst-realize/src/lib.rs#L534-L591](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L534-L591)
+[crates/typst-realize/src/lib.rs#L534-L591](crates/typst-realize/src/lib.rs#L534-L591)
 
 只在元素第一次被处理时执行：
 
@@ -486,7 +486,7 @@ fn prepare(engine, locator, elem, map, styles) -> Result<Option<(Tag, Tag)>> {
 
 ### 5.5 visit_styled：构建 StyleChain
 
-[crates/typst-realize/src/lib.rs#L593-L694](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L593-L694)
+[crates/typst-realize/src/lib.rs#L593-L694](crates/typst-realize/src/lib.rs#L593-L694)
 
 ```rust
 fn visit_styled(s, content, local, outer) -> Result<()> {
@@ -578,25 +578,25 @@ Hello world.
 
 | 概念 | 文件 | 关键行 |
 |------|------|--------|
-| Set 规则求值 | [crates/typst-eval/src/rules.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs) | L11-L35 |
-| Show 规则求值 | [crates/typst-eval/src/rules.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs) | L37-L64 |
-| Recipe 结构 | [crates/typst-library/src/foundations/styles.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs) | L445-L511 |
-| StyleChain 结构 | [crates/typst-library/src/foundations/styles.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs) | L557-L786 |
-| Selector::matches | [crates/typst-library/src/foundations/selector.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/selector.rs) | L131-L155 |
-| Realization 入口 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L44-L76 |
-| visit 主流程 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L243-L296 |
-| verdict 核心匹配 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L438-L531 |
-| visit_show_rules 递归 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L354-L434 |
-| prepare 首次初始化 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L534-L591 |
-| visit_styled 构建链 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L593-L694 |
-| Content::styled_with_recipe | [crates/typst-library/src/foundations/content/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/content/mod.rs) | L321-L333 |
-| Element::set 分派 | [crates/typst-library/src/foundations/content/element.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/content/element.rs) | L69-L74 |
-| Set trait 定义 | [crates/typst-library/src/foundations/content/element.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/content/element.rs) | L239-L245 |
-| ShowSet trait 定义 | [crates/typst-library/src/foundations/content/element.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/content/element.rs) | L255-L263 |
-| Markup 规则挂载 | [crates/typst-eval/src/markup.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/markup.rs) | L26-L87 |
-| Code 规则挂载 | [crates/typst-eval/src/code.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/code.rs) | L24-L72 |
-| TEXTUAL 分组+正则 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L1019-L1374 |
-| NativeRuleMap 内置规则 | [crates/typst-library/src/foundations/styles.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs) | L985-L1085 |
+| Set 规则求值 | [crates/typst-eval/src/rules.rs](crates/typst-eval/src/rules.rs) | L11-L35 |
+| Show 规则求值 | [crates/typst-eval/src/rules.rs](crates/typst-eval/src/rules.rs) | L37-L64 |
+| Recipe 结构 | [crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs) | L445-L511 |
+| StyleChain 结构 | [crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs) | L557-L786 |
+| Selector::matches | [crates/typst-library/src/foundations/selector.rs](crates/typst-library/src/foundations/selector.rs) | L131-L155 |
+| Realization 入口 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L44-L76 |
+| visit 主流程 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L243-L296 |
+| verdict 核心匹配 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L438-L531 |
+| visit_show_rules 递归 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L354-L434 |
+| prepare 首次初始化 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L534-L591 |
+| visit_styled 构建链 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L593-L694 |
+| Content::styled_with_recipe | [crates/typst-library/src/foundations/content/mod.rs](crates/typst-library/src/foundations/content/mod.rs) | L321-L333 |
+| Element::set 分派 | [crates/typst-library/src/foundations/content/element.rs](crates/typst-library/src/foundations/content/element.rs) | L69-L74 |
+| Set trait 定义 | [crates/typst-library/src/foundations/content/element.rs](crates/typst-library/src/foundations/content/element.rs) | L239-L245 |
+| ShowSet trait 定义 | [crates/typst-library/src/foundations/content/element.rs](crates/typst-library/src/foundations/content/element.rs) | L255-L263 |
+| Markup 规则挂载 | [crates/typst-eval/src/markup.rs](crates/typst-eval/src/markup.rs) | L26-L87 |
+| Code 规则挂载 | [crates/typst-eval/src/code.rs](crates/typst-eval/src/code.rs) | L24-L72 |
+| TEXTUAL 分组+正则 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L1019-L1374 |
+| NativeRuleMap 内置规则 | [crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs) | L985-L1085 |
 
 ---
 
@@ -624,7 +624,7 @@ Hello world.
 
 Realization 有 5 种模式，决定了当前处理上下文是否被视为"容器内部"：
 
-[crates/typst-library/src/routines.rs#L153-L169](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/routines.rs#L153-L169)
+[crates/typst-library/src/routines.rs#L153-L169](crates/typst-library/src/routines.rs#L153-L169)
 
 ```rust
 pub enum RealizationKind<'a> {
@@ -636,7 +636,7 @@ pub enum RealizationKind<'a> {
 }
 ```
 
-**outside 标志的初始化**（[crates/typst-realize/src/lib.rs#L66](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L66)：
+**outside 标志的初始化**（[crates/typst-realize/src/lib.rs#L66](crates/typst-realize/src/lib.rs#L66)：
 ```rust
 outside: matches!(kind, RealizationKind::Document { .. }),
 ```
@@ -645,7 +645,7 @@ outside: matches!(kind, RealizationKind::Document { .. }),
 
 ### 9.2 容器边界判定：set document / set page 的禁区
 
-在 `visit_styled` 中对 document 和 page 样式做严格的边界检查（[crates/typst-realize/src/lib.rs#L605-L656](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L605-L656)：
+在 `visit_styled` 中对 document 和 page 样式做严格的边界检查（[crates/typst-realize/src/lib.rs#L605-L656](crates/typst-realize/src/lib.rs#L605-L656)：
 
 | RealizationKind | set document | set page |
 |-----------------|--------------|----------|
@@ -655,7 +655,7 @@ outside: matches!(kind, RealizationKind::Document { .. }),
 | `Par` | ❌ 同上 | ❌ 同上 |
 | `Math` | ❌ 同上 | ❌ 同上 |
 
-**set page 在 Document + Paged Target 的特殊行为**（[crates/typst-realize/src/lib.rs#L636-L641](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L636-L641)：
+**set page 在 Document + Paged Target 的特殊行为**（[crates/typst-realize/src/lib.rs#L636-L641](crates/typst-realize/src/lib.rs#L636-L641)：
 ```rust
 Target::Paged => {
     // 当遇到 page styles 时，我们从 show rule 笼子里"破笼而出"
@@ -678,9 +678,9 @@ style.liftable()  ← 源自 set 规则（非直接构造）
 style.outside()   ← 源自 Document 顶层或被 set page 越狱后标记
 ```
 
-两个标志独立设置，通过 `Styles::outside()` 遍历所有样式设置 outside=true（[crates/typst-library/src/foundations/styles.rs#L92-L102](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs#L92-L102)。
+两个标志独立设置，通过 `Styles::outside()` 遍历所有样式设置 outside=true（[crates/typst-library/src/foundations/styles.rs#L92-L102](crates/typst-library/src/foundations/styles.rs#L92-L102)。
 
-**outside 标志在 show rule 中的继承**（[crates/typst-realize/src/lib.rs#L419-L420](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L419-L420)：
+**outside 标志在 show rule 中的继承**（[crates/typst-realize/src/lib.rs#L419-L420](crates/typst-realize/src/lib.rs#L419-L420)：
 ```rust
 let prev_outside = s.outside;
 s.outside &= content.is::<ContextElem>();  // 进入 show rule 时 outside 清零
@@ -700,7 +700,7 @@ s.outside = prev_outside;  // 退出 show rule 时恢复
 
 ### 10.1 Target 枚举与 TargetElem
 
-[crates/typst-library/src/foundations/target.rs#L65-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/target.rs#L65-L91)
+[crates/typst-library/src/foundations/target.rs#L65-L91](crates/typst-library/src/foundations/target.rs#L65-L91)
 
 ```rust
 pub enum Target {
@@ -721,7 +721,7 @@ pub struct TargetElem {
 
 ### 10.2 Target 属性注入入口
 
-[crates/typst/src/lib.rs#L111-L113](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst/src/lib.rs#L111-L113)
+[crates/typst/src/lib.rs#L111-L113](crates/typst/src/lib.rs#L111-L113)
 
 ```rust
 let base = StyleChain::new(&library.styles);
@@ -738,7 +738,7 @@ let styles = base.chain(&target);
 
 #### 告警 A：show page 规则求值告警（发生在 Eval 阶段，与 Target 无关）
 
-代码位置：[crates/typst-eval/src/rules.rs#L66-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs#L66-L77)
+代码位置：[crates/typst-eval/src/rules.rs#L66-L77](crates/typst-eval/src/rules.rs#L66-L77)
 
 ```rust
 /// Warns that `show page` rules currently have no effect.
@@ -755,7 +755,7 @@ fn check_show_page_rule(vm: &mut Vm, recipe: &Recipe) {
 }
 ```
 
-调用时机：Show 规则求值时（[crates/typst-eval/src/rules.rs#L59](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs#L59)）
+调用时机：Show 规则求值时（[crates/typst-eval/src/rules.rs#L59](crates/typst-eval/src/rules.rs#L59)）
 ```rust
 let recipe = Recipe::new(selector, transform, self.span());
 check_show_page_rule(vm, &recipe);        // ← 告警 A
@@ -776,7 +776,7 @@ check_show_par_set_block(vm, &recipe);    // ← spacing 迁移提示
 
 #### 告警 B：HTML 下 set page 告警（发生在 Realization 阶段，Target=Html 专属）
 
-代码位置：[crates/typst-realize/src/lib.rs#L642-L646](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L642-L646)
+代码位置：[crates/typst-realize/src/lib.rs#L642-L646](crates/typst-realize/src/lib.rs#L642-L646)
 
 ```rust
 Target::Html => {
@@ -811,7 +811,7 @@ Target::Html => {
 
 ### 10.4 Builtin Show Rule 与 Target 的关系
 
-每个元素的内置 show rule 按 Target 分别注册在 `NativeRuleMap` 中（[crates/typst-library/src/foundations/styles.rs#L985-L1085](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs#L985-L1085)）：
+每个元素的内置 show rule 按 Target 分别注册在 `NativeRuleMap` 中（[crates/typst-library/src/foundations/styles.rs#L985-L1085](crates/typst-library/src/foundations/styles.rs#L985-L1085)）：
 
 在 verdict 中查找 builtin rule 时：
 ```rust
@@ -829,7 +829,7 @@ if let Some(rule) = engine.library.rules.get(target, elem) {
 
 ### 11.1 架构变更背景：Par 不再是 Block
 
-迁移提示的核心代码在 [crates/typst-eval/src/rules.rs#L79-L95](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs#L79-L95)：
+迁移提示的核心代码在 [crates/typst-eval/src/rules.rs#L79-L95](crates/typst-eval/src/rules.rs#L79-L95)：
 
 ```rust
 /// Migration hint for `show par: set block(spacing: ..)`.
@@ -861,7 +861,7 @@ fn check_show_par_set_block(vm: &mut Vm, recipe: &Recipe) {
 
 两种间距属性定义在不同元素上，用途完全不同：
 
-**ParElem.spacing**（[crates/typst-library/src/model/par.rs#L213-L225](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/model/par.rs#L213-L225)）：
+**ParElem.spacing**（[crates/typst-library/src/model/par.rs#L213-L225](crates/typst-library/src/model/par.rs#L213-L225)）：
 ```rust
 /// The spacing between paragraphs.
 ///
@@ -877,7 +877,7 @@ fn check_show_par_set_block(vm: &mut Vm, recipe: &Recipe) {
 pub spacing: Length,
 ```
 
-**BlockElem.above / BlockElem.below**（[crates/typst-library/src/layout/container.rs#L318-L354](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/layout/container.rs#L318-L354)）：
+**BlockElem.above / BlockElem.below**（[crates/typst-library/src/layout/container.rs#L318-L354](crates/typst-library/src/layout/container.rs#L318-L354)）：
 ```rust
 /// The spacing around the block. When `{auto}`, inherits the paragraph
 /// @par.spacing[`spacing`].
@@ -934,7 +934,7 @@ pub below: Smart<Spacing>,
 
 ### 11.5 Par 分组规则与元素构造
 
-Par 分组规则（[crates/typst-realize/src/lib.rs#L1045-L1073](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L1045-L1073)）触发的结果是通过 `finish_par`（[crates/typst-realize/src/lib.rs#L1190-L1205](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L1190-L1205)）构造出纯粹的 ParElem：
+Par 分组规则（[crates/typst-realize/src/lib.rs#L1045-L1073](crates/typst-realize/src/lib.rs#L1045-L1073)）触发的结果是通过 `finish_par`（[crates/typst-realize/src/lib.rs#L1190-L1205](crates/typst-realize/src/lib.rs#L1190-L1205)）构造出纯粹的 ParElem：
 
 ```rust
 fn finish_par(mut grouped: Grouped) -> SourceResult<()> {
@@ -976,14 +976,14 @@ fn finish_par(mut grouped: Grouped) -> SourceResult<()> {
 
 ### 12.1 RecipeIndex 的计算方式
 
-[crates/typst-library/src/foundations/styles.rs#L526-L528](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs#L526-L528)
+[crates/typst-library/src/foundations/styles.rs#L526-L528](crates/typst-library/src/foundations/styles.rs#L526-L528)
 
 ```rust
 // "从链顶开始"计数的 Recipe 编号
 pub struct RecipeIndex(pub usize);
 ```
 
-在 verdict 中计算（[crates/typst-realize/src/lib.rs#L491-L493](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L491-L493)）：
+在 verdict 中计算（[crates/typst-realize/src/lib.rs#L491-L493](crates/typst-realize/src/lib.rs#L491-L493)）：
 
 ```
 StyleChain（从顶到底遍历 = 从内层到外层）
@@ -1015,7 +1015,7 @@ output.into_owned().guarded(guard)  // 在 Content 上打 guard 标记
 if elem.is_guarded(index) { continue; }  // 已 guard → 跳过此Recipe
 ```
 
-Guard 标记存储在 `Content.guards: SmallBitSet` 上（[crates/typst-library/src/foundations/content/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/content/mod.rs)）。
+Guard 标记存储在 `Content.guards: SmallBitSet` 上（[crates/typst-library/src/foundations/content/mod.rs](crates/typst-library/src/foundations/content/mod.rs)）。
 
 特点：
 - 每个 Recipe 只对**它自己产生的输出**打 guard
@@ -1028,7 +1028,7 @@ Guard 标记存储在 `Content.guards: SmallBitSet` 上（[crates/typst-library/
 
 因为正则匹配是在 TEXTUAL 分组阶段进行的，操作的是**文本字符串**不是元素**，guard 打在元素上，但分组里跨元素操作，需要在 StyleChain 级别撤销。
 
-[crates/typst-realize/src/lib.rs#L1465-L1470](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L1465-L1470)
+[crates/typst-realize/src/lib.rs#L1465-L1470](crates/typst-realize/src/lib.rs#L1465-L1470)
 
 ```rust
 let output = recipe.apply(s.engine, context.track(), matched_text)?;
@@ -1038,7 +1038,7 @@ let chained = outer.chain(s.arenas.styles.alloc(revocation));
 visit(s, s.store(output), chained)?;  // 用带 Revocation 的链递归
 ```
 
-在 `find_regex_match_in_str` 中检测（[crates/typst-realize/src/lib.rs#L1321-L1374](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs#L1321-L1374)）：
+在 `find_regex_match_in_str` 中检测（[crates/typst-realize/src/lib.rs#L1321-L1374](crates/typst-realize/src/lib.rs#L1321-L1374)）：
 
 ```rust
 let mut revoked = SmallBitSet::new();
@@ -1074,7 +1074,7 @@ for entry in styles.entries() {
 
 ### 13.1 import：只导命名空间，不带规则
 
-[crates/typst-eval/src/import.rs#L15-L181](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/import.rs#L15-L181)
+[crates/typst-eval/src/import.rs#L15-L181](crates/typst-eval/src/import.rs#L15-L181)
 
 `#import "lib.typ"` 的行为：
 1. 加载文件 → `import_file()` → 调用 `eval()` 完整求值被导入文件
@@ -1098,7 +1098,7 @@ Hello                    // 颜色还是默认的
 
 ### 13.2 include：插入内容，规则跟内容走
 
-[crates/typst-eval/src/import.rs#L184-L209](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/import.rs#L184-L209)
+[crates/typst-eval/src/import.rs#L184-L209](crates/typst-eval/src/import.rs#L184-L209)
 
 ```rust
 impl Eval for ast::ModuleInclude<'_> {
@@ -1168,26 +1168,26 @@ impl Eval for ast::ModuleInclude<'_> {
 
 | 概念 | 文件 | 关键行 |
 |------|------|--------|
-| RealizationKind 定义 | [crates/typst-library/src/routines.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/routines.rs) | L153-L179 |
-| outside 初始化 + 越狱 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L66, L636-L641 |
-| show rule 笼子继承 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L419-L420, L658-L662 |
-| document/page 容器边界检查 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L605-L656 |
-| Target 与 TargetElem | [crates/typst-library/src/foundations/target.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/target.rs) | L65-L137 |
-| Target 属性注入入口 | [crates/typst/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst/src/lib.rs) | L111-L113 |
-| 告警 A：show page 求值告警 | [crates/typst-eval/src/rules.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs) | L59, L66-L77 |
-| 告警 B：HTML 下 set page 告警 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L642-L646 |
-| spacing 迁移提示（show par + set block）| [crates/typst-eval/src/rules.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs) | L60, L79-L95 |
-| ParElem.spacing 属性定义 | [crates/typst-library/src/model/par.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/model/par.rs) | L98-L99, L213-L225 |
-| BlockElem.above/below 定义 | [crates/typst-library/src/layout/container.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/layout/container.rs) | L250-L251, L318-L354 |
-| PAR 分组规则定义 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L1045-L1073 |
-| finish_par 构造 ParElem | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L1190-L1205 |
-| RecipeIndex 定义 | [crates/typst-library/src/foundations/styles.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs) | L526-L528 |
-| RecipeIndex 计算 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L491-L493 |
-| Revocation 定义 | [crates/typst-library/src/foundations/styles.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs) | L221-L226 |
-| Revocation 注入 | [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L1465-L1470 |
-| Revocation 检测（正则匹配）| [crates/typst-realize/src/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-realize/src/lib.rs) | L1321-L1374 |
-| import vs ModuleImport | [crates/typst-eval/src/import.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/import.rs) | L15-L181 |
-| include vs ModuleInclude | [crates/typst-eval/src/import.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/import.rs) | L184-L209 |
-| Styles::outside() | [crates/typst-library/src/foundations/styles.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs) | L92-L102 |
-| Style.liftable()/outside()| [crates/typst-library/src/foundations/styles.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-library/src/foundations/styles.rs) | L268-L286 |
-| check_show_par_set_block 触发点 | [crates/typst-eval/src/rules.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/127-typst/crates/typst-eval/src/rules.rs) | L60, L79-L95 |
+| RealizationKind 定义 | [crates/typst-library/src/routines.rs](crates/typst-library/src/routines.rs) | L153-L179 |
+| outside 初始化 + 越狱 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L66, L636-L641 |
+| show rule 笼子继承 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L419-L420, L658-L662 |
+| document/page 容器边界检查 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L605-L656 |
+| Target 与 TargetElem | [crates/typst-library/src/foundations/target.rs](crates/typst-library/src/foundations/target.rs) | L65-L137 |
+| Target 属性注入入口 | [crates/typst/src/lib.rs](crates/typst/src/lib.rs) | L111-L113 |
+| 告警 A：show page 求值告警 | [crates/typst-eval/src/rules.rs](crates/typst-eval/src/rules.rs) | L59, L66-L77 |
+| 告警 B：HTML 下 set page 告警 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L642-L646 |
+| spacing 迁移提示（show par + set block）| [crates/typst-eval/src/rules.rs](crates/typst-eval/src/rules.rs) | L60, L79-L95 |
+| ParElem.spacing 属性定义 | [crates/typst-library/src/model/par.rs](crates/typst-library/src/model/par.rs) | L98-L99, L213-L225 |
+| BlockElem.above/below 定义 | [crates/typst-library/src/layout/container.rs](crates/typst-library/src/layout/container.rs) | L250-L251, L318-L354 |
+| PAR 分组规则定义 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L1045-L1073 |
+| finish_par 构造 ParElem | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L1190-L1205 |
+| RecipeIndex 定义 | [crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs) | L526-L528 |
+| RecipeIndex 计算 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L491-L493 |
+| Revocation 定义 | [crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs) | L221-L226 |
+| Revocation 注入 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L1465-L1470 |
+| Revocation 检测（正则匹配）| [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L1321-L1374 |
+| import vs ModuleImport | [crates/typst-eval/src/import.rs](crates/typst-eval/src/import.rs) | L15-L181 |
+| include vs ModuleInclude | [crates/typst-eval/src/import.rs](crates/typst-eval/src/import.rs) | L184-L209 |
+| Styles::outside() | [crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs) | L92-L102 |
+| Style.liftable()/outside()| [crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs) | L268-L286 |
+| check_show_par_set_block 触发点 | [crates/typst-eval/src/rules.rs](crates/typst-eval/src/rules.rs) | L60, L79-L95 |
