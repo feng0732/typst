@@ -63,25 +63,40 @@ pub const THICK: Em = Em::new(5.0 / 18.0);   // ≈0.278em
 
 #### 完整间距匹配规则
 
-以下是 `spacing()` 中 match 臂的完整顺序和逻辑：
+以下是 `spacing()` 中 match 臂的完整顺序和逻辑（注意哪些规则有 `!script()` 守卫）：
 
-| 序号 | 匹配模式 (l.rclass, r.lclass) | 作用 | 设置 |
-|------|-------------------------------|------|------|
-| 1 | `(_, Punctuation)` | 标点前不加间距 | 无 |
-| 2 | `(Punctuation, _)` 非 Script | 标点后加 Thin | `l.rspace = THIN` |
-| 3 | `(Opening, _)` 或 `(_, Closing)` | 开分隔符后、闭分隔符前不加间距 | 无 |
-| 4 | `(Relation, Relation)` | 连续关系符间不加额外间距 | 无 |
-| 5 | `(Relation, _)` 非 Script | 关系符后加 Thick | `l.rspace = THICK` |
-| 6 | `(_, Relation)` 非 Script | 关系符前加 Thick | `r.lspace = THICK` |
-| 7 | `(Binary, _)` 非 Script | 二元运算符后加 Medium | `l.rspace = MEDIUM` |
-| 8 | `(_, Binary)` 非 Script | 二元运算符前加 Medium | `r.lspace = MEDIUM` |
-| 9 | `(Large, Opening \| Fence)` | **大型运算符后接开分隔符/围栏时，不加间距** | 无 |
-| 10 | `(Large, _)` | 大型运算符后加 Thin | `l.rspace = THIN` |
-| 11 | `(_, Large)` | 大型运算符前加 Thin | `r.lspace = THIN` |
-| 12 | `l.is_spaced() \|\| r.is_spaced()` | 用户显式标记间距的元素 | 返回显式空格 |
-| 13 | `_` | 默认不加间距 | 无 |
+| 序号 | 匹配模式 (l.rclass, r.lclass) | 守卫条件 | 作用 | 设置 |
+|------|-------------------------------|----------|------|------|
+| 1 | `(_, Punctuation)` | 无 | 标点前不加间距 | 无 |
+| 2 | `(Punctuation, _)` | `!script(l)` | 标点后加 Thin（非脚本尺寸） | `l.rspace = THIN` |
+| 3 | `(Opening, _)` 或 `(_, Closing)` | 无 | 开分隔符后、闭分隔符前不加间距 | 无 |
+| 4 | `(Relation, Relation)` | 无 | 连续关系符间不加额外间距 | 无 |
+| 5 | `(Relation, _)` | `!script(l)` | 关系符后加 Thick（非脚本尺寸） | `l.rspace = THICK` |
+| 6 | `(_, Relation)` | `!script(r)` | 关系符前加 Thick（非脚本尺寸） | `r.lspace = THICK` |
+| 7 | `(Binary, _)` | `!script(l)` | 二元运算符后加 Medium（非脚本尺寸） | `l.rspace = MEDIUM` |
+| 8 | `(_, Binary)` | `!script(r)` | 二元运算符前加 Medium（非脚本尺寸） | `r.lspace = MEDIUM` |
+| 9 | `(Large, Opening \| Fence)` | **无** | **大型运算符后接开分隔符/围栏时，不加间距**（所有尺寸） | 无 |
+| 10 | `(Large, _)` | **无** | 大型运算符后加 Thin（**所有尺寸，含脚本**） | `l.rspace = THIN` |
+| 11 | `(_, Large)` | **无** | 大型运算符前加 Thin（**所有尺寸，含脚本**） | `r.lspace = THIN` |
+| 12 | `l.is_spaced() \|\| r.is_spaced()` | 无 | 用户显式标记间距的元素 | 返回显式空格 |
+| 13 | `_` | 无 | 默认不加间距 | 无 |
 
-**重要**：所有间距规则在 Script 或 ScriptScript 尺寸下被 `if !script(l/r)` 守卫跳过，即上下标内的运算符之间不自动添加间距。
+**重要发现**：`Punctuation`、`Relation`、`Binary` 三类的规则都有 `if !script(l/r)` 守卫，在 Script 或 ScriptScript 尺寸下被跳过；但 **`Large` 的三条规则（序号 9-11）完全没有守卫**，大型运算符的间距在脚本尺寸下依然生效。
+
+#### 关系符后接开分隔符的优先级详解
+
+`(Relation, Opening)` 这种组合（如 `= (x+1)`）的匹配流程值得特别说明。按从上到下的顺序：
+
+1. 序号 1 `(_, Punctuation)`：右侧是 Opening，不匹配
+2. 序号 2 `(Punctuation, _)`：左侧是 Relation，不匹配
+3. 序号 3 `(Opening, _) | (_, Closing)`：**这个规则只匹配左侧 Opening 或右侧 Closing**。当前左侧是 Relation、右侧是 Opening，两个都不满足 → **不拦截**
+4. 序号 4 `(Relation, Relation)`：右侧是 Opening，不匹配
+5. 序号 5 `(Relation, _)`：**匹配！** → 设置 `l.rspace = THICK`（非脚本尺寸下）
+6. 后续规则不再执行
+
+所以 `= (` 中，`=` 与 `(` 之间会有 **THICK** 间距（非脚本尺寸），而非无间距。同理 `> (`, `< (` 等也是如此。
+
+这与 `(Large, Opening)` 的情况形成鲜明对比：后者因为序号 9 有显式匹配 `(Large, Opening|Fence)` 而不加间距；但 Relation 没有对应的特殊规则，所以走通用的 `(Relation, _)` → THICK。
 
 #### 左右侧有效类：rclass 与 lclass
 
@@ -90,7 +105,7 @@ pub const THICK: Em = Em::new(5.0 / 18.0);   // ≈0.278em
 - **`rclass()`**（右侧有效类）：`FencedItem` 若含闭分隔符且无显式类 → 返回 `Closing`；否则返回 `class()`
 - **`lclass()`**（左侧有效类）：`FencedItem` 若含开分隔符且无显式类 → 返回 `Opening`；否则返回 `class()`
 
-这意味着整个 `(x+y)` 在其左侧视为 `Opening`，右侧视为 `Closing`。例如 `∑ (x+y)` 中，`(x+y)` 的 `lclass()` 是 `Opening`，从而匹配 `(Large, Opening|Fence)` 臂 → 不加间距。
+这意味着整个 `(x+y)` 在其左侧视为 `Opening`，右侧视为 `Closing`。例如 `∑ (x+y)` 中，`(x+y)` 的 `lclass()` 是 `Opening`，从而匹配 `(Large, Opening|Fence)` 臂 → 不加间距。但 `= (x+y)` 中，同样的 `lclass()=Opening` 因没有对应的 Relation 特殊规则，依然走 `(Relation, _)` → THICK。
 
 #### Vary 类的处理：一元 vs 二元
 
@@ -113,19 +128,24 @@ if item.class() == MathClass::Vary
 
 #### 大型运算符间距规则详解
 
-大型运算符（`Large` 类，如 `∑`、`∏`、`∐`、`⋃`、`⋁` 等）的间距规则**不是简单的"两侧加 Thick"**，而是遵循 TeXBook 第 170 页的规则：
+大型运算符（`Large` 类，如 `∑`、`∏`、`∐`、`⋃`、`⋁` 等）的间距规则**不是简单的"两侧加 Thick"**，而是遵循 TeXBook 第 170 页的规则，并且**在脚本尺寸下依然生效**：
 
 1. **大型运算符后接开分隔符/围栏时不加间距**——`(Large, Opening|Fence)` 臂（序号 9）
    - 这是最特殊的规则：`∑ (x)` 中 ∑ 与 `(` 之间没有间距
    - 原因：大型运算符在 Display 尺寸下上下有极限标记（limits），它们占据了 ∑ 右侧的视觉空间，如果再加间距会显得太宽
+   - 注意此规则**无脚本守卫**，脚本尺寸下也不加间距
 
 2. **大型运算符后接其他元素时加 Thin**——`(Large, _)` 臂（序号 10）
    - `∑ x` → ∑ 与 x 之间有 THIN 间距
    - `∑ ∏` → ∑ 与 ∏ 之间有 THIN 间距（序号 10 先于序号 11 匹配，只设置 `l.rspace`）
+   - **无脚本守卫**：即使 `x^∑`（上标）中的 ∑ 后面也保留 THIN
 
 3. **大型运算符前加 Thin**——`(_, Large)` 臂（序号 11）
    - `x ∑` → x 与 ∑ 之间有 THIN 间距
    - 但如果左侧是 Binary/Relation 等，更高优先级的臂会先匹配（见下文）
+   - **无脚本守卫**：脚本尺寸下也加 Thin
+
+对比：`∑^x y`（Display 尺寸）中 ∑ 和 y 之间有 THIN；`a^(∑_k x_k)` 中上标里的 ∑ 和 x_k 之间同样有 THIN——这正是 Large 规则无脚本守卫的结果。
 
 #### 大型运算符与其他运算类交互的优先级影响
 
@@ -174,16 +194,16 @@ if let Some(rspace) = props.rspace && !rspace.is_zero() {
 2. 紧跟其后的 `i` 是 `Alphabetic` 类
 3. 调用 `spacing(∑_i^n, i)`：`(Large, Alphabetic)` → 命中序号 10 `(Large, _)` → `∑_i^n.rspace = THIN`
 4. `i` 和 `=` 之间：`(Alphabetic, Relation)` → 命中序号 6 `(_, Relation)` → `=.lspace = THICK`
-5. `=` 和 `(n(n+1))` 之间：`(Relation, Opening)` → 命中序号 3 `(Opening, _)` → 无间距（因为 `(n(n+1))` 的 `lclass()` 是 `Opening`）
+5. `=` 和 `(n(n+1))` 之间：`(Relation, Opening)` → 序号 3 的 `(Opening, _)|(_, Closing)` **不匹配**（左非 Opening，右非 Closing）→ 命中序号 5 `(Relation, _)` → `=.rspace = THICK`
 
-所以 ∑ 与 i 之间有 THIN 间距，i 与 = 之间有 THICK 间距，= 与 `(` 之间无间距。
+所以 ∑ 与 i 之间有 THIN 间距，i 与 = 之间有 THICK 间距，= 与 `(` 之间有 **THICK** 间距。
 
 对比另一个示例 `$sum_(k=0)^n (2k+1)$`：
 
 1. `∑_(k=0)^n` 是 `Large`
 2. `(2k+1)` 是 `FencedItem`，`lclass() = Opening`
 3. `spacing(∑, (2k+1))`：`(Large, Opening)` → 命中序号 9 → **无间距**
-4. 这正是 TeXBook p170 规则的体现——求和符后接括号时不加间距
+4. 这正是 TeXBook p170 规则的体现——求和符后接括号时不加间距，而关系符后接括号时仍加 THICK。
 
 ### 2.3 符号的字形布局
 
@@ -412,8 +432,8 @@ frame.set_baseline(height / 2.0 + axis)
 4. **间距处理**（[process.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/ir/process.rs)）：
    - `∑_i^n` 与 `i` 之间：`(Large, Alphabetic)` → THIN（∑ 的 rspace）
    - `i` 与 `=` 之间：`(Alphabetic, Relation)` → THICK（= 的 lspace）
-   - `=` 与 `(n(n+1))` 之间：`(Relation, Opening)` → 无间距（Opening 后不加间距规则）
-   - `(n(n+1))` 与 `/` 之间：`(Closing, ...)` → 无间距（Closing 前不加间距）
+   - `=` 与 `(n(n+1))` 之间：`(Relation, Opening)` → 序号 3 的 `(Opening, _)|(_, Closing)` 不匹配（左非 Opening，右非 Closing），命中 `(Relation, _)` → **THICK**（= 的 rspace）
+   - `(n(n+1))` 与 `/` 之间：`(Closing, ...)` → 序号 3 `(_, Closing)` 匹配 → 无间距
    - 分数线由 `FractionItem` 自身绘制，不依赖自动间距
 
 5. **布局**（[typst-layout/src/math/](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-layout/src/math/)）：
