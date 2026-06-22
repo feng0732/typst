@@ -449,7 +449,9 @@ fn compile_impl<T: Output>(...) -> SourceResult<T> {
 
 **做什么**：检查"用新的 Introspector 替换本轮的 Introspector 之后，约束**实际跟踪到的那些**方法调用是否都返回相同结果"。
 
-**⚠️ 不是整个 Introspector 一致**：`constraint.validate(new_introspector)` 不做"新旧两个 Introspector 对象是否完全等价"的逐字段比较，也不检查所有可能的方法调用。它只验证**本迭代编译过程中，通过 `track_with(&constraint)` 绑定后，确实调用过、并被 comemo 缓存记录下来的那些 `Introspector` trait 方法**——在使用 `new_introspector` 调用时，返回值与本轮完全相同。没有被访问到的数据即便变了，也不会导致验证失败。
+**⚠️ 约束只跟踪 Introspector 调用**：约束通过 `introspector.track_with(&constraint)` 绑定，因此**只有** `Introspector` trait 上的方法调用（如 `query_label`、`page`、`query` 等）会被观察和记录。编译过程中对其他 comemo 追踪对象（如 `World`、`styles` 等）的调用不会进入此约束，也不会影响验证结果。`constraint.validate()` 的失败来源**只能是** introspector 方法调用返回值不同，不能泛化为"任意 comemo 缓存数据变了"。
+
+**⚠️ 不是整个 Introspector 一致**：`constraint.validate(new_introspector)` 不做"新旧两个 Introspector 对象是否完全等价"的逐字段比较，也不检查所有可能的方法调用。它只验证**本迭代编译过程中，通过 `track_with(&constraint)` 绑定后，确实调用过、并被约束记录下来的那些 `Introspector` trait 方法**——在使用 `new_introspector` 调用时，返回值与本轮完全相同。没有被访问到的数据即便变了，也不会导致验证失败。
 
 **原理**：
 1. 每次迭代创建 `comemo::Constraint`
@@ -471,7 +473,7 @@ fn compile_impl<T: Output>(...) -> SourceResult<T> {
 
 **触发条件**：comemo 验证失败 **且** 已达 5 次迭代上限。
 
-**做什么**：对每个编译期间记录的 `Introspection`，用全部 6 个 introspector（empty + 5 轮）分别重算 Output，比较最后两轮的 hash 是否相同。
+**做什么**：对编译期间**通过 `engine.introspect()` 显式记录的**每个 `Introspection`，用全部 6 个 introspector（empty + 5 轮）分别重算 Output，比较最后两轮的 hash 是否相同。注意：只有经 `engine.introspect()` 调用并记录到 Sink 中的 Introspection 才会被诊断，直接访问 introspector 但未记录的调用不在诊断范围内。
 
 [analyze()](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/introspection/convergence.rs#L25-L70) 的逻辑：
 
@@ -566,7 +568,11 @@ if !diags.is_empty() {
 
 **情况 3：comemo 失败 + History 失败 → 真正未收敛，发出警告**
 
-另一种 comemo 失败但不影响结果的情况：**被访问方法返回值变了，但变化的方法与任何 Introspection 无关**（例如其他 comemo 追踪的非 introspection 数据变化）。由于 History 只关心记录下来的 Introspection，这类变化也不会被诊断出来，因此不发警告。
+comemo 失败的来源**只能是**约束跟踪到的 Introspector 方法调用返回值在新旧 introspector 之间不同（因为约束仅通过 `introspector.track_with(&constraint)` 绑定，只观察 introspector 调用）。不存在"非 introspection 数据变化导致 comemo 验证失败"的情况——其他 comemo 追踪对象（如 `World`）的调用不在此约束的观察范围内。
+
+而 History 诊断的输入也**只能是**编译期间通过 `engine.introspect()` 显式记录的那些 `Introspection` 实例（见 4.4 节）。未被记录的 introspector 调用（例如直接通过 `engine.introspector` 访问但未经过 `engine.introspect()` 的调用）不会出现在 History 的诊断范围中。
+
+因此两者不一致**只可能**来自粒度差异：comemo 约束观察到的是 Introspector 方法返回的原始值（如完整的 `EcoVec<Content>`），History 诊断检查的是各 `Introspection` 归约后的 `Output` hash。原始值变了但归约后的 Output 没变 → comemo 失败 + History 通过；原始值变了且归约后 Output 也变了 → 两者都失败。
 
 ### 5.5 迭代 N+1 观察迭代 N 的结果
 
@@ -1055,12 +1061,18 @@ loop {
 ### 10.1 comemo Constraint 作为快速收敛路径
 
 **优势：**
-- 不需要手动记录所有依赖——所有 Introspector trait 方法调用自动被约束观察
-- 只验证**实际访问过**的方法，没调用过的 Introspector 数据即便不同也不影响结果
-- 与增量计算系统无缝集成——验证过程就是重放缓存过的方法调用
+- 不需要手动记录所有依赖——约束自动观察所有对 `Introspector` trait 的方法调用
+- 只验证**实际访问过**的 introspector 方法，没调用过的数据即便不同也不影响结果
+- 与增量计算系统无缝集成——验证过程就是重放约束记录过的 introspector 方法调用
 - 验证通过即可**确定**收敛：因为下一轮用到的所有 introspector 数据（调用返回值）和本轮完全一致
 
-**⚠️ 关键澄清：它不是"比较整个 Introspector"**
+**⚠️ 关键澄清：约束只跟踪 Introspector，不跟踪其他 comemo 对象**
+
+`constraint` 是通过 `introspector.track_with(&constraint)` 绑定到 **introspector 一个对象**上的。因此：
+- 约束记录的**只有** `Introspector` trait 上的方法调用（`query`、`query_label`、`page`、`position` 等）
+- 编译过程中对其他 `#[comemo::track]` 对象（如 `World`、`Library`）的调用**不在此约束的观察范围内**
+- `constraint.validate()` 的失败原因**只能是**：某条已记录的 introspector 方法调用，用 `new_introspector` 重放时返回值不同
+- 不存在"非 introspection 数据变化导致验证失败"的可能
 
 `constraint.validate(new_introspector)` 做的事情是：
 1. 遍历本轮约束中记录的**每一条**观察到的 Introspector 方法调用（如 `query_label(<intro>)`、`page(loc1)`、`query(heading)` 等）
@@ -1071,19 +1083,24 @@ loop {
 这不是对两个 Introspector 对象做 `==` 比较。如果新旧 Introspector 之间有差异，但差异对应的方法本轮**没被调用过**，验证仍然通过。因此，它的通过条件**弱于**"整个 Introspector 内容一致"。
 
 **局限：**
-- comemo 看到的是原始输入（方法返回值本身），不是归约后的 Introspection Output
-- 因此可能"假阴性"：comemo 说没收敛（某个 query 返回的列表元素字段变了），但实际语义已稳定（如 Introspection 只关心 `list.is_empty()`）
+- comemo 约束看到的是 Introspector 方法的原始返回值，不是归约后的 Introspection Output
+- 因此可能"假阴性"：约束说没收敛（某个 `query` 返回的列表元素字段变了），但实际语义已稳定（如对应的 Introspection 只关心 `list.is_empty()`）
 
 ### 10.2 History 诊断作为慢速但更精确的后备
 
+**⚠️ 关键限定：History 只诊断已记录的 Introspection 输出**
+
+`analyze()` 的输入 `introspections: &[Introspection]` 来自编译期间 `engine.introspect()` 的副产物（见 4.4 节）。只有通过 `engine.introspect(SomeIntrospection)` 调用时，该 `Introspection` 才会被 `sink.introspection()` 记录下来。直接通过 `engine.introspector` 访问 introspector 但未经过 `engine.introspect()` 的调用，不会出现在 `analyze()` 的诊断范围中。
+
 **优势：**
-- 检查的是用户可观察的 Introspection Output，语义更精确
-- 能区分"comemo 看到变化但输出已稳定"的情况（不发出警告）
-- 为每个未收敛的 Introspection 生成精确的诊断信息（告诉用户是哪个查询还在抖）
+- 检查的是每个已记录 `Introspection` 的 Output（归约后的值），语义更精确
+- 能区分"comemo 约束看到原始返回值变化但 Output 已稳定"的情况（不发出警告）
+- 为每个未收敛的 `Introspection` 生成精确的诊断信息（告诉用户是哪个查询还在抖）
 
 **代价：**
-- 需要对每个 Introspection 用 6 个 introspector 重算，开销大
+- 需要对每个 `Introspection` 用 6 个 introspector 重算，开销大
 - 仅在达到迭代上限后才触发，不能用来提前终止迭代
+- 不诊断未通过 `engine.introspect()` 记录的 introspector 调用
 
 ### 10.3 Introspection Output 的粒度选择
 
