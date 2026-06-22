@@ -7,13 +7,14 @@
     │
     ▼  编译入口 typst::compile::<T>()  [lib.rs:74-82]
     │
-    │  T 的选择决定了 Output trait 的实现：
-    │  ├─ T = PagedDocument  → Target::Paged （PNG/SVG/PDF 共用）
-    │  └─ T = HtmlDocument   → Target::Html   （HTML 输出）
+    │  T 的选择决定了 Output trait 的实现（3 选 1）：
+    │  ├─ T = PagedDocument  → Target::Paged   （PNG/SVG/PDF 共用）
+    │  ├─ T = HtmlDocument   → Target::Html    （HTML 输出）
+    │  └─ T = Bundle         → Target::Bundle  （多文件混合输出）
     │
     ▼  元素定义 (typst-library/visualize/)
        LineElem / RectElem / SquareElem / EllipseElem / CircleElem
-       PolygonElem / CurveElem
+       PolygonElem / CurveElem / FrameElem (html.frame)
     │
     ▼  Show Rule 注册（按 Target 区分）
     │
@@ -26,7 +27,11 @@
     │    IMAGE_RULE （仅图片有 Show Rule）
     │    其他图形元素无 Show Rule → 在 convert.rs 中被忽略并警告
     │
-    ▼  布局层
+    │  Target::Bundle  [typst-bundle/lib.rs]:
+    │    无图形 Show Rule（Bundle 不是布局目标，是编排目标）
+    │    根层只允许 document() / asset() / tag()
+    │
+    ▼  布局层（图形输出主线：PagedDocument + HtmlDocument）
     │
     │  Target::Paged 路径 (typst-layout/shapes.rs):
     │    layout_line / layout_rect / layout_curve / ...
@@ -48,17 +53,37 @@
     ├─ PagedDocument  [typst-layout/document.rs:L63-L79]
     │   ├─ pages: Vec<Page { frame, bleed, fill, ... }>
     │   └─ 后处理导出：
-    │       ├─ PDF:  typst_pdf::pdf(&document, ...)      → Vec<u8>
-    │       ├─ PNG:  typst_render::render(&page, ...)    → sk::Pixmap （逐页）
-    │       └─ SVG:  typst_svg::svg(&page, ...)          → String （逐页）
+    │       ├─ PDF:     typst_pdf::pdf(&document, ...)          → Vec<u8>
+    │       ├─ PNG:     typst_render::render(&page, ...)        → sk::Pixmap
+    │       └─ SVG:     typst_svg::svg(&page, ...)              → String
     │
-    └─ HtmlDocument  [typst-html/dom.rs:L81-L97]
-        └─ 编码 (typst-html/encode.rs):
-            ├─ 普通 HTML 元素 → <div>/<p>/<span>/...
-            └─ HtmlNode::Frame(frame) → [encode.rs:L391-L402]
-                typst_svg::svg_in_html(
-                    &frame.inner, frame.text_size, pretty, id, styles, anchors, link_resolver
-                ) → 内联 <svg> 字符串
+    ├─ HtmlDocument  [typst-html/dom.rs:L81-L97]
+    │   └─ 编码 (typst-html/encode.rs):
+    │       ├─ 普通 HTML 元素 → <div>/<p>/<span>/...
+    │       └─ HtmlNode::Frame(frame) → [encode.rs:L391-L402]
+    │           typst_svg::svg_in_html(
+    │               &frame.inner, frame.text_size, pretty, id, styles, anchors, link_resolver
+    │           ) → 内联 <svg> 字符串
+    │
+    └─ Bundle  [typst-bundle/lib.rs:L56-L72]
+        ├─ files: IndexMap<VirtualPath, BundleFile>
+        │   ├─ BundleFile::Document(BundleDocument)
+        │   │   ├─ Paged(PagedDocument, PagedExtras { format: Pdf|Png|Svg, anchors })
+        │   │   └─ Html(HtmlDocument)
+        │   └─ BundleFile::Asset(Bytes)
+        │
+        ├─ 构建阶段：并行调用
+        │   ├─ typst_layout::layout_document_for_bundle() → PagedDocument  （复用）
+        │   └─ typst_html::html_document_for_bundle()    → HtmlDocument   （复用）
+        │
+        └─ 导出阶段 [typst-bundle/export.rs]：并行调用
+            ├─ Paged(Pdf)  → typst_pdf::pdf_in_bundle()   （复用 + anchors/link_resolver）
+            ├─ Paged(Png)  → typst_render::render()       （完全复用）
+            ├─ Paged(Svg)  → typst_svg::svg_in_bundle()   （复用 + anchors/link_resolver）
+            └─ Html        → typst_html::html_in_bundle() （复用 + link_resolver）
+
+  图形输出主线：PagedDocument + HtmlDocument
+  Bundle = 编排层（不引入新图形逻辑，只协调多文件 + 跨文档链接）
 ```
 
 ---
@@ -293,7 +318,7 @@ styled_rect(size, radius, fill, stroke)
 
 ### 3.1 Output trait 与 Target 枚举
 
-定义在 [target.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/foundations/target.rs)：
+定义在 [target.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/foundations/target.rs#L13-L92)：
 
 ```rust
 /// 编译输出，与 Target 变体一一对应
@@ -306,19 +331,24 @@ pub trait Output: Any {
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash, Cast)]
 pub enum Target {
     #[default]
-    Paged,   // 分页完整排版（PNG/SVG/PDF 共用）
+    Paged,   // 分页完整排版
     Html,    // HTML 导出
     Bundle,  // 多文件捆绑导出
 }
 ```
 
-**关键事实：Output trait 只有两个核心实现**
+**三个 Output 实现，对应三个 Target**：
 
-| 实现 | Target | 创建函数 | 导出用途 |
-|------|--------|---------|---------|
-| `PagedDocument` | `Target::Paged` | `typst_layout::layout_document()` | PNG / SVG / PDF（共用该 Output，后处理不同） |
-| `HtmlDocument` | `Target::Html` | `typst_html::html_document()` | HTML 导出 |
-| `Bundle` | `Target::Bundle` | `typst_bundle::bundle_document()` | 多文件捆绑导出 |
+| Output 实现 | Target | 创建函数 | 内部产物 | 最终输出 |
+|------------|--------|---------|---------|---------|
+| `PagedDocument` | `Target::Paged` | `typst_layout::layout_document()` | `Vec<Page { Frame }>` | CLI 后处理 → PDF / PNG / SVG |
+| `HtmlDocument` | `Target::Html` | `typst_html::html_document()` | `HtmlNode` 树（含 `HtmlFrame`） | CLI 后处理 → HTML 字符串（含内联 SVG） |
+| `Bundle` | `Target::Bundle` | `typst_bundle::bundle()` | `IndexMap<VirtualPath, BundleFile>` | 并行导出 → 多文件 `VirtualFs`（PDF/PNG/SVG/HTML 混合） |
+
+**图形输出主线**：
+- `PagedDocument` 和 `HtmlDocument` 是图形输出的两个**主分支**
+- `Bundle` 是**编排层**：内部并行调用 `layout_document_for_bundle` / `html_document_for_bundle` 产出 `PagedDocument` / `HtmlDocument`，再调用各格式的 `_in_bundle` 导出函数
+- 图形数据路径（`Shape → Geometry → Curve → FrameItem::Shape`）完全由 `PagedDocument` 和 `HtmlDocument` 分支承载，Bundle 不引入新的图形数据结构
 
 ### 3.2 顶层编译入口
 
@@ -329,7 +359,7 @@ pub fn compile<T>(world: &dyn World) -> Warned<SourceResult<T>>
 where
     T: Output,
 {
-    // 1. 设置 Target 样式
+    // 1. 设置 Target 样式（决定后续 Show Rule 和布局流程）
     let base = StyleChain::new(&library.styles);
     let target = TargetElem::target.set(T::target()).wrap();
     let styles = base.chain(&target);
@@ -355,28 +385,146 @@ where
 typst-cli/src/compile.rs 顶层 export 函数
   │
   ├─ OutputFormat::Pdf / Png / Svg:
-  │   let Warned { output, warnings } = typst::compile::<PagedDocument>(world);
-  │   output.and_then(|doc| export_paged(&doc, config))
+  │   typst::compile::<PagedDocument>(world)
+  │   → PagedDocument { pages: Vec<Page { Frame }> }
   │   │
-  │   ├─ export_pdf(doc, config):
-  │   │   typst_pdf::pdf(&doc, &options) → Vec<u8>
-  │   │
-  │   ├─ export_image(doc, config, Png):
-  │   │   for (i, page) in doc.pages().iter().enumerate() {
-  │   │       let pixmap = typst_render::render(page, &opts);
-  │   │       pixmap.encode_png() → Vec<u8>
-  │   │   }
-  │   │
-  │   └─ export_image(doc, config, Svg):
-  │       for (i, page) in doc.pages().iter().enumerate() {
-  │           let svg = typst_svg::svg(page, &opts);  → String
-  │       }
+  │   ├─ export_pdf:    typst_pdf::pdf(&doc, &options)           → Vec<u8>
+  │   ├─ export_png:    typst_render::render(page, &opts)        → sk::Pixmap → encode_png
+  │   └─ export_svg:    typst_svg::svg(page, &opts)              → String
   │
-  └─ OutputFormat::Html:
-      let Warned { output, warnings } = typst::compile::<HtmlDocument>(world);
-      output.and_then(|doc| export_html(&doc, config))
-          let html = typst_html::html(&doc, &options) → String
+  ├─ OutputFormat::Html:
+  │   typst::compile::<HtmlDocument>(world)
+  │   → HtmlDocument { HtmlNode tree }
+  │   → typst_html::html(&doc, &options)                          → String（含内联 SVG）
+  │
+  └─ OutputFormat::Bundle:
+      typst::compile::<Bundle>(world)
+      → Bundle { files: IndexMap<VirtualPath, BundleFile> }
+      │
+      └─ typst_bundle::export(&bundle, &options) → VirtualFs
+          │
+          ├─ BundleDocument::Paged(doc, PagedExtras { format: Pdf }):
+          │     typst_pdf::pdf_in_bundle(doc, opts, anchors, link_resolver)
+          │
+          ├─ BundleDocument::Paged(doc, PagedExtras { format: Png }):
+          │     typst_render::render(&doc.pages()[0], opts) → encode_png
+          │
+          ├─ BundleDocument::Paged(doc, PagedExtras { format: Svg }):
+          │     typst_svg::svg_in_bundle(&doc.pages()[0], opts, anchors, link_resolver)
+          │
+          └─ BundleDocument::Html(doc):
+                typst_html::html_in_bundle(doc.root(), opts, link_resolver)
 ```
+
+---
+
+## 三附、Bundle 架构详解
+
+Bundle 是 Typst 的**多文件输出编排层**，自身不定义新的图形渲染逻辑，而是将多个独立 `PagedDocument` / `HtmlDocument` 的内省、链接、导出统一协调。
+
+### 3A.1 Bundle 的数据结构
+
+定义在 [typst-bundle/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-bundle/src/lib.rs#L37-L114)：
+
+```rust
+pub struct Bundle {
+    /// 虚拟路径 → 文件内容
+    pub files: Arc<IndexMap<VirtualPath, BundleFile, FxBuildHasher>>,
+    /// 全 Bundle 共享的内省器（跨文档链接解析需要它）
+    pub introspector: Arc<BundleIntrospector>,
+}
+
+pub enum BundleFile {
+    Document(BundleDocument),  // 来自 document() 元素
+    Asset(Bytes),              // 来自 asset() 元素
+}
+
+pub enum BundleDocument {
+    /// 分页格式（PDF/PNG/SVG）：持有 PagedDocument + 导出元信息
+    Paged(Box<PagedDocument>, PagedExtras {
+        format: PagedFormat,   // Pdf | Png | Svg
+        anchors: Vec<(Location, EcoString)>,  // 跨文档链接锚点
+    }),
+    /// HTML 格式：持有 HtmlDocument
+    Html(Box<HtmlDocument>),
+}
+```
+
+### 3A.2 Bundle 的构建流程（bundle → compile_document）
+
+定义在 [typst-bundle/lib.rs:121-339](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-bundle/src/lib.rs#L121-L339)：
+
+```
+bundle(engine, content, styles)
+  │
+  ├─ 1. Bundle Realization（RealizationKind::Bundle）
+  │    根层只能出现 TagElem / AssetElem / DocumentElem
+  │    其他元素报错 → "not allowed at the top-level in bundle export"
+  │
+  ├─ 2. 并行编译每个 document（engine.parallelize）
+  │    │
+  │    └─ compile_document(document_elem, styles, locator)
+  │         │
+  │         ├─ DocumentFormat::Paged(PagedFormat::Pdf | Png | Svg)
+  │         │    target = TargetElem::target.set(Target::Paged).wrap()
+  │         │    typst_layout::layout_document_for_bundle(engine, &body, locator, styles.chain(&target))
+  │         │    → PagedDocument
+  │         │    → BundleDocument::Paged(doc, PagedExtras { format, anchors: [] })
+  │         │
+  │         └─ DocumentFormat::Html
+  │              target = TargetElem::target.set(Target::Html).wrap()
+  │              typst_html::html_document_for_bundle(engine, &body, locator, styles.chain(&target))
+  │              → HtmlDocument
+  │              → BundleDocument::Html(doc)
+  │
+  ├─ 3. 构建 BundleIntrospector（所有文档的内省合并）
+  │
+  ├─ 4. 创建跨文档链接锚点（link.rs）
+  │    │
+  │    ├─ Paged 文档：将锚点写入 PagedExtras.anchors
+  │    │   → 由 pdf_in_bundle / svg_in_bundle 消费
+  │    │   → PNG 不支持锚点，被忽略
+  │    │
+  │    └─ HTML 文档：直接修改 DOM 树，插入 id 属性
+  │        → 由 html_in_bundle 消费
+  │
+  └─ 5. 组装 Bundle：files + introspector
+```
+
+**关键边界**：
+- `layout_document_for_bundle` 与普通 `layout_document` 逻辑相同，只是增加了 `locator` 参数以便 Bundle 跟踪每个文档在全局位置
+- `html_document_for_bundle` 与普通 `html_document` 同理
+- 图形渲染逻辑完全复用：Paged 分支 → typst-layout/shapes.rs → FrameItem::Shape；HTML 分支 → html.frame 切 Target::Paged → 同 Paged 路径
+
+### 3A.3 Bundle 的导出流程（export.rs）
+
+定义在 [typst-bundle/export.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-bundle/src/export.rs#L24-L142)：
+
+```
+export(&bundle, options) → VirtualFs
+  │
+  └─ 并行遍历 bundle.files.par_iter()
+     │
+     ├─ BundleFile::Asset(bytes) → 原样返回 bytes
+     │
+     └─ BundleFile::Document(doc) → export_document(doc, options, link_resolver)
+          │
+          ├─ Paged(Pdf)   → typst_pdf::pdf_in_bundle(doc, opts, anchors, link_resolver)
+          ├─ Paged(Png)   → typst_render::render(doc.pages()[0], opts) → encode_png
+          ├─ Paged(Svg)   → typst_svg::svg_in_bundle(doc.pages()[0], opts, anchors, link_resolver)
+          └─ Html         → typst_html::html_in_bundle(doc.root(), opts, link_resolver)
+```
+
+**Bundle 与单文件导出的区别**（`*_in_bundle` vs 普通导出函数）：
+
+| 导出 | 单文件函数 | Bundle 函数 | 新增参数 |
+|------|----------|------------|---------|
+| PDF | `typst_pdf::pdf()` | `typst_pdf::pdf_in_bundle()` | `anchors`, `link_resolver` |
+| PNG | `typst_render::render()` | 直接调用 `render()`（无锚点支持） | — |
+| SVG | `typst_svg::svg()` | `typst_svg::svg_in_bundle()` | `anchors`, `link_resolver` |
+| HTML | `typst_html::html()` | `typst_html::html_in_bundle()` | `link_resolver`（输入为 root 元素而非整文档） |
+
+**图形渲染完全复用**：无论是单文件还是 Bundle 导出，最终都调用同一套 `typst_render::render` / `typst_svg::svg` / `typst_pdf::pdf` 核心逻辑。Bundle 只额外处理**跨文档链接锚点**和**LateLinkResolver**（跨文档链接解析）。
 
 ---
 
@@ -554,9 +702,9 @@ fn write_frame(w: &mut Writer, frame: &HtmlFrame) {
 
 ```
                     ┌─────────────────────────────────────────┐
-                    │          编译入口 typst::compile::<T>()  │
+                    │       编译入口 typst::compile::<T>()     │
                     │  [typst/src/lib.rs:L74-L82]              │
-                    │  T=PagedDocument  or  T=HtmlDocument    │
+                    │  T∈{PagedDocument, HtmlDocument, Bundle}│
                     └──────────────────┬──────────────────────┘
                                        │
                                        ▼
@@ -566,39 +714,44 @@ fn write_frame(w: &mut Writer, frame: &HtmlFrame) {
                     │  #curve(move(..), line(..), cubic(..))   │
                     │  #polygon((0pt,0pt), (10pt,10pt), ...)  │
                     │  #html.frame[#rect(...)]                 │
+                    │  #document(path: "a.pdf", format: "pdf") │
+                    │  #document(path: "b.html", format: "html")│
                     └──────────────────┬──────────────────────┘
                                        │ 解析
                     ┌──────────────────▼──────────────────────┐
                     │    元素定义 (typst-library/visualize/)   │
                     │  LineElem  RectElem  CurveElem           │
                     │  FrameElem (html.frame)                  │
+                    │  DocumentElem / AssetElem (Bundle 专用)  │
                     │  Shape { geometry, fill, stroke, rule }  │
                     │  Geometry { Line, Rect, Curve }          │
                     │  Curve(Vec<CurveItem>)                   │
                     │  CurveItem { Move, Line, Cubic, Close }  │
                     └──────────────────┬──────────────────────┘
                                        │  Show Rule（按 Target 区分）
-          ┌────────────────────────────┴────────────────────────────┐
-          │ Target::Paged            │           Target::Html       │
-          │ [typst-layout/rules.rs]  │       [typst-html/rules.rs]  │
-          │ 7 种图形元素都有规则     │  仅 ImageElem 有规则         │
-          ▼                          ▼                              ▼
-┌─────────────────────────┐  ┌──────────────────────────┐  ┌─────────────────────┐
-│ 布局层 (typst-layout/  │  │ convert.rs:L155-L160      │  │ convert.rs:L140-L154 │
-│ shapes.rs)             │  │ 普通图形元素 → 忽略+警告  │  │ html.frame 处理      │
-│                         │  │                         │  │  ├─ 切 Target::Paged  │
-│ layout_line → Shape    │  │                         │  │  ├─ layout_frame()   │
-│ layout_curve → Shape   │  │                         │  │  └─ Frame → HtmlFrame│
-│ layout_rect → Shape    │  │                         │  │                        │
-│ ...                    │  │                         │  │                        │
-│ 产出: PagedDocument    │  │                         │  │ 产出: HtmlDocument    │
-│   pages: Vec<Page>     │  │                         │  │   HtmlNode tree       │
-│   Page.frame: Frame    │  │                         │  │   HtmlNode::Frame(..) │
-└──────────┬─────────────┘  └──────────────────────────┘  └──────────┬───────────┘
-           │                                                          │
-           │ 后处理                                                  │ 编码
-           │                                                          │
-   ┌───────┴────────┬─────────────────┐                               │
+         ┌─────────────────────────────┼──────────────────────────────┐
+         │ Target::Paged               │ Target::Html                 │ Target::Bundle
+         │ [typst-layout/rules.rs]    │ [typst-html/rules.rs]        │ （编排，不直接布局）
+         │ 7 种图形元素都有规则        │ 仅 ImageElem 有规则          │ 根层 document/asset/tag
+         ▼                             ▼                              ▼
+┌─────────────────────────┐  ┌──────────────────────────┐  ┌───────────────────────────────┐
+│ 布局层 (typst-layout/  │  │ convert.rs:L155-L160      │  │ typst-bundle/lib.rs           │
+│ shapes.rs)             │  │ 普通图形元素 → 忽略+警告  │  │                                │
+│                         │  │                         │  │ 并行编译每个 document:         │
+│ layout_line → Shape    │  │                         │  │  ├─ PagedFormat 分支          │
+│ layout_curve → Shape   │  │ convert.rs:L140-L154     │  │  │  → layout_document_for_bundle │
+│ layout_rect → Shape    │  │ html.frame 处理          │  │  │    → PagedDocument           │
+│ ...                    │  │  ├─ 切 Target::Paged     │  │  └─ Html 分支                  │
+│ 产出: PagedDocument    │  │  ├─ layout_frame()       │  │     → html_document_for_bundle │
+│   pages: Vec<Page>     │  │  └─ Frame → HtmlFrame    │  │       → HtmlDocument          │
+│   Page.frame: Frame    │  │                         │  │                                │
+└──────────┬─────────────┘  └──────────┬───────────────┘  │ 产出: Bundle                   │
+           │                           │                  │   files: {path → BundleFile}  │
+           │                           │                  │   BundleDocument::Paged/Html  │
+           │                           │                  │   + BundleIntrospector        │
+           │ 后处理                    │ 编码             └──────────────┬────────────────┘
+           │                           │                                 │
+   ┌───────┴────────┬─────────────────┐                               │ export
    ▼                ▼                 ▼                               │
 ┌──────────┐   ┌──────────┐   ┌──────────┐                          │
 │ PDF 输出 │   │ PNG 输出 │   │ SVG 输出 │                          │
@@ -620,23 +773,52 @@ fn write_frame(w: &mut Writer, frame: &HtmlFrame) {
                                      │ [typst-svg/lib.rs:L82-L120]  │
                                      │ 共享 render_shape 代码       │
                                      ▼                              ▼
-                                 内联 <svg> 片段 ──────────────► HTML 字符串
+                                 内联 <svg> 片段 ─────────────► HTML 字符串
+
+        ╔═══════════════════════════════════════════════════════════════════╗
+        ║  图形输出主线 = PagedDocument + HtmlDocument                      ║
+        ║  Bundle = 编排层（内部 *复用* PagedDocument/HtmlDocument 逻辑）  ║
+        ║  Bundle 新增 = 多文件 + 跨文档链接锚点 + LateLinkResolver         ║
+        ╚═══════════════════════════════════════════════════════════════════╝
 ```
 
 ---
 
 ## 六、关键设计模式总结
 
-### 6.1 Output trait 的双实现架构
+### 6.1 Output trait 的三实现架构与分层边界
 
-**核心事实：`Output` trait 只有两个核心实现**（定义在 [target.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/foundations/target.rs#L13-L30)）：
+**核心事实：`Output` trait 有三个实现，分为两个层次**（定义在 [target.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/foundations/target.rs#L13-L92)）：
 
-| 实现 | Target | 调用方 | 后处理 |
-|------|--------|-------|-------|
-| `PagedDocument` | `Target::Paged` | `typst::compile::<PagedDocument>()` | PNG / SVG / PDF（三个独立后处理函数） |
-| `HtmlDocument` | `Target::Html` | `typst::compile::<HtmlDocument>()` | HTML 编码 |
+| 层次 | Output 实现 | Target | 角色 | 图形输出边界 |
+|------|------------|--------|------|-------------|
+| **主输出层** | `PagedDocument` | `Target::Paged` | 分页完整排版 | 承载 PDF/PNG/SVG 图形输出主线：`Shape → Geometry → Curve → FrameItem::Shape` |
+| **主输出层** | `HtmlDocument` | `Target::Html` | HTML 语义化输出 | 普通图形忽略；`html.frame` 切 Paged 目标 → 复用 Paged 图形逻辑 → 内联 SVG |
+| **编排层** | `Bundle` | `Target::Bundle` | 多文件协调导出 | **不引入任何新图形数据结构**，内部调用 `layout_document_for_bundle` / `html_document_for_bundle` 产出上述两种主输出 |
 
-**PNG/SVG/PDF 不是独立的 Output**，而是对 `PagedDocument` 的后处理。三者共享同一套布局流程和同一批 `Frame` 数据，只是最终渲染目标不同。
+**分层边界**：
+- **PNG/SVG/PDF 不是 Output 实现**，它们是对 `PagedDocument` 的后处理函数
+- **Bundle 的图形输出完全复用**：构建阶段复用 `layout_document_for_bundle`（Paged）和 `html_document_for_bundle`（HTML）；导出阶段复用 `pdf_in_bundle` / `svg_in_bundle` / `html_in_bundle`（各自加了 anchors + link_resolver 参数处理跨文档链接）
+- **PNG 在 Bundle 中最纯粹**：Bundle 导出 PNG 直接调用 `typst_render::render()`，与单文件导出完全一致（因为 PNG 不支持命名锚点，无法参与跨文档链接）
+
+### 6.1.1 DocumentFormat 与 PagedFormat：Bundle 内的格式选择
+
+定义在 [typst-library/model/document.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/model/document.rs#L256-L299)：
+
+```rust
+pub enum DocumentFormat {
+    Paged(PagedFormat),  // → Target::Paged
+    Html,                // → Target::Html
+}
+
+pub enum PagedFormat {
+    Pdf,   // → typst_pdf::pdf_in_bundle()
+    Png,   // → typst_render::render()
+    Svg,   // → typst_svg::svg_in_bundle()
+}
+```
+
+Bundle 构建阶段在 [compile_document](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-bundle/src/lib.rs#L288-L339) 中通过 `document.determine_format(styles)` 读取每个 `document()` 元素的 format 参数，决定走哪条主输出分支。
 
 ### 6.2 Geometry 三变体统一抽象
 
