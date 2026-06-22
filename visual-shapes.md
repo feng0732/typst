@@ -5,31 +5,60 @@
 ```
 用户代码 (Typst markup)
     │
-    ▼
-元素定义 (typst-library/visualize/)
-  LineElem / RectElem / SquareElem / EllipseElem / CircleElem
-  PolygonElem / CurveElem
+    ▼  编译入口 typst::compile::<T>()  [lib.rs:74-82]
     │
-    ▼  Show Rule 注册 (typst-layout/rules.rs)
-    │   将元素包装为 BlockElem::single_layouter(elem, layout_xxx)
+    │  T 的选择决定了 Output trait 的实现：
+    │  ├─ T = PagedDocument  → Target::Paged （PNG/SVG/PDF 共用）
+    │  └─ T = HtmlDocument   → Target::Html   （HTML 输出）
     │
-布局 (typst-layout/shapes.rs)
-  layout_line / layout_rect / layout_square / ...
-  layout_curve / layout_polygon
-    │   产出 Frame，其中包含 FrameItem::Shape(Shape, Span)
+    ▼  元素定义 (typst-library/visualize/)
+       LineElem / RectElem / SquareElem / EllipseElem / CircleElem
+       PolygonElem / CurveElem
     │
-    ▼
-Frame 树 (typst-library/layout/frame.rs)
-  Frame -> Vec<(Point, FrameItem)>
-  FrameItem::Shape / FrameItem::Group / FrameItem::Text / ...
+    ▼  Show Rule 注册（按 Target 区分）
     │
-    ▼  三条输出管线各自遍历 Frame 树
+    │  Target::Paged  [typst-layout/rules.rs:L96-L103]:
+    │    LINE_RULE → layout_line
+    │    RECT_RULE → layout_rect
+    │    ...所有 7 种图形元素都有 Show Rule
     │
-  ┌──────────┬──────────────┬──────────────┐
-  ▼          ▼              ▼              ▼
-PNG 渲染   SVG 渲染      PDF 渲染      HTML 渲染
-typst-render  typst-svg    typst-pdf     typst-html
-(tiny-skia)  (xmlwriter)  (krilla)
+    │  Target::Html  [typst-html/rules.rs:L82-L83]:
+    │    IMAGE_RULE （仅图片有 Show Rule）
+    │    其他图形元素无 Show Rule → 在 convert.rs 中被忽略并警告
+    │
+    ▼  布局层
+    │
+    │  Target::Paged 路径 (typst-layout/shapes.rs):
+    │    layout_line / layout_rect / layout_curve / ...
+    │    → 产出 Frame，包含 FrameItem::Shape(Shape, Span)
+    │
+    │  Target::Html 路径 (typst-html/convert.rs):
+    │    ├─ 普通图形元素（rect/line/curve 等）→ 无 Show Rule
+    │    │   → [convert.rs:L155-L160] 警告并忽略
+    │    │
+    │    └─ html.frame(body)  [convert.rs:L140-L154]:
+    │        ├─ 临时切换 Target::Paged 重新布局
+    │        │   let style = TargetElem::target.set(Target::Paged).wrap();
+    │        │   let frame = layout_frame(engine, &elem.body, locator, styles.chain(&style), ...);
+    │        ├─ 包装为 HtmlFrame { inner: frame, text_size, css, ... }
+    │        └─ 作为 HtmlNode::Frame 插入 DOM 树
+    │
+    ▼  Output 产物
+    │
+    ├─ PagedDocument  [typst-layout/document.rs:L63-L79]
+    │   ├─ pages: Vec<Page { frame, bleed, fill, ... }>
+    │   └─ 后处理导出：
+    │       ├─ PDF:  typst_pdf::pdf(&document, ...)      → Vec<u8>
+    │       ├─ PNG:  typst_render::render(&page, ...)    → sk::Pixmap （逐页）
+    │       └─ SVG:  typst_svg::svg(&page, ...)          → String （逐页）
+    │
+    └─ HtmlDocument  [typst-html/dom.rs:L81-L97]
+        └─ 编码 (typst-html/encode.rs):
+            ├─ 普通 HTML 元素 → <div>/<p>/<span>/...
+            └─ HtmlNode::Frame(frame) → [encode.rs:L391-L402]
+                typst_svg::svg_in_html(
+                    &frame.inner, frame.text_size, pretty, id, styles, anchors, link_resolver
+                ) → 内联 <svg> 字符串
 ```
 
 ---
@@ -260,11 +289,104 @@ styled_rect(size, radius, fill, stroke)
 
 ---
 
-## 三、渲染输出管线
+## 三、Output trait 与顶层编译入口
 
-布局产出的 `PagedDocument` 包含多页 `Frame`，每页 `Frame` 是一棵 `(Point, FrameItem)` 树。三条输出管线各自遍历此树，对 `FrameItem::Shape` 调用各自的转换逻辑。
+### 3.1 Output trait 与 Target 枚举
 
-### 3.1 PNG 渲染 (typst-render → tiny-skia)
+定义在 [target.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/foundations/target.rs)：
+
+```rust
+/// 编译输出，与 Target 变体一一对应
+pub trait Output: Any {
+    fn target() -> Target where Self: Sized;
+    fn create(engine: &mut Engine, content: &Content, styles: StyleChain) -> SourceResult<Self>;
+    fn introspector(&self) -> &dyn Introspector;
+}
+
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash, Cast)]
+pub enum Target {
+    #[default]
+    Paged,   // 分页完整排版（PNG/SVG/PDF 共用）
+    Html,    // HTML 导出
+    Bundle,  // 多文件捆绑导出
+}
+```
+
+**关键事实：Output trait 只有两个核心实现**
+
+| 实现 | Target | 创建函数 | 导出用途 |
+|------|--------|---------|---------|
+| `PagedDocument` | `Target::Paged` | `typst_layout::layout_document()` | PNG / SVG / PDF（共用该 Output，后处理不同） |
+| `HtmlDocument` | `Target::Html` | `typst_html::html_document()` | HTML 导出 |
+| `Bundle` | `Target::Bundle` | `typst_bundle::bundle_document()` | 多文件捆绑导出 |
+
+### 3.2 顶层编译入口
+
+定义在 [typst/src/lib.rs:74-194](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst/src/lib.rs#L74-L194)：
+
+```rust
+pub fn compile<T>(world: &dyn World) -> Warned<SourceResult<T>>
+where
+    T: Output,
+{
+    // 1. 设置 Target 样式
+    let base = StyleChain::new(&library.styles);
+    let target = TargetElem::target.set(T::target()).wrap();
+    let styles = base.chain(&target);
+
+    // 2. 求值主文件为 Content
+    let content = typst_eval::eval(...)?.content();
+
+    // 3. 迭代布局直到内省稳定（最多 5 次）
+    loop {
+        document = T::create(&mut engine, &content, styles)?;
+        if constraint.validate(document.introspector()) { break; }
+        if history.is_full() { break; }
+        history.push(document);
+    }
+
+    Ok(document)
+}
+```
+
+### 3.3 各导出格式的调用链
+
+```
+typst-cli/src/compile.rs 顶层 export 函数
+  │
+  ├─ OutputFormat::Pdf / Png / Svg:
+  │   let Warned { output, warnings } = typst::compile::<PagedDocument>(world);
+  │   output.and_then(|doc| export_paged(&doc, config))
+  │   │
+  │   ├─ export_pdf(doc, config):
+  │   │   typst_pdf::pdf(&doc, &options) → Vec<u8>
+  │   │
+  │   ├─ export_image(doc, config, Png):
+  │   │   for (i, page) in doc.pages().iter().enumerate() {
+  │   │       let pixmap = typst_render::render(page, &opts);
+  │   │       pixmap.encode_png() → Vec<u8>
+  │   │   }
+  │   │
+  │   └─ export_image(doc, config, Svg):
+  │       for (i, page) in doc.pages().iter().enumerate() {
+  │           let svg = typst_svg::svg(page, &opts);  → String
+  │       }
+  │
+  └─ OutputFormat::Html:
+      let Warned { output, warnings } = typst::compile::<HtmlDocument>(world);
+      output.and_then(|doc| export_html(&doc, config))
+          let html = typst_html::html(&doc, &options) → String
+```
+
+---
+
+## 四、渲染输出管线详解
+
+布局产出的 `PagedDocument` 包含多页 `Frame`，每页 `Frame` 是一棵 `(Point, FrameItem)` 树。三条渲染管线（PNG/SVG/PDF）各自遍历此树，对 `FrameItem::Shape` 调用各自的转换逻辑。
+
+HTML 输出则走完全不同的路径——普通图形元素被忽略，只有 `html.frame` 内的内容通过内联 SVG 渲染。
+
+### 4.1 PNG 渲染 (typst-render → tiny-skia)
 
 入口：[render_shape](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-render/src/shape.rs#L11-L84)
 
@@ -287,7 +409,7 @@ Shape
 
 填充规则映射：`NonZero → Winding`，`EvenOdd → EvenOdd`
 
-### 3.2 SVG 渲染 (typst-svg → xmlwriter)
+### 4.2 SVG 渲染 (typst-svg → xmlwriter)
 
 入口：[render_shape](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-svg/src/shape.rs#L13-L48)
 
@@ -311,7 +433,7 @@ Shape
 
 [SvgPathBuilder](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-svg/src/path.rs#L8-L168) 使用**相对坐标**生成 SVG path `d` 属性，自动优化水平/垂直线段为 `h`/`v` 命令。
 
-### 3.3 PDF 渲染 (typst-pdf → krilla)
+### 4.3 PDF 渲染 (typst-pdf → krilla)
 
 入口：[handle_shape](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-pdf/src/shape.rs#L14-L75)
 
@@ -337,57 +459,186 @@ Shape
 
 [convert_path](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-pdf/src/util.rs#L209-L225) 的实现与 PNG 的 `convert_curve` 几乎一模一样，只是目标类型从 `tiny_skia::PathBuilder` 换成了 `krilla::PathBuilder`。
 
+### 4.4 HTML 输出边界与内联 SVG 机制
+
+HTML 输出对图形元素的处理与 Paged 目标完全不同，分为两条路径：
+
+#### 4.4.1 普通图形元素：直接忽略
+
+在 `Target::Html` 下，[typst-html/rules.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/rules.rs) 只为 `ImageElem` 注册了 Show Rule（L83），**没有为 RectElem/LineElem/CurveElem/PolygonElem 等图形元素注册 Show Rule**。
+
+因此，在 [convert.rs:155-160](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/convert.rs#L155-L160) 的 `handle()` 函数中，这些元素会落入 else 分支，被忽略并警告：
+
+```rust
+} else {
+    converter.engine.sink.warn(warning!(
+        child.span(),
+        "{} was ignored during HTML export",
+        child.elem().name(),
+    ));
+}
+```
+
+#### 4.4.2 html.frame：通过内联 SVG 渲染
+
+`html.frame(body)` 是 HTML 目标下渲染图形的唯一途径。处理流程分为两步：
+
+**第一步：布局阶段（convert.rs:140-154）**
+
+```rust
+} else if let Some(elem) = child.to_packed::<FrameElem>() {
+    let locator = converter.locator.next(&elem.span());
+    // 关键：临时切换到 Target::Paged
+    let style = TargetElem::target.set(Target::Paged).wrap();
+    // 调用 Paged 目标的布局流程
+    let frame = (converter.engine.library.routines.layout_frame)(
+        converter.engine,
+        &elem.body,
+        locator,
+        styles.chain(&style),  // styles 叠加 Target::Paged
+        Region::new(Size::splat(Abs::inf()), Axes::splat(false)),
+    )?;
+    // 包装为 HtmlFrame
+    let mut node = HtmlFrame::new(frame, styles, elem.span()).into();
+    make_block_level(&mut node).unwrap();
+    converter.push(node);
+}
+```
+
+**关键点**：
+- 通过 `TargetElem::target.set(Target::Paged).wrap()` 临时切换目标
+- 调用的是 Paged 目标的 `layout_frame`，因此内部会触发完整的 Paged 布局流程
+- 产出的 `Frame` 包含 `FrameItem::Shape`，与 Paged 文档的 Frame 结构完全一致
+- 包装为 `HtmlFrame` 后作为 `HtmlNode::Frame` 插入 DOM 树
+
+**第二步：编码阶段（encode.rs:391-402）**
+
+在 HTML 编码时，`HtmlNode::Frame` 会调用 `typst_svg::svg_in_html()` 生成内联 SVG：
+
+```rust
+fn write_frame(w: &mut Writer, frame: &HtmlFrame) {
+    let svg = typst_svg::svg_in_html(
+        &frame.inner,      // 来自 Paged 布局的 Frame
+        frame.text_size,   // 用于 em 单位换算
+        w.pretty,          // 是否格式化
+        frame.id.as_deref(),  // SVG 元素 id
+        &eco_format!("{}", frame.css.to_inline()),  // 内联 CSS
+        &frame.anchors,    // 锚点位置（用于链接跳转）
+        w.link_resolver,   // 链接解析器
+    );
+    w.buf.push_str(&svg);
+}
+```
+
+#### 4.4.3 svg_in_html 与普通 svg 的区别
+
+`typst_svg::svg_in_html()`（[lib.rs:82-120](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-svg/src/lib.rs#L82-L120)）与普通 `svg()` 函数的区别：
+
+| 特性 | `svg(page, opts)`（单页导出） | `svg_in_html(frame, ...)`（内联） |
+|------|-----------------------------|--------------------------------|
+| 输入 | `&Page`（含 bleed 和 fill） | `&Frame`（无 bleed） |
+| 输出 | 完整 XML 文档（含 `<?xml?>`） | 仅 `<svg>` 元素片段（直接嵌入 HTML） |
+| 尺寸 | 用 pt 绝对单位 | 用 em 相对单位（`width: ${w}em; height: ${h}em`） |
+| 额外参数 | 无 | `id`, `styles` (CSS), `anchors`, `link_resolver` |
+| 共享代码 | ✅ `render_shape` / `convert_geometry_to_path` / `convert_curve` 全部共享 | 同左 |
+
+**共享图形转换逻辑**：
+- `svg_in_html` 内部创建 `SVGRenderer::with_options(Some(link_resolver))`
+- 调用 `render_frame()` 遍历 Frame 树
+- 对 `FrameItem::Shape` 调用同一套 `render_shape()` 函数
+- `Geometry` → `SvgPathBuilder` 的转换完全复用
+
 ---
 
-## 四、协作关系图
+## 五、协作关系图
 
 ```
+                    ┌─────────────────────────────────────────┐
+                    │          编译入口 typst::compile::<T>()  │
+                    │  [typst/src/lib.rs:L74-L82]              │
+                    │  T=PagedDocument  or  T=HtmlDocument    │
+                    └──────────────────┬──────────────────────┘
+                                       │
+                                       ▼
                     ┌─────────────────────────────────────────┐
                     │          用户层 (Typst 代码)              │
                     │  #rect(fill: blue, stroke: red)          │
                     │  #curve(move(..), line(..), cubic(..))   │
                     │  #polygon((0pt,0pt), (10pt,10pt), ...)  │
+                    │  #html.frame[#rect(...)]                 │
                     └──────────────────┬──────────────────────┘
                                        │ 解析
                     ┌──────────────────▼──────────────────────┐
                     │    元素定义 (typst-library/visualize/)   │
                     │  LineElem  RectElem  CurveElem           │
+                    │  FrameElem (html.frame)                  │
                     │  Shape { geometry, fill, stroke, rule }  │
                     │  Geometry { Line, Rect, Curve }          │
                     │  Curve(Vec<CurveItem>)                   │
                     │  CurveItem { Move, Line, Cubic, Close }  │
                     └──────────────────┬──────────────────────┘
-                                       │ Show Rule + Layout
-                    ┌──────────────────▼──────────────────────┐
-                    │     布局层 (typst-layout/shapes.rs)      │
-                    │  layout_line → Geometry::Line.stroked()  │
-                    │  layout_curve → CurveBuilder → Curve     │
-                    │  layout_polygon → Curve(move+lines+close)│
-                    │  layout_rect/square/ellipse/circle       │
-                    │    → styled_rect / Curve::ellipse()      │
-                    │  产出: Frame { Vec<(Point, FrameItem)> } │
-                    │  其中 FrameItem::Shape(Shape, Span)      │
-                    └──────┬──────────┬──────────┬────────────┘
-                           │          │          │
-              ┌────────────▼┐  ┌──────▼──────┐  ┌▼──────────────┐
-              │ PNG 输出     │  │ SVG 输出    │  │ PDF 输出      │
-              │ typst-render │  │ typst-svg   │  │ typst-pdf     │
-              │              │  │             │  │               │
-              │ Shape        │  │ Shape       │  │ Shape         │
-              │  → sk::Path  │  │  → <path d> │  │  → krilla    │
-              │  → fill_path │  │  → fill属性 │  │    ::Path     │
-              │  → stroke_   │  │  → stroke   │  │  → set_fill  │
-              │    path      │  │    属性     │  │  → set_stroke │
-              │              │  │             │  │  → draw_path  │
-              │ tiny-skia    │  │ xmlwriter   │  │ krilla        │
-              └──────────────┘  └─────────────┘  └───────────────┘
+                                       │  Show Rule（按 Target 区分）
+          ┌────────────────────────────┴────────────────────────────┐
+          │ Target::Paged            │           Target::Html       │
+          │ [typst-layout/rules.rs]  │       [typst-html/rules.rs]  │
+          │ 7 种图形元素都有规则     │  仅 ImageElem 有规则         │
+          ▼                          ▼                              ▼
+┌─────────────────────────┐  ┌──────────────────────────┐  ┌─────────────────────┐
+│ 布局层 (typst-layout/  │  │ convert.rs:L155-L160      │  │ convert.rs:L140-L154 │
+│ shapes.rs)             │  │ 普通图形元素 → 忽略+警告  │  │ html.frame 处理      │
+│                         │  │                         │  │  ├─ 切 Target::Paged  │
+│ layout_line → Shape    │  │                         │  │  ├─ layout_frame()   │
+│ layout_curve → Shape   │  │                         │  │  └─ Frame → HtmlFrame│
+│ layout_rect → Shape    │  │                         │  │                        │
+│ ...                    │  │                         │  │                        │
+│ 产出: PagedDocument    │  │                         │  │ 产出: HtmlDocument    │
+│   pages: Vec<Page>     │  │                         │  │   HtmlNode tree       │
+│   Page.frame: Frame    │  │                         │  │   HtmlNode::Frame(..) │
+└──────────┬─────────────┘  └──────────────────────────┘  └──────────┬───────────┘
+           │                                                          │
+           │ 后处理                                                  │ 编码
+           │                                                          │
+   ┌───────┴────────┬─────────────────┐                               │
+   ▼                ▼                 ▼                               │
+┌──────────┐   ┌──────────┐   ┌──────────┐                          │
+│ PDF 输出 │   │ PNG 输出 │   │ SVG 输出 │                          │
+│ typst-   │   │ typst-   │   │ typst-   │                          │
+│ pdf      │   │ render   │   │ svg      │                          │
+│          │   │          │   │          │                          │
+│ Shape    │   │ Shape    │   │ Shape    │                          │
+│ → krilla │   │ → sk::   │   │ → <path  │                          │
+│ ::Path   │   │ Path     │   │ d="..." │                          │
+│ → draw_  │   │ → fill_  │   │ → fill/  │                          │
+│ path     │   │ path     │   │ stroke   │                          │
+│          │   │ → stroke │   │ 属性     │                          │
+│          │   │ _path    │   │          │                          │
+│ krilla   │   │ tiny-    │   │ xml-     │                          │
+│          │   │ skia     │   │ writer   │                          │
+└──────────┘   └──────────┘   └──────┬───┘                          │
+                                     │                              │
+                                     │ svg_in_html()                │
+                                     │ [typst-svg/lib.rs:L82-L120]  │
+                                     │ 共享 render_shape 代码       │
+                                     ▼                              ▼
+                                 内联 <svg> 片段 ──────────────► HTML 字符串
 ```
 
 ---
 
-## 五、关键设计模式总结
+## 六、关键设计模式总结
 
-### 5.1 Geometry 三变体统一抽象
+### 6.1 Output trait 的双实现架构
+
+**核心事实：`Output` trait 只有两个核心实现**（定义在 [target.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-library/src/foundations/target.rs#L13-L30)）：
+
+| 实现 | Target | 调用方 | 后处理 |
+|------|--------|-------|-------|
+| `PagedDocument` | `Target::Paged` | `typst::compile::<PagedDocument>()` | PNG / SVG / PDF（三个独立后处理函数） |
+| `HtmlDocument` | `Target::Html` | `typst::compile::<HtmlDocument>()` | HTML 编码 |
+
+**PNG/SVG/PDF 不是独立的 Output**，而是对 `PagedDocument` 的后处理。三者共享同一套布局流程和同一批 `Frame` 数据，只是最终渲染目标不同。
+
+### 6.2 Geometry 三变体统一抽象
 
 `Geometry` 的三种变体（Line / Rect / Curve）为不同复杂度的图形提供了分层表达：
 
@@ -399,7 +650,7 @@ Shape
 
 圆/椭圆在布局时就已经被 `Curve::ellipse()` 转换为贝塞尔曲线，因此渲染器只需处理 `Curve`，无需特殊椭圆逻辑。
 
-### 5.2 二次贝塞尔统一升阶
+### 6.3 二次贝塞尔统一升阶
 
 用户可写 `curve.quad()`，但 `CurveItem` 只有 `Cubic`。`CurveBuilder::quad()` 通过 `control_q2c()` 升阶：
 
@@ -411,7 +662,7 @@ Shape
 
 这简化了渲染管线——所有后端只需处理三次贝塞尔。
 
-### 5.3 矩形的双模式渲染
+### 6.4 矩形的双模式渲染
 
 [styled_rect](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-layout/src/shapes.rs#L686-L697) 根据复杂度选择两种策略：
 
@@ -420,10 +671,35 @@ Shape
 
 分段矩形中，实线描边优先使用 `fill_segment`（用填充区域模拟描边，能更好地处理角连接），虚线描边使用 `stroke_segment`。
 
-### 5.4 圆角弧线的贝塞尔近似
+### 6.5 圆角弧线的贝塞尔近似
 
 所有圆角（矩形圆角、圆/椭圆）都通过 `bezier_arc_control` 函数（[L1372-L1386](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-layout/src/shapes.rs#L1372-L1386)）将圆弧转换为三次贝塞尔，基于 [StackOverflow 算法](https://stackoverflow.com/a/44829356)。
 
-### 5.5 Frame 树作为统一中间表示
+### 6.6 Target 动态切换与 html.frame 桥接
+
+HTML 目标下普通图形元素会被忽略，但 `html.frame()` 提供了桥接机制：
+
+**关键机制**（[convert.rs:140-154](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/convert.rs#L140-L154)）：
+
+```rust
+// 1. 临时切换 Target
+let style = TargetElem::target.set(Target::Paged).wrap();
+
+// 2. 调用 Paged 目标的布局流程
+let frame = layout_frame(engine, &elem.body, locator, styles.chain(&style), ...);
+
+// 3. 包装为 HtmlFrame
+HtmlFrame::new(frame, styles, elem.span())
+
+// 4. 编码时调用 typst_svg::svg_in_html() 渲染为内联 SVG
+```
+
+**设计亮点**：
+- `Target` 是一个样式（`TargetElem::target`），可以动态叠加切换
+- `html.frame` 内部触发的是完整的 Paged 布局流程，因此支持所有 Paged 目标的功能
+- `svg_in_html()` 与普通 SVG 导出共享 `render_shape` / `convert_geometry_to_path` 等核心转换逻辑
+- 实现了 "HTML 文档中嵌入精确排版图形" 的能力，同时保持 HTML 输出的语义化
+
+### 6.7 Frame 树作为统一中间表示
 
 `Frame` + `FrameItem` 是布局与渲染之间的唯一契约。所有图形元素经过布局后都变成了 `(Point, FrameItem::Shape(Shape, Span))`。渲染器不需要知道"这个 Shape 来自 rect 还是 polygon"，只需遍历 Frame 树，对每个 Shape 调用 `Geometry` → 目标路径的转换。
