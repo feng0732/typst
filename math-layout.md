@@ -149,22 +149,63 @@ if item.class() == MathClass::Vary
 
 #### 大型运算符与其他运算类交互的优先级影响
 
-由于 match 臂从上到下首次匹配，当 `Large` 与 `Binary`、`Relation` 相邻时，**Binary/Relation 的规则优先**：
+由于 match 臂从上到下首次匹配，当 `Large` 与 `Binary`、`Relation` 相邻时，**非脚本尺寸和脚本尺寸的匹配路径会有本质差异**。核心机制是：**带有 `if` 守卫的 match 臂，如果模式匹配了但守卫为 false，会继续向下匹配下一个分支**（Rust 的 match 守卫语义）。
 
-| 左侧项 | 右侧项 | 命中臂 | 实际间距 |
-|--------|--------|--------|----------|
-| `Binary` | `Large` | 序号 7 `(Binary, _)` | MEDIUM（Binary 后），无 THIN（`(_, Large)` 未命中） |
-| `Large` | `Binary` | 序号 8 `(_, Binary)` | MEDIUM（Binary 前），无 THIN（`(Large, _)` 未命中） |
-| `Relation` | `Large` | 序号 5 `(Relation, _)` | THICK（Relation 后），无 THIN |
-| `Large` | `Relation` | 序号 6 `(_, Relation)` | THICK（Relation 前），无 THIN |
-| `Large` | `Opening/Fence` | 序号 9 | **无间距** |
-| `Large` | `Closing` | 序号 3 `(_, Closing)` | **无间距** |
-| `Opening` | `Large` | 序号 3 `(Opening, _)` | **无间距** |
-| `Large` | `Alphabetic/Normal` | 序号 10 | THIN |
-| `Alphabetic/Normal` | `Large` | 序号 11 | THIN |
-| `Large` | `Large` | 序号 10 | THIN（后一个 Large 无 THIN） |
+以下是所有典型组合的逐分支匹配追踪：
 
-关键发现：**当 Large 与 Binary/Relation 相邻时，只有一侧间距生效，且是 Binary 的 MEDIUM 或 Relation 的 THICK，而非 Large 的 THIN**。
+##### 非脚本尺寸（Display/Text）
+
+| 组合 | 逐分支匹配过程 | 最终结果 |
+|------|---------------|----------|
+| `Binary + Large` | 序号 7 `(Binary, _)` 模式匹配，`!script(l)=true` → 命中 | `l.rspace = MEDIUM`，**无 THIN**（序号 11 `(_, Large)` 不执行） |
+| `Large + Binary` | 序号 8 `(_, Binary)` 模式匹配，`!script(r)=true` → 命中 | `r.lspace = MEDIUM`，**无 THIN**（序号 10 `(Large, _)` 不执行） |
+| `Relation + Large` | 序号 5 `(Relation, _)` 模式匹配，`!script(l)=true` → 命中 | `l.rspace = THICK`，**无 THIN** |
+| `Large + Relation` | 序号 6 `(_, Relation)` 模式匹配，`!script(r)=true` → 命中 | `r.lspace = THICK`，**无 THIN** |
+| `Large + Opening` | 序号 9 `(Large, Opening\|Fence)` → 命中 | **无间距** |
+| `Large + Closing` | 序号 3 `(_, Closing)` → 命中 | **无间距** |
+| `Opening + Large` | 序号 3 `(Opening, _)` → 命中 | **无间距** |
+| `Large + Alphabetic` | 序号 10 `(Large, _)` → 命中 | `l.rspace = THIN` |
+| `Alphabetic + Large` | 序号 11 `(_, Large)` → 命中 | `r.lspace = THIN` |
+| `Large + Large` | 序号 10 `(Large, _)` → 命中 | 仅 `l.rspace = THIN`，后一个 Large 无 THIN |
+
+**非脚本尺寸结论**：当 Large 与 Binary/Relation 相邻时，只有一侧间距生效，且是 Binary 的 MEDIUM 或 Relation 的 THICK，而非 Large 的 THIN。
+
+##### 脚本尺寸（Script/ScriptScript）
+
+当处于脚本尺寸时（`script(l/r) = true`），Binary 和 Relation 的守卫 `!script(l/r)` 为 false，**模式匹配成功但守卫失败，继续向下匹配**：
+
+| 组合 | 逐分支匹配过程 | 最终结果 |
+|------|---------------|----------|
+| `Binary + Large` | 序号 7 `(Binary, _)` 模式匹配，但 `!script(l)=false` → 守卫失败，继续<br>↓<br>序号 11 `(_, Large)` → 命中 | **无 MEDIUM**，但 `r.lspace = THIN` |
+| `Large + Binary` | 序号 8 `(_, Binary)` 模式匹配，但 `!script(r)=false` → 守卫失败，继续<br>↓<br>序号 10 `(Large, _)` → 命中 | **无 MEDIUM**，但 `l.rspace = THIN` |
+| `Relation + Large` | 序号 5 `(Relation, _)` 模式匹配，但 `!script(l)=false` → 守卫失败，继续<br>↓<br>序号 11 `(_, Large)` → 命中 | **无 THICK**，但 `r.lspace = THIN` |
+| `Large + Relation` | 序号 6 `(_, Relation)` 模式匹配，但 `!script(r)=false` → 守卫失败，继续<br>↓<br>序号 10 `(Large, _)` → 命中 | **无 THICK**，但 `l.rspace = THIN` |
+| `Large + Opening` | 序号 9 `(Large, Opening\|Fence)` → 命中（无守卫） | **无间距** |
+| `Large + Closing` | 序号 3 `(_, Closing)` → 命中（无守卫） | **无间距** |
+| `Opening + Large` | 序号 3 `(Opening, _)` → 命中（无守卫） | **无间距** |
+| `Large + Alphabetic` | 序号 10 `(Large, _)` → 命中（无守卫） | `l.rspace = THIN` |
+| `Alphabetic + Large` | 序号 11 `(_, Large)` → 命中（无守卫） | `r.lspace = THIN` |
+| `Large + Large` | 序号 10 `(Large, _)` → 命中（无守卫） | 仅 `l.rspace = THIN` |
+
+**脚本尺寸关键发现**：
+- Binary 和 Relation 的 MEDIUM/THICK 间距被禁用（守卫失败）
+- 但 **Large 规则没有守卫**，会"捡漏"成功，继续施加 THIN 间距
+- 结果：脚本尺寸下 Binary+Large 变成 THIN，而非 MEDIUM；Relation+Large 变成 THIN，而非 THICK
+- 但 Large+Opening/Closing 仍然保持无间距（序号 3 和 9 也没有守卫）
+
+#### 两种尺寸的差异总结
+
+| 组合 | 非脚本尺寸 | 脚本尺寸 |
+|------|-----------|---------|
+| `x + ∑` | MEDIUM（+后） | THIN（∑前） |
+| `∑ + x` | MEDIUM（+前） | THIN（∑后） |
+| `x = ∑` | THICK（=后） | THIN（∑前） |
+| `∑ = x` | THICK（=前） | THIN（∑后） |
+| `∑ (x)` | 无间距 | 无间距 |
+| `∑ x` | THIN | THIN |
+| `x ∑` | THIN | THIN |
+
+这一差异的设计意图：非脚本尺寸优先尊重运算符的语义间距（二元运算符需要中等间距，关系符需要较宽间距）；脚本尺寸为了紧凑，只保留最基本的 Large 运算符视觉区分。
 
 #### 间距的落地机制
 
