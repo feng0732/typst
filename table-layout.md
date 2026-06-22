@@ -1068,6 +1068,11 @@ while !fits(header_height) {
 - 如果没有"旧高度预判断"，就无法预先确定 header 应该放在哪一页
 - 两个机制共同作用，确保了布局的终止性，但牺牲了一定的灵活性
 
+**与其他两种场景的对比要点**：
+- 普通不可断内容行同样使用"模拟 + 不可断组"的组合，但它的 **Rel 行在换页后会用新 full 重新解析**，所以即使预测量不准确，实际高度也会自动适配
+- Rowspan 模拟不使用"不可断组"锁，而是**每次跳页后都重新模拟 header/footer**，确保模拟数据始终与当前 regions 匹配
+- 重复表头卡在中间：Rel 行实际布局会重新解析（高度正确），但**跳页判断使用旧预测量**（换页位置可能错误），再加上锁换页，三者叠加导致溢出风险
+
 #### 3.6.3 修正"结果一定正确"的过度说法
 
 之前的说法 **"最终实际布局时会重新测量，所以结果仍然正确"** 是不准确的。
@@ -1148,30 +1153,211 @@ self.regions.size.y -= self.current.footer_height;  // 减去新 footer 高度
 
 这虽然不会导致溢出，但会产生不必要的空白页。
 
-#### 3.6.5 不可断组设计的风险分析
+#### 3.6.5 三种场景的完整流程对比
 
-**`unbreakable_rows_left` 的双刃剑效应**：
+代码中存在三种涉及"先模拟→可能换页→实际布局"的场景：
+1. 普通不可断内容行组
+2. 重复表头/表尾组
+3. Rowspan 模拟（`RowspanSimulator`）
 
-```rust
-// L264-L267 注释明确说明了设计意图
-// Group of headers is unbreakable.
-// Thus, no risk of 'finish_region' being recursively called from within 'layout_row'.
+##### 场景 1：普通不可断内容行组的完整流程
+
+代码路径：[`check_for_unbreakable_rows()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L237-L297) → `layout_row_internal()` → `layout_relative_row()` / `layout_auto_row()`
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 1: 模拟（使用当前 regions.full）                           │
+│                                                               │
+│ simulate_unbreakable_row_group(current_row, None,             │
+│     &self.regions, ...)                                       │
+│                                                               │
+│ 内部：Rel 行高度 = v.resolve().relative_to(regions.base().y)  │
+│                    = v.resolve().relative_to(regions.full)    │
+│                                                               │
+│ → 得到 row_group.height（使用当前 full 解析）                  │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 2: 空间不足 → 换页                                        │
+│                                                               │
+│ while !fits(row_group.height) {                               │
+│     finish_region() → regions.next()                          │
+│                                │                              │
+│                                ▼                              │
+│                          // Regions::next() 关键代码:          │
+│                          self.size.y = new_height;             │
+│                          self.full = new_height;  // full 也变!│
+│ }                                                             │
+│                                                               │
+│ → regions.full 已更新为新页面的高度！                          │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 3: 实际布局 Rel 行（使用新 regions.full 重新解析）         │
+│                                                               │
+│ layout_relative_row():                                        │
+│   resolved = v.resolve(self.styles)                           │
+│              .relative_to(self.regions.base().y)  // ← 新 full!│
+│                                                               │
+│ → ✅  关键：使用换页后的新 full 重新解析！                     │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 4: 实际布局 Auto 行（使用新 regions 重新测量）             │
+│                                                               │
+│ layout_auto_row():                                            │
+│   measure_auto_row(..., unbreakable_rows_left, ...)           │
+│     → breakable = false (因为 unbreakable_rows_left > 0)      │
+│     → 使用无限高度测量 (Abs::inf())                            │
+│     → 但可用空间扣除了 header/footer                          │
+│                                                               │
+│ → Auto 行虽然是固定高度测量（unbreakable），但高度准确          │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-**优点**：
-- ✅ 防止无限递归（header 放不下→换页→放 header→又放不下→...）
-- ✅ 确保 header 完整性，不被换页拆分
-- ✅ 简化了状态管理，不需要处理部分布局的 header 回滚
+**普通不可断内容行的 `regions.full` 风险**：
+- ✅ **Rel 行风险低**：模拟用旧 full → 换页后实际布局用新 full 重新解析
+- ⚠️ **仅存在 Auto 行模拟时的偏差**：`simulate_unbreakable_row_group()` 中的 Auto 行使用 `Abs::inf()` 测量，与实际布局一致，所以 Auto 行高度不受 full 变化影响
+- **结论**：普通不可断内容行对 `regions.full` 变化的**鲁棒性最好**
 
-**风险**：
-- ❌ 一旦预判断错误，没有补救机制
-- ❌ 实际布局期间发现空间不够也不能换页，只能溢出
-- ❌ 没有回滚机制（header 行已经部分布局到 `lrows` 中）
+##### 场景 2：重复表头组的完整流程
 
-**与其他不可断组的区别**：
-- 普通不可断行组（内容行）：`check_for_unbreakable_rows()` 会先模拟整组高度，空间不够就换页
-- Header 不可断组：只模拟了 header 高度，但模拟时使用的 `regions.full` 可能已经变化
-- 关键区别：普通不可断组的模拟和布局使用相同的 `regions`，而 header 组的模拟（预测量）和布局可能使用不同的 `regions.full`
+代码路径：[`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L203-L352)
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 1: 预测量（使用当前 regions.full）                        │
+│                                                               │
+│ simulate_header_height(repeating_headers,                     │
+│     &self.regions, ...)                                       │
+│ → 内部调用 simulate_unbreakable_row_group()                  │
+│ → 使用当前 regions.full 解析 Rel 行                           │
+│                                                               │
+│ → 得到 header_height（使用旧 full 解析）                      │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 2: 空间不足 → 换页                                        │
+│                                                               │
+│ while !fits(header_height) {                                  │
+│     finish_region_internal() → regions.next()                 │
+│                                │                              │
+│                                ▼                              │
+│                          regions.full = new_height  // full 变!│
+│     ⚠️  Header 高度不重新模拟！（TODO 问题）                   │
+│ }                                                             │
+│                                                               │
+│ 循环结束后：                                                  │
+│   → Footer 重新模拟 (使用新 regions.full)                     │
+│   → Header ❌ 不重新模拟！                                    │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 3: 标记不可断组                                          │
+│                                                               │
+│ unbreakable_rows_left += header_rows + pending_rows;          │
+│                                                               │
+│ → 🔒  实际布局期间禁止换页！                                   │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 4: 实际布局 header 行（使用新 regions.full 重新解析）     │
+│                                                               │
+│ layout_header_rows() → layout_row_with_state()               │
+│   → layout_relative_row():                                    │
+│       resolved = v.resolve()                                  │
+│                  .relative_to(self.regions.base().y) // 新full│
+│                                                               │
+│ → ✅  Rel 行用新 full 重新解析！                             │
+│                                                               │
+│   → layout_auto_row():                                        │
+│       breakable = false (unbreakable_rows_left > 0)           │
+│       Auto 行高度准确                                          │
+│                                                               │
+│ → 🔒  但布局期间不能换页（即使空间不够）！                    │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**重复表头的 `regions.full` 风险**：
+- ✅ **Rel 行实际布局使用新 full 重新解析** → 实际高度正确
+- ❌ **跳页判断使用旧 full** → 预测量高度可能与实际高度不一致
+  - 如果旧 full 解析高度 < 新 full 解析高度 → 预测量偏小 → 可能**溢出**
+  - 如果旧 full 解析高度 > 新 full 解析高度 → 预测量偏大 → 可能**多跳页**
+- **结论**：重复表头对 `regions.full` 变化的**鲁棒性最差**，是三者中唯一存在溢出风险的
+
+##### 场景 3：Rowspan 模拟（`RowspanSimulator`）的完整流程
+
+代码路径：[`simulate_header_footer_layout()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1150-L1244)（在 `RowspanSimulator` 内部）
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 1: 首次模拟 header/footer（使用当前模拟器 regions.full）  │
+│                                                               │
+│ header_height = simulate_header_height(headers,               │
+│     &self.regions, ...)                                       │
+│ footer_height = simulate_footer(footer, &self.regions, ...)   │
+│                                                               │
+│ → 使用模拟器内部的 regions.full                               │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 2: 空间不足 → 跳页                                        │
+│                                                               │
+│ while !fits(header_height + footer_height) {                  │
+│     self.regions.next()  // 模拟器内部的 regions               │
+│     self.finished += 1;                                       │
+│ }                                                             │
+│                                                               │
+│ skipped_region = true;                                        │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 3: ✅  Header 和 Footer 都重新模拟（使用新 regions.full） │
+│                                                               │
+│ if skipped_region {                                           │
+│     header_height = simulate_header_height(                   │
+│         repeating_headers, &self.regions, ...)  // 新regions! │
+│                                                               │
+│     footer_height = simulate_footer(                          │
+│         footer, &self.regions, ...)  // 新regions!           │
+│ }                                                             │
+│                                                               │
+│ → 两者都使用新 full 重新模拟！                                │
+└────────────────────────────────┬──────────────────────────────┘
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 步骤 4: 后续每次换页都触发重新模拟                             │
+│                                                               │
+│ finish_region(layouter, engine):                              │
+│   self.regions.next();                                        │
+│   self.simulate_header_footer_layout(layouter, engine)        │
+│     → 再次执行步骤 1-3！                                      │
+│                                                               │
+│ → 每次换页都重新计算 header/footer 高度                       │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**Rowspan 模拟的 `regions.full` 风险**：
+- ✅ **Header 跳页后重新模拟** → 高度始终与当前 regions 匹配
+- ✅ **Footer 跳页后重新模拟** → 高度始终与当前 regions 匹配
+- ✅ **每次换页都触发重新模拟** → 不存在"旧高度判断"问题
+- **结论**：Rowspan 模拟对 `regions.full` 变化的**鲁棒性最好**，三者中最严谨
+
+##### 三种场景的完整对照表
+
+| 对比维度 | 普通不可断内容行 | 重复表头/表尾 | Rowspan 模拟 |
+|---------|---------------|-------------|-------------|
+| **模拟代码位置** | [`check_for_unbreakable_rows()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L237-L297) | [`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L203-L352) | [`simulate_header_footer_layout()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1150-L1244) |
+| **换页方式** | `finish_region()` → 真实换页 | `finish_region_internal()` → 只推进 regions | `regions.next()` → 模拟器内部推进 |
+| **换页时 regions.full 更新** | ✅ 真实更新 | ✅ 真实更新 | ✅ 模拟器内更新 |
+| **Header 模拟在跳页后重算** | N/A（内容行无 header） | ❌ **不重算**（TODO 问题） | ✅ **重算** |
+| **Footer 模拟在跳页后重算** | N/A（内容行无 footer） | ✅ 重算 | ✅ **重算** |
+| **Rel 行实际解析时使用的 full** | ✅ 换页后的新 full | ✅ 换页后的新 full | N/A（纯模拟，无实际布局） |
+| **标记 unbreakable_rows_left** | ✅ 模拟后设置，>0 锁换页 | ✅ 模拟后设置，>0 锁换页 | N/A（模拟器独立维护状态） |
+| **实际布局期间能否换页** | ❌ 不能（锁换页） | ❌ 不能（锁换页） | N/A（纯模拟，无实际布局） |
+| **Regions.full 变化风险** | ⭐⭐⭐ 低（Rel 行重新解析） | ⭐ 高（跳页判断用旧高度） | ⭐⭐⭐ 低（每次都重新模拟） |
+| **溢出风险** | ✅ 低（模拟和布局都用新 full 重新解析） | ❌ **高**（预测量可能偏小，且锁换页） | N/A（模拟值偏大/偏小只影响 rowspan 扩展量，不溢出） |
+| **多跳页风险** | ⭐ 低 | ⭐⭐ 中（预测量可能偏大） | N/A（模拟跳页不产生真实空白页） |
 
 #### 3.6.6 可能的改进方向
 
@@ -1181,18 +1367,28 @@ self.regions.size.y -= self.current.footer_height;  // 减去新 footer 高度
    ```rust
    while !fits(header_height) {
        finish_region_internal();
-       header_height = simulate_header_height(new_regions);  // ← 添加这行
-       footer_height = simulate_footer(new_regions);         // ← 也更新 footer
+       // TODO(layout model): 这里应该重新模拟 header
+       header_height = simulate_header_height(new_regions);
+       footer_height = simulate_footer(new_regions);
    }
    ```
+   这将消除重复表头的溢出风险，使其与 Rowspan 模拟的严谨性对齐。
 
 2. **增加溢出检查和降级处理**：
-   - 实际布局 header 后检查是否溢出
-   - 如果溢出且可以换页，撤销 header 布局并换页重试
+   - 在 `layout_header_rows()` 完成后，检查 `self.regions.size.y` 是否为负值（溢出）
+   - 如果溢出且 `may_progress_with_repeats()` 为 true：
+     - 回滚 header 行的布局（从 `lrows` 中弹出）
+     - 调用 `finish_region()` 换页
+     - 重试布局 header
 
 3. **使用更保守的预测量**：
-   - 考虑到 `regions.full` 可能变化，预测量时使用最小可能的 `full` 值
-   - 或者同时模拟多个可能的 `full` 值，取最大高度
+   - 在 `simulate_header_height()` 中，如果检测到当前 `regions.full` 是 `inf` 或异常大
+   - 同时使用 `backlog` 中最小的高度再模拟一次
+   - 取两者中的较大值作为预测量结果，避免预测量偏小
+
+4. **统一三种场景的换页模拟模式**：
+   - 参考 Rowspan 模拟的严谨做法，所有场景都在每次跳页后重新模拟 header/footer
+   - 这将大大简化代码的心智模型，消除不一致的行为
 
 ---
 
