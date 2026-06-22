@@ -1,6 +1,6 @@
 # Typst 表格布局机制深度解析
 
-本文档基于 Typst 源码梳理表格（Table）和网格（Grid）的布局机制，重点聚焦于**行列分配**和**跨页处理**两个核心难点。
+本文档基于 Typst 源码逐行梳理表格（Table）和网格（Grid）的布局机制，重点聚焦于**行列分配**、**跨页处理**、**近似假设**、**降级策略**和**绘制顺序**五个核心难点。
 
 ---
 
@@ -202,21 +202,6 @@ let height = v.share(fr, remaining);
 
 最复杂，调用 [`measure_auto_row()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L1243-L1425)。
 
-**关键处理逻辑**：
-
-1. **换页检测**：如果第一个区域中某列单元格为空但后续区域有内容（说明内容从换页后开始），跳过第一个区域重新测量
-
-2. **Rowspan 高度分配**：
-   - 跨行单元格的高度同样只影响**最后一个被跨越的自动行**
-   - 需要减去已经确定高度的其他跨越行（Rel 行等）
-   - 如果跨越 gutter，且 gutter 可能因换页消失，则需要**模拟**
-
-3. **Rowspan 模拟算法**：
-   - 当 rowspan 跨越 gutter 时，需要预测换页情况
-   - 使用 [`run_rowspan_simulation()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L879-L1002) 最多迭代 5 次
-   - 每次模拟：假设 auto 行扩展 `amount_to_grow`，检查是否覆盖 rowspan 高度需求
-   - 模拟稳定后，从尾部减去被其他行覆盖的高度
-
 ### 2.4 colspan 和 rowspan 的影响
 
 **列维度（colspan）**：
@@ -237,7 +222,7 @@ let height = v.share(fr, remaining);
 
 ---
 
-## 三、跨页处理机制
+## 三、跨页处理机制 - 逐行深度分析
 
 ### 3.1 区域 (Region) 概念
 
@@ -257,9 +242,701 @@ pub struct Regions<'a> {
 
 当 `size.y` 不足以容纳下一行时，调用 `regions.next()` 推进到下一个区域（换页），`backlog` 中的下一个高度成为新的 `size.y`。
 
-### 3.2 换页触发条件
+### 3.2 finish_region() - 跨页核心逻辑逐行解析
 
-在 [`layout_row_internal()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L425-L464) 中，换页在以下情况下发生：
+[`finish_region()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L1599-L1834) 是跨页处理的入口。以下是逐行分析：
+
+#### 3.2.1 孤儿预防（Orphan Prevention）- L1607-L1618
+
+```rust
+if let Some(orphan_snapshot) = self.current.lrows_orphan_snapshot.take()
+    && !last
+{
+    self.current.lrows.truncate(orphan_snapshot);
+    self.current.repeated_header_rows =
+        self.current.repeated_header_rows.min(orphan_snapshot);
+
+    if orphan_snapshot == 0 {
+        // Removed all repeated headers.
+        self.current.last_repeated_header_end = 0;
+    }
+}
+```
+
+**工作原理**：
+- 当 `lrows_orphan_snapshot` 存在（说明刚刚放置了 header 但还没有后续内容行），且不是最后一页时
+- 将已布局的行 `lrows` 截断到快照位置，相当于"撤回"刚刚放置的 header
+- 同时更新重复 header 计数等状态变量
+- 被撤回的 header 仍保留在 `pending_headers` 队列中，下一页会自动重新尝试
+
+**典型场景**：
+- 页面底部刚好只能放下 header，放不下任何内容行
+- 触发换页后，header 被"带回"到下一页顶部
+
+#### 3.2.2 移除末尾 Gutter 行 - L1620-L1630
+
+```rust
+if self
+    .current
+    .lrows
+    .last()
+    .is_some_and(|row| self.grid.is_gutter_track(row.index()))
+{
+    // Remove the last row in the region if it is a gutter row.
+    self.current.lrows.pop().unwrap();
+    self.current.repeated_header_rows =
+        self.current.repeated_header_rows.min(self.current.lrows.len());
+}
+```
+
+**设计意图**：
+- 页面末尾的 gutter（行间距）没有意义，应该移除
+- 这是导致 rowspan 模拟复杂性的根源：gutter 的存在与否取决于换页位置，而换页位置又取决于行高测量结果
+
+#### 3.2.3 Widow 预防（Footer 检查）- L1632-L1647
+
+```rust
+let footer_would_be_widow = matches!(&self.grid.footer, Some(footer) if footer.repeated)
+    && self.current.lrows.is_empty()
+    && self.current.could_progress_at_top;
+```
+
+**检查条件**：
+1. 存在重复 footer
+2. 当前页面没有任何内容行（只有 header 不算）
+3. 可以换页（`could_progress_at_top` 为 true）
+
+如果满足所有条件，**不放置 footer**，避免 footer 单独出现在页面上。
+
+#### 3.2.4 Footer 布局 - L1648-L1663
+
+```rust
+let mut laid_out_footer_start = None;
+if !footer_would_be_widow && let Some(footer) = &self.grid.footer {
+    if footer.repeated
+        && self.current.lrows.iter().all(|row| row.index() < footer.start)
+    {
+        laid_out_footer_start = Some(footer.start);
+        self.layout_footer(footer, engine, self.finished.len(), true)?;
+    }
+}
+```
+
+**条件解读**：
+- footer 是重复的（`footer.repeated == true`）
+- 当前所有已布局行都在 footer 起始行之前
+
+满足条件时，在当前页面底部放置重复 footer。注意 `is_being_repeated = true`，标记这是重复出现而非最终出现。
+
+#### 3.2.5 高度统计与 Fr 行分配 - L1665-L1698
+
+```rust
+// 统计已使用高度和 Fr 总量
+let mut used = Abs::zero();
+let mut fr = Fr::zero();
+for row in &self.current.lrows {
+    match row {
+        Row::Frame(frame, _, _) => used += frame.height(),
+        Row::Fr(v, _, _) => fr += *v,
+    }
+}
+
+// 确定区域大小：有 Fr 行则扩展到 full 高度
+let mut size = Size::new(self.width, used).min(self.current.initial);
+if fr.get() > 0.0 && self.current.initial.y.is_finite() {
+    size.y = self.current.initial.y;
+}
+
+// 遍历所有行，放置 Fr 行
+for (i, row) in std::mem::take(&mut self.current.lrows).into_iter().enumerate() {
+    let (frame, y, is_last) = match row {
+        Row::Frame(frame, y, is_last) => (frame, y, is_last),
+        Row::Fr(v, y, disambiguator) => {
+            let remaining = self.regions.full - used;
+            let height = v.share(fr, remaining);
+            (self.layout_single_row(engine, disambiguator, height, y)?, y, true)
+        }
+    };
+    // ... 放置 frame，统计 header 高度 ...
+}
+```
+
+**关键点**：
+- Fr 行的高度是在区域结束时才确定的，基于 `regions.full - used`
+- 如果有 Fr 行，区域高度会扩展到 `initial.y`（完整页面高度）
+
+#### 3.2.6 Rowspan 高度累计 - L1707-L1746
+
+```rust
+for rowspan in self
+    .rowspans
+    .iter_mut()
+    .filter(|rowspan| (rowspan.y..rowspan.y + rowspan.rowspan).contains(&y))
+    .filter(|rowspan| {
+        rowspan.max_resolved_row.is_none_or(|max_row| y > max_row)
+    })
+{
+    // 设置 first_region 和 dy
+    if rowspan.first_region > current_region {
+        rowspan.first_region = current_region;
+        rowspan.dy = pos.y;
+        rowspan.region_full = self.regions.full;
+    }
+
+    // 确保 heights 数组足够长
+    let amount_missing_heights = (current_region + 1)
+        .saturating_sub(rowspan.heights.len() + rowspan.first_region);
+    rowspan
+        .heights
+        .extend(std::iter::repeat_n(Abs::zero(), amount_missing_heights));
+
+    // 累计当前行高度到该区域
+    *rowspan.heights.last_mut().unwrap() += height;
+
+    if is_last {
+        rowspan.max_resolved_row = Some(y);
+    }
+}
+```
+
+**核心逻辑**：
+- 对每个跨越当前行 `y` 的 rowspan，更新其 `heights` 数组
+- `first_region` 记录 rowspan 首次出现的页面索引
+- `dy` 记录在第一页的垂直偏移（因为第一页可能不是从顶部开始）
+- `region_full` 记录第一页的完整高度（用于后续重新测量）
+- `max_resolved_row` 防止重复累计（同一行的多帧情况）
+
+#### 3.2.7 完成的 Rowspan 布局 - L1753-L1790
+
+```rust
+let mut i = 0;
+while let Some(rowspan) = self.rowspans.get(i) {
+    if laid_out_footer_start.is_none_or(|footer_start| {
+        y < footer_start || rowspan.y >= footer_start
+    }) && (rowspan.y + rowspan.rowspan < y + 1
+        || rowspan.y + rowspan.rowspan == y + 1 && is_last)
+    {
+        // 条件满足：该 rowspan 在当前行或之前结束
+        let rowspan = self.rowspans.remove(i);
+        self.layout_rowspan(
+            rowspan,
+            Some((&mut output, repeated_header_row_height)),
+            engine,
+        )?;
+    } else {
+        i += 1;
+    }
+}
+```
+
+**触发条件（满足其一）**：
+1. `rowspan.y + rowspan.rowspan < y + 1`：rowspan 结束于当前行之前
+2. `rowspan.y + rowspan.rowspan == y + 1 && is_last`：rowspan 结束于当前行，且是当前行的最后一帧
+
+**Footer 边界处理**：
+- 如果 footer 已经布局，则只有完全在 footer 内或完全在 footer 外的 rowspan 才会被布局
+- 避免 rowspan 跨越 footer 边界导致渲染错误
+
+**注意**：使用 `while let Some` + `remove(i)` 而非 `for` 循环，因为删除元素后索引会变化。
+
+#### 3.2.8 下一区域准备 - L1807-L1831
+
+```rust
+if !last {
+    // 重置 header 状态
+    self.current.repeated_header_rows = 0;
+    self.current.last_repeated_header_end = 0;
+    self.current.repeating_header_height = Abs::zero();
+    self.current.repeating_header_heights.clear();
+
+    let disambiguator = self.finished.len();
+    if let Some(footer) =
+        self.grid.footer.as_ref().and_then(Repeatable::as_repeated)
+    {
+        self.prepare_footer(footer, engine, disambiguator)?;
+    }
+
+    // 预先扣除 footer 高度
+    self.regions.size.y -= self.current.footer_height;
+    self.current.initial_after_repeats = self.regions.size.y;
+
+    // 放置重复 header
+    if !self.repeating_headers.is_empty() || !self.pending_headers.is_empty() {
+        self.layout_active_headers(engine)?;
+    }
+}
+```
+
+**重要顺序**：
+1. 先重置 header 状态
+2. 再 prepare_footer（可能触发换页）
+3. 扣除 footer 高度
+4. 最后 layout_active_headers（再次可能触发换页）
+
+### 3.3 行跨页的近似假设与测量逻辑
+
+#### 3.3.1 核心近似假设
+
+在 [`run_rowspan_simulation()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L879-L1002) 中有明确的注释说明局限性：
+
+```rust
+// A flaw of this approach is that we consider rowspans' content to
+// be contiguous. That is, we treat rowspans' requested heights as
+// a simple number, instead of properly using the vector of
+// requested heights in each region. This can lead to some
+// weirdness when using multi-page rowspans with content that
+// reacts to the amount of space available, including paragraphs.
+// However, this is probably the best we can do for now.
+```
+
+**近似假设 1：内容连续性假设**
+- 将 rowspan 的内容视为连续的单一高度需求，而不是按页面分割的向量
+- 简化了计算，但对于对可用空间敏感的内容（如段落、弹性布局）可能不准确
+- 当 rowspan 跨多页且内容在不同页面有不同布局行为时，会出现偏差
+
+**近似假设 2：Header/Footer 高度不变假设**
+
+在 [`RowspanSimulator::new()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1032-L1051) 中：
+
+```rust
+// There can be no new headers or footers within a multi-page
+// rowspan, since headers and footers are unbreakable, so
+// assuming the repeating header height and footer height
+// won't change is safe.
+header_height: current.repeating_header_height,
+footer_height: current.footer_height,
+```
+
+- 假设在 rowspan 跨越的多个页面中，重复 header 和 footer 的高度保持不变
+- 这是合理的，因为 header/footer 本身是不可断的，且在 rowspan 开始前就已确定
+
+**近似假设 3：仅考虑固定高度行**
+
+在 [`prepare_rowspan_sizes()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L612-L695) 中：
+
+```rust
+// We can only predict the resolved size of upcoming fixed-size
+// rows, but not fractional rows. In the future, we might be
+// able to simulate and circumvent the problem with fractional
+// rows. Relative rows are currently always measured relative
+// to the first region as well.
+// We can ignore auto rows since this is the last spanned auto
+// row.
+let will_be_covered_height: Abs = self
+    .grid
+    .rows
+    .iter()
+    .skip(auto_row_y + 1)
+    .take(last_spanned_row - auto_row_y)
+    .map(|row| match row {
+        Sizing::Rel(v) => {
+            v.resolve(self.styles).relative_to(self.regions.base().y)
+        }
+        _ => Abs::zero(),
+    })
+    .sum();
+```
+
+- 计算"未来"行将覆盖的高度时，只考虑 Rel（固定高度）行
+- Fr 行和 Auto 行按 0 高度估计
+- 这是保守估计，可能导致 auto 行扩展过多，但避免了布局不足
+
+#### 3.3.2 Rowspan 模拟算法详解
+
+当 rowspan 跨越 gutter 时，需要运行模拟算法。触发条件：
+
+```rust
+if auto_row_y != last_spanned_row      // 不结束于当前行
+    && !sizes.is_empty()               // 有高度需求
+    && self.grid.has_gutter            // 存在 gutter
+    && !is_effectively_unbreakable_rowspan  // 不是不可断
+{
+    return true;  // 需要模拟
+}
+```
+
+**模拟流程（最多 5 次迭代）**：
+
+```rust
+for _attempt in 0..5 {
+    // 1. 创建模拟器，假设 auto 行扩展 amount_to_grow
+    let rowspan_simulator = RowspanSimulator::new(...);
+
+    // 2. 模拟布局，计算能覆盖的总高度
+    let total_spanned_height = rowspan_simulator.simulate_rowspan_layout(
+        y, max_spanned_row, amount_to_grow,
+        requested_rowspan_height, ...
+    )?;
+
+    // 3. 检查是否足够
+    if (total_spanned_height + amount_to_grow).fits(requested_rowspan_height) {
+        // 足够：减去被其他行覆盖的高度，返回成功
+        subtract_end_sizes(simulated_sizes, requested_rowspan_height - amount_to_grow);
+        return Ok(true);
+    }
+
+    // 4. 不够：更新 amount_to_grow，推进模拟区域，继续迭代
+    let old_amount_to_grow = std::mem::replace(
+        &mut amount_to_grow,
+        requested_rowspan_height - total_spanned_height,
+    );
+
+    // 5. 推进 regions，模拟 auto 行扩展后的换页
+    let mut extra_amount_to_grow = amount_to_grow - old_amount_to_grow;
+    while extra_amount_to_grow > Abs::zero()
+        && simulated_regions.size.y < extra_amount_to_grow
+    {
+        extra_amount_to_grow -= simulated_regions.size.y.max(Abs::zero());
+        simulated_regions.next();
+        simulated_regions.size.y -=
+            self.current.repeating_header_height + self.current.footer_height;
+        disambiguator += 1;
+    }
+    simulated_regions.size.y -= extra_amount_to_grow;
+}
+```
+
+**收敛性证明**：
+- `amount_to_grow` 严格单调递增（因为 `total_spanned_height + old_amount < requested`）
+- 最多 5 次迭代，无论是否收敛都停止
+
+#### 3.3.3 测量时的空 Frame 跳过机制
+
+在 [`measure_auto_row()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L1338-L1355) 中有一个特殊的 HACK：
+
+```rust
+// HACK: Also consider frames empty if they only contain tags. Table
+// and grid cells need to be locatable for pdf accessibility, but
+// the introspection tags interfere with the layouting.
+fn is_empty_frame(frame: &Frame) -> bool {
+    frame.items().all(|(_, item)| matches!(item, FrameItem::Tag(_)))
+}
+
+// Skip the first region if one cell in it is empty. Then,
+// remeasure.
+if let Some([first, rest @ ..]) =
+    frames.get(measurement_data.frames_in_previous_regions..)
+    && can_skip
+    && breakable
+    && is_empty_frame(first)
+    && rest.iter().any(|frame| !is_empty_frame(frame))
+{
+    return Ok(None);
+}
+```
+
+**目的**：
+- 第一帧只有 Tag（用于 PDF 可访问性）但后续有实际内容时，说明内容应该从下一页开始
+- 返回 `None` 触发重新测量，跳过第一页
+
+**触发重测的逻辑在 `layout_auto_row()`**：
+
+```rust
+let mut resolved = match self.measure_auto_row(
+    engine, disambiguator, y, true,  // can_skip = true
+    self.unbreakable_rows_left, None,
+)? {
+    Some(resolved) => resolved,
+    None => {
+        // 第一页为空，换页后重新测量
+        self.finish_region(engine, false)?;
+        self.measure_auto_row(
+            engine, disambiguator, y, false,  // can_skip = false
+            self.unbreakable_rows_left, None,
+        )?.unwrap()  // 此时一定返回 Some
+    }
+};
+```
+
+### 3.4 出错/边界情况的降级处理策略
+
+#### 3.4.1 Rowspan 模拟失败降级
+
+当 5 次迭代仍未收敛时，在 [`simulate_and_measure_rowspans_in_auto_row()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L800-L822) 中降级：
+
+```rust
+if !simulations_stabilized {
+    // If the simulation didn't stabilize above, we will just pretend
+    // all gutters were removed, as a best effort. That means the auto
+    // row will expand more than it normally should, but there isn't
+    // much we can do.
+    let will_be_covered_height = self
+        .grid
+        .rows
+        .iter()
+        .enumerate()
+        .skip(y + 1)
+        .take(max_spanned_row - y)
+        .filter(|(y, _)| !self.grid.is_gutter_track(*y))  // 忽略所有 gutter
+        .map(|(_, row)| match row {
+            Sizing::Rel(v) => {
+                v.resolve(self.styles).relative_to(self.regions.base().y)
+            }
+            _ => Abs::zero(),
+        })
+        .sum();
+
+    subtract_end_sizes(&mut simulated_sizes, will_be_covered_height);
+}
+```
+
+**降级策略**：
+- **保守假设**：所有 gutter 都被移除（即所有换页都恰好发生在 gutter 位置）
+- **结果**：auto 行扩展量会比实际需要的多，但避免了内容溢出
+- **权衡**：宁可空白多一点，也不让内容被裁剪
+
+#### 3.4.2 Unbreakable Rowspan 强制单页
+
+在 [`measure_auto_row()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L1299-L1314) 中：
+
+```rust
+let pod = if !breakable {
+    // Force cell to fit into a single region when the row is
+    // unbreakable, even when it is a breakable rowspan, as a best
+    // effort.
+    let mut pod: Regions = Region::new(size, self.regions.expand).into();
+    pod.full = measurement_data.full;
+
+    if measurement_data.frames_in_previous_regions > 0 {
+        // Best effort to conciliate a breakable rowspan which
+        // started at a previous region going through an
+        // unbreakable auto row. Ensure it goes through previously
+        // laid out regions, but stops at this one when measuring.
+        pod.backlog = backlog;
+    }
+
+    pod
+}
+```
+
+**降级策略**：
+- 当 auto 行所在的 unbreakable 组包含不可断 rowspan 时，强制该 auto 行不可断
+- 即使 rowspan 本身标记为可断（`breakable = true`），也强制放在单页
+- 这是"尽力而为"的处理，可能导致页面底部出现大块空白
+
+#### 3.4.3 无法换页时的溢出处理
+
+在 [`may_progress_with_repeats()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L24-L31) 中定义了何时可以换页：
+
+```rust
+pub fn may_progress_with_repeats(&self) -> bool {
+    self.current.could_progress_at_top
+        || self.regions.last.is_some()
+            && self.regions.size.y != self.current.initial_after_repeats
+}
+```
+
+**条件解读**：
+1. `could_progress_at_top`：当前区域顶部可以推进（有 backlog 或可以换页）
+2. 或者还有后续区域（`last.is_some()`）且当前区域已有内容（`size.y != initial_after_repeats`）
+
+如果不能换页但内容放不下，内容会**溢出**（Typst 的默认行为是显示警告但继续渲染）。
+
+#### 3.4.4 Header 无法放置时的降级
+
+在 [`layout_new_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L391-L429) 中：
+
+```rust
+let should_snapshot = !short_lived
+    && self.current.lrows_orphan_snapshot.is_none()
+    && self.may_progress_with_repeats();
+
+if should_snapshot {
+    self.current.lrows_orphan_snapshot = Some(self.current.lrows.len());
+}
+
+// ... 布局 header ...
+
+if !may_progress {
+    // Flush pending headers immediately, as placing them again later
+    // won't help.
+    self.flush_orphans();
+}
+```
+
+**降级策略**：
+- 如果无法换页（`may_progress = false`），立即 flush_orphans()，放弃孤儿预防
+- header 会被强制放置在当前位置，即使成为孤儿
+
+#### 3.4.5 Footer 跳过区域后的重测
+
+在 [`prepare_footer()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L471-L512) 中：
+
+```rust
+self.current.footer_height = if skipped_region {
+    // Simulate the footer again; the region's 'full' might have
+    // changed.
+    self.simulate_footer(footer, &self.regions, engine, disambiguator)?
+        .height
+} else {
+    footer_height
+};
+```
+
+**原因**：
+- 跳过区域后，`regions.full` 可能从 `inf` 变为有限值
+- 这会影响 Rel 行的高度计算（Rel 是相对于 `regions.full` 解析的）
+- 因此需要重新模拟 footer 高度
+
+### 3.5 头部和尾部高度重算的影响
+
+#### 3.5.1 何时触发高度重算
+
+**场景 1：layout_active_headers 中跳过区域后**
+
+[`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L245-L256)：
+
+```rust
+if let Some(footer) = &self.grid.footer
+    && footer.repeated
+    && skipped_region
+{
+    // Simulate the footer again; the region's 'full' might have
+    // changed.
+    self.regions.size.y += self.current.footer_height;
+    self.current.footer_height = self
+        .simulate_footer(footer, &self.regions, engine, disambiguator)?
+        .height;
+    self.regions.size.y -= self.current.footer_height;
+}
+```
+
+**触发条件**：
+- 存在重复 footer
+- 跳过了至少一个区域（`skipped_region = true`）
+
+**重算原因**：
+- 跳过区域意味着进入了新的页面，新页面的 `regions.full` 可能与前一页不同
+- 例如：第一页是无限高度（如 float 容器），后续页面是有限高度
+
+**场景 2：prepare_footer 中跳过区域后**
+
+[`prepare_footer()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L502-L509) 同上。
+
+#### 3.5.2 高度重算对布局的影响
+
+**对 Auto 行测量的影响**：
+
+在 [`prepare_auto_row_cell_measurement()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L402-L436) 中：
+
+```rust
+if breakable
+    && (!self.repeating_headers.is_empty()
+        || !self.pending_headers.is_empty()
+        || matches!(&self.grid.footer, Some(footer) if footer.repeated))
+{
+    let mapped_regions = self.regions.map(&mut custom_backlog, |size| {
+        Size::new(
+            size.x,
+            size.y
+                - self.current.repeating_header_height  // 减去 header
+                - self.current.footer_height,           // 减去 footer
+        )
+    });
+}
+```
+
+**影响点**：
+- Auto 行测量时，所有后续区域的高度都会预先减去 `repeating_header_height + footer_height`
+- 如果这些高度被重算，测量结果会不同
+- Rowspan 的 backlog 构造也依赖这些高度
+
+**对 rowspan 模拟的影响**：
+
+在 [`RowspanSimulator::new()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1044-L1045) 中：
+
+```rust
+header_height: current.repeating_header_height,
+footer_height: current.footer_height,
+```
+
+- 模拟时也使用这些高度来计算每页的可用空间
+- 高度变化会影响模拟结果，进而影响 auto 行的扩展量
+
+#### 3.5.3 高度重算的潜在问题
+
+代码中有 TODO 注释指出了潜在问题：
+
+[`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L234-L238)：
+
+```rust
+// TODO(layout model): re-calculate heights of headers and footers
+// on each region if 'full' changes? (Assuming height doesn't
+// change for now...)
+//
+// Would remove the footer height update below (move it here).
+```
+
+**当前限制**：
+- Header 高度不会在换页时重算，假设其高度不变
+- 只有 Footer 高度在跳过区域后会重算
+- 这可能导致 header 在不同页面有细微差异时布局不准确
+
+---
+
+## 四、换页触发时机与不可断行组
+
+### 4.1 换页触发的多层级检查
+
+换页不是在单一位置检查，而是分布在布局流程的多个阶段：
+
+#### 4.1.1 行布局前的检查 - check_for_unbreakable_rows()
+
+[`check_for_unbreakable_rows()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L237-L297)：
+
+```rust
+if self.unbreakable_rows_left == 0 {
+    // 模拟不可断行组的高度
+    let row_group = self.simulate_unbreakable_row_group(
+        current_row, amount_unbreakable_rows, &self.regions, engine, 0,
+    )?;
+
+    // 不够则换页
+    while !self.regions.size.y.fits(row_group.height)
+        && self.may_progress_with_repeats()
+    {
+        self.finish_region(engine, false)?;
+    }
+
+    self.unbreakable_rows_left = row_group.rows.len();
+}
+```
+
+**特点**：
+- 提前预测整组的高度需求
+- 避免组内部分行在当前页，部分在下一页
+
+#### 4.1.2 Rel 行的换页 - layout_relative_row()
+
+```rust
+// Skip to fitting region, but only if we aren't part of an unbreakable
+// row group.
+while !self.regions.size.y.fits(resolved)
+    && self.unbreakable_rows_left == 0
+    && self.may_progress_with_repeats()
+{
+    self.finish_region(engine, false)?;
+}
+```
+
+#### 4.1.3 Auto 行测量后的换页 - layout_auto_row()
+
+```rust
+let mut resolved = match self.measure_auto_row(
+    engine, disambiguator, y, true, self.unbreakable_rows_left, None,
+)? {
+    Some(resolved) => resolved,
+    None => {
+        // 第一帧为空，换页重测
+        self.finish_region(engine, false)?;
+        self.measure_auto_row(
+            engine, disambiguator, y, false, self.unbreakable_rows_left, None,
+        )?.unwrap()
+    }
+};
+```
+
+#### 4.1.4 每行布局后的检查 - layout_row_internal()
 
 ```rust
 let is_content_row = !self.grid.is_gutter_track(y);
@@ -268,311 +945,244 @@ if self.unbreakable_rows_left == 0 && self.regions.is_full() && is_content_row {
 }
 ```
 
-条件解读：
-1. **当前不在不可断行组中** (`unbreakable_rows_left == 0`)
-2. **区域已满** (`self.regions.is_full()`)
-3. **是内容行而非 gutter 行**
+### 4.2 不可断行组的组成与扩展
 
-此外，Rel 行和 Auto 行在测量阶段也可能主动换页。
+#### 4.2.1 组的动态扩展
 
-### 3.3 不可断行组 (Unbreakable Row Group)
-
-不可断行组确保相关的多行必须保持在同一页面中。
-
-#### 形成条件
-
-在 [`check_for_unbreakable_rows()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L237-L297) 中检查：
-
-1. **不可断行 rowspan**：如果某个单元格 `breakable == false` 且 `rowspan > 1`，则其所有跨越行形成不可断行组
-2. **Header/Footer**：所有 header 和 footer 行天然不可断
-3. **非重复 footer**：也被视为不可断行组
-
-#### 处理流程
-
-```
-simulate_unbreakable_row_group():
-  从当前行开始，模拟高度累加:
-    遇到不可断行 rowspan → 扩展组到其跨越的最后一行
-    计算该组总高度
-  如果当前区域放不下:
-    循环 finish_region() 换页，直到放得下或无法继续
-  设置 unbreakable_rows_left = 组内行数
-```
-
-换页后，`unbreakable_rows_left` 在每行处理后递减，确保组内行不会再次换页。
-
-### 3.4 Header 重复机制
-
-Header 的处理是跨页中最复杂的部分之一。
-
-#### Header 状态机
-
-一个 header 在其生命周期中可能处于以下状态：
-
-```
-                    首次发现 header
-                         │
-                         ▼
-              ┌───  upcoming_headers  ───┐
-              │   (等待被处理的所有 header)│
-              └─────────────┬────────────┘
-                            │ 被 place_new_headers() 处理
-                            ▼
-              ┌───  pending_headers  ────┐
-              │(首次放置中，受孤儿预防约束)│
-              └─────────────┬────────────┘
-                            │ flush_orphans() 被调用
-                            │ (有后续行放置，确认非孤儿)
-                            ▼
-              ┌─── repeating_headers  ───┐
-              │  (将在每页顶部重复出现)   │
-              └─────────────┬────────────┘
-                            │ 遇到低级别的冲突 header
-                            ▼
-                      停止重复（被截断）
-```
-
-相关代码：[repeated.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs)
-
-#### Header 级别 (Level) 冲突规则
-
-每个 header 有一个 `level` 字段（默认 1，从 1 开始递增）：
-
-- **低级 header → 替换高级**：当发现一个级别更低的新 header 时，所有相同或更高级别的旧 header 停止重复
-- **并行共存**：不同级别的 header 可以同时重复（前提是级别严格递增）
-- **短命 header (short_lived)**：如果一个 header 后紧跟相同或更低级别的 header，则标记为短命，不进行重复和孤儿预防
-
-#### 孤儿预防 (Orphan Prevention)
-
-为避免 header 单独出现在页面底部（后面没有内容），使用以下机制：
-
-1. 首次放置 header 后，保存 `lrows_orphan_snapshot = 当前行数`
-2. 如果在 `flush_orphans()` 前就触发 `finish_region()`，且不是最后一页：
-   - 将 `current.lrows` 截断到快照位置（移除刚刚放置的 header）
-3. 当后续有任何行被成功放置后，调用 `flush_orphans()`，清除快照
-
-**效果**：如果 header 后没有任何内容行就换页了，header 会被"收回"，在下一页重新尝试。
-
-#### 区域顶部的 Header 放置
-
-在 [`finish_region()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L1599-L1834) 末尾，准备下一页时：
+[`simulate_unbreakable_row_group()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L306-L368)：
 
 ```rust
-if !self.repeating_headers.is_empty() || !self.pending_headers.is_empty() {
-    self.layout_active_headers(engine)?;
+for (y, row) in self.grid.rows.iter().enumerate().skip(first_row) {
+    if amount_unbreakable_rows.is_none() {
+        // 动态发现更多不可断行
+        let additional_unbreakable_rows = self.check_for_unbreakable_cells(y);
+        unbreakable_rows_left =
+            unbreakable_rows_left.max(additional_unbreakable_rows);
+    }
+    if unbreakable_rows_left == 0 {
+        break;
+    }
+    // ... 测量高度 ...
+    unbreakable_rows_left -= 1;
 }
 ```
 
-[`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L203-L352)：
+**扩展机制**：
+- 从当前行开始，每遇到一个不可断单元格（`breakable = false`），就将组扩展到其 rowspan 的最后一行
+- 这样形成的组可能比预期的大，确保所有关联的不可断行都在同一页
 
-1. 模拟 header 高度，不够则换页
-2. 将 header 行标记为不可断行组
-3. 依次布局 `repeating_headers`（标记 `is_being_repeated = true`）和 `pending_headers`
-4. 重置 `repeating_header_height` 等统计量，供 Auto 行测量使用
+#### 4.2.2 effectively_unbreakable 标记
 
-### 3.5 Footer 重复机制
-
-Footer 相对简单，关键要点：
-
-#### 准备阶段
-
-在主布局循环开始前，如果有重复 footer：
+[`check_for_unbreakable_rows()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L278-L294)：
 
 ```rust
-if let Some(footer) = &self.grid.footer && footer.repeated {
-    self.prepare_footer(footer, engine, 0)?;
-    self.regions.size.y -= self.current.footer_height;
+if self.unbreakable_rows_left > 1 {
+    for rowspan_data in
+        self.rowspans.iter_mut().filter(|rowspan| rowspan.y == current_row)
+    {
+        rowspan_data.is_effectively_unbreakable |=
+            self.unbreakable_rows_left >= rowspan_data.rowspan;
+    }
 }
 ```
 
-**预先扣除 footer 高度**，确保后续行不会侵占该空间。每次换页后在 `finish_region()` 末尾重新准备。
-
-#### Widow 预防
-
-如果 footer 前没有任何内容行（header 不算），且可以换页，则不放置 footer，避免 footer 成为"寡妇"单独出现在页面上。
-
-```rust
-let footer_would_be_widow = matches!(&self.grid.footer, Some(footer) if footer.repeated)
-    && self.current.lrows.is_empty()
-    && self.current.could_progress_at_top;
-```
-
-#### 最终布局
-
-在主循环中，到达 footer 起始行时：
-
-```rust
-if y == footer.start {
-    self.layout_footer(footer, engine, self.finished.len(), false)?;
-}
-```
-
-`is_being_repeated=false` 表示这是 footer 的最终真实出现（之前每页顶部的预留空间是模拟布局，最终在 `finish_region()` 中真正放置）。
-
-### 3.6 Rowspan 的跨页处理
-
-Rowspan（跨行单元格）是跨页中最棘手的问题。
-
-#### Rowspan 数据结构
-
-```rust
-pub struct Rowspan {
-    pub x: usize,                    // 起始列
-    pub y: usize,                    // 起始行
-    pub rowspan: usize,              // 跨越行数
-    pub is_effectively_unbreakable: bool,  // 是否实际上不可断
-    pub dx: Abs,                     // 水平偏移
-    pub dy: Abs,                     // 第一页的垂直偏移
-    pub first_region: usize,         // 首次出现的区域索引
-    pub region_full: Abs,            // 首个区域的完整高度
-    pub heights: Vec<Abs>,           // 每页的累计高度
-    pub max_resolved_row: Option<usize>, // 已处理的最大行号
-    pub is_being_repeated: bool,     // 是否为重复 header 中的 rowspan
-}
-```
-
-#### 生命周期
-
-1. **发现阶段**：在 `check_for_rowspans()` 中，当处理 rowspan 的起始行时，将其加入 `rowspans` 队列，设置 `x, y, rowspan, dx`
-
-2. **高度累计阶段**：在 `finish_region()` 中，对每个已完成的行，更新所有跨越该行的 rowspan 的 `heights` 数组
-
-3. **布局触发**：当一行是某个 rowspan 的最后一个跨越行（且为该行最后一帧）时，调用 `layout_rowspan()`，将其从队列中移除
-
-4. **兜底阶段**：所有行处理完后，处理可能遗漏的 rowspan（如最后一行为空 Auto 行的情况）
-
-#### 多页渲染
-
-在 [`layout_rowspan()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L103-L199) 中：
-
-```rust
-for ((i, (finished, header_dy)), frame) in ... {
-    let dy = if i == 0 {
-        dy  // 第一页：原始垂直位置
-    } else {
-        header_dy  // 后续页：从 header 下方开始
-    };
-    finished.push_frame(Point::new(dx, dy), frame);
-}
-```
-
-关键点：后续页的 rowspan 从 **header 下方**开始，避免与重复 header 重叠。
+**用途**：
+- 标记某些 rowspan 为"实际上不可断"，即使它们本身设置了 `breakable = true`
+- 当整个 rowspan 都在不可断行组内时，就没有必要运行复杂的换页模拟
 
 ---
 
-## 四、线条 (Stroke) 和填充 (Fill) 渲染
+## 五、线条 (Stroke) 和填充 (Fill) 渲染 - 绘制顺序详解
 
-### 4.1 线段优先级
+### 5.1 render_fills_strokes() 逐行解析
 
-绘制线条时，有三级优先级（影响同厚度线条的上下层关系）：
+[`render_fills_strokes()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L467-L912) 是渲染的核心。以下是绘制顺序的详细分析：
 
-| 优先级 | 来源 | 说明 |
-|-------|------|------|
-| 0 (最低) | GridStroke | 表格/网格的全局 `stroke` 设置 |
-| 1 | CellStroke | 单元格级别的 `stroke` 覆盖 |
-| 2 (最高) | ExplicitLine | 显式的 `hline` / `vline` 元素 |
+#### 5.1.1 整体流程
 
-相关代码：[lines.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/lines.rs#L10-L26) 中的 `StrokePriority`
+```rust
+fn render_fills_strokes(mut self) -> SourceResult<Fragment> {
+    let mut finished = std::mem::take(&mut self.finished);
+    for (((frame_index, frame), rows), finished_header_rows) in
+        finished.iter_mut().enumerate().zip(&self.rrows).zip(...)
+    {
+        if self.rcols.is_empty() || rows.is_empty() {
+            continue;
+        }
 
-### 4.2 线段分段生成
+        let mut lines = vec![];
 
-[`generate_line_segments()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/lines.rs#L79-L253) 是线条渲染的核心：
+        // 步骤 1: 生成所有垂直线段 (vlines)
+        for (x, dx) in points(self.rcols.iter().copied()).enumerate() {
+            // ... 生成垂直线段 ...
+            lines.extend(segments);
+        }
 
-**核心思路**：逐轨道（行/列）推进，连续相同 stroke 的轨道合并为一个线段，遇到以下情况则断开：
+        // 步骤 2: 生成所有水平线段 (hlines)
+        for ((i, y), dy) in hline_indices.zip(hline_offsets) {
+            // ... 生成水平线段 ...
+            lines.extend(segments);
+        }
 
-1. **遇到合并单元格**：例如 vline 穿过 colspan 区域时必须断开（因为该区域不存在实际分隔线）
+        // 步骤 3: 按厚度和优先级排序所有线条
+        lines.sort_by_key(|(thickness, priority, ..)| (*thickness, *priority));
 
-   ```
-   vline at x=2 穿过 row y=1:
-     检查 cell(x=2,y=1) 的 parent，如果 parent.x < 2 → 说明有 colspan → 跳过
-   ```
+        // 步骤 4: 生成所有填充矩形 (fills)
+        let mut fills = vec![];
+        for (x, &col) in self.rcols.iter().enumerate() {
+            for row in rows {
+                // ... 生成填充 ...
+                fills.push((pos, FrameItem::Shape(rect, self.span)));
+            }
+        }
 
-2. **Stroke 变化**：线条属性（颜色、粗细）或优先级变化
+        // 步骤 5: 先放入 fills，再放入 lines，统一 prepend 到 frame
+        frame.prepend_multiple(
+            fills
+                .into_iter()
+                .chain(lines.into_iter().map(|(_, _, point, shape)| (point, shape))),
+        );
+    }
 
-3. **用户显式 hline/vline**：指定 `start/end` 范围的显式线条
+    Ok(Fragment::frames(finished))
+}
+```
 
-### 4.3 线条折叠 (Folding) 规则
+#### 5.1.2 最终层叠顺序（从下到上）
 
-线条的最终 stroke 通过**折叠**（fold）多层来源决定，优先级从高到低：
-
-#### 垂直线 (vline) 折叠顺序：
+由于使用 `prepend_multiple`（添加到 frame 底部），且 iterator 顺序是 `fills` 在前、`lines` 在后，**最终的层叠顺序（从下到上）**是：
 
 ```
-显式 vline.stroke  →  右侧单元格.left  →  左侧单元格.right  →  全局 stroke
+┌─────────────────────────────────────┐
+│  5. 单元格内容 (Cell Content)        │  ← 最上层，prepend 之前已存在
+├─────────────────────────────────────┤
+│  4. 水平线条 (Horizontal Lines)      │  ← 后放入 lines，先 prepend → 在上
+│     (按 thickness 排序，厚在上)        │
+├─────────────────────────────────────┤
+│  3. 垂直线条 (Vertical Lines)        │  ← 先放入 lines，后 prepend → 在下
+│     (按 thickness 排序，厚在上)        │
+├─────────────────────────────────────┤
+│  2. 填充 (Fills)                     │  ← 先放入 fills，最后 prepend → 最底
+├─────────────────────────────────────┤
+│  1. Frame 背景 (透明)                │
+└─────────────────────────────────────┘
 ```
 
-#### 水平线 (hline) 折叠顺序：
+**为什么 hline 在上，vline 在下？**
 
+代码注释解释：
+```rust
+// Render vertical lines.
+// Render them first so horizontal lines have priority later.
+for (x, dx) in points(self.rcols.iter().copied()).enumerate() { ... }
+
+// Render horizontal lines.
+// They are rendered second as they default to appearing on top.
+for ((i, y), dy) in hline_indices.zip(hline_offsets) { ... }
 ```
-显式 hline.stroke
-  → 下方单元格.top (或底部 border / footer 顶部)
-  → 上方单元格.bottom (或顶部 border / header 底部)
-  → 全局 stroke
+
+这是排版中的常见惯例：水平线默认在垂直线之上，形成"横线压竖线"的视觉效果。
+
+#### 5.1.3 线条排序规则
+
+```rust
+// Sort by increasing thickness, so that we draw larger strokes
+// on top. When the thickness is the same, sort by priority.
+//
+// Sorting by thickness avoids layering problems where a smaller
+// hline appears "inside" a larger vline. When both have the same
+// size, hlines are drawn on top (since the sort is stable, and
+// they are pushed later).
+lines.sort_by_key(|(thickness, priority, ..)| (*thickness, *priority));
 ```
 
-折叠规则（Sides::fold）：
-- `None` (未指定) ← `Some(x)` → 使用 `x`
-- `Some(None)` (指定为 none) ← `Some(Some(y))` → 使用 `None`
-- `Some(Some(a))` ← `Some(Some(b))` → 合并 stroke 属性
+**排序键（从小到大，后 prepend 的在上）**：
+1. **第一键：thickness（线宽）** - 细线在下，粗线在上
+2. **第二键：priority（优先级）** - 同粗细时，低优先级在下，高优先级在上
+3. **稳定排序的隐式第三键：插入顺序** - 同粗细同优先级时，vline（先插入）在下，hline（后插入）在上
 
-### 4.4 跨页时的特殊线条处理
+**排序示例**：
 
-#### 顶部边框优先级提升
+| 线条 | thickness | priority | 插入顺序 | 最终位置 |
+|------|-----------|----------|----------|---------|
+| vline (Grid) | 1pt | 0 | 1 | 最底 |
+| vline (Cell) | 1pt | 1 | 2 | 第2层 |
+| hline (Grid) | 1pt | 0 | 3 | 第3层 |
+| hline (Cell) | 1pt | 1 | 4 | 第4层 |
+| vline (Explicit) | 1pt | 2 | 5 | 第5层 |
+| hline (Explicit) | 1pt | 2 | 6 | 第6层 |
+| vline (thick) | 2pt | 0 | 7 | 第7层 |
+| hline (thick) | 2pt | 0 | 8 | 最上 |
 
-在非首页的区域顶部，原表格的顶部边框线条会获得额外优先级（仿佛是新的 header 线），确保页面顶部有清晰的边界。
+#### 5.1.4 填充生成的细节
 
-#### Header 下方线条优先级
+```rust
+let parent = self
+    .grid
+    .effective_parent_cell_position(x, row.y)
+    .filter(|parent| {
+        parent.x == x  // 只在单元格的第一列绘制填充
+            && (parent.y == row.y
+                || rows
+                    .iter()
+                    .find(|row| row.y >= parent.y)
+                    .is_some_and(|first_spanned_row| {
+                        first_spanned_row.y == row.y
+                    }))
+    });
+```
 
-当 header 被重复时，原 header 最后一行下方的线条被提升优先级，确保其覆盖住页面内部正常的线条。
-
-#### 底部边框处理
-
-非尾页的底部边框同样提升优先级，但尾页的底部边框按正常规则处理。
-
-### 4.5 单元格填充 (Fill)
-
-填充在 [`render_fills_strokes()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L467-L912) 中处理，先于线条绘制。
-
-填充的关键规则：
-- **Rowspan 填充**：从该 rowspan 在当前区域的**第一个实际跨越行**开始，不是逻辑起始行（因为前面的行可能在另一页或被删除）
-- **Colspan 填充**：仅在第一列绘制一次，宽度跨越所有 colspan 列
-- **Gutter 处理**：如果 gutter 行是 rowspan 在该页的第一行，则从 gutter 行开始填充
+**Rowspan 填充的特殊处理**：
+- 使用 `effective_parent_cell_position` 而非 `parent_cell_position`
+- 允许 gutter 行成为 rowspan 在当前页的"第一行"
+- 确保 rowspan 的填充从当前页的最顶端开始，即使那是 gutter 行
 
 ---
 
-## 五、关键算法和技巧总结
+## 六、关键算法和技巧总结
 
-### 5.1 迭代式公平压缩 (Fair Shrink)
+### 6.1 迭代式公平压缩 (Fair Shrink)
 
 用于空间不足时压缩 Auto 列/行：
 - **避免一次性平均压缩**导致小列被过度压缩
 - **每轮识别无需压缩的列**，从压缩池中移除
 - **收敛很快**：最多 O(n) 轮
 
-### 5.2 Rowspan 预测模拟 (最多 5 次)
+### 6.2 Rowspan 预测模拟 (最多 5 次)
 
 用于预测换页时 gutter 消失对 rowspan 高度的影响：
 - **问题**：Auto 行的扩展高度决定了哪些行在哪一页，而分页又决定了哪些 gutter 被移除
 - **方案**：假设一个扩展值 → 模拟分页 → 计算实际覆盖高度 → 调整扩展值 → 重复
 - **收敛保证**：每轮扩展值严格递增，5 轮未收敛则降级为"所有 gutter 都消失"的保守估计
+- **近似假设**：rowspan 内容是连续的单一高度，header/footer 高度不变
 
-### 5.3 快照式孤儿预防
+### 6.3 快照式孤儿预防
 
 通过保存 `lrows` 的长度快照来实现 header 的孤儿预防：
 - 无副作用：即使 header 已经完成布局和 frame 构建
 - 回滚简单：只需要 `truncate(snapshot)` 截断数组即可
 - 自动重试：header 仍保留在 `pending_headers` 中，下一页会自动重新布局
 
-### 5.4 延迟式 Rowspan 布局
+### 6.4 延迟式 Rowspan 布局
 
 Rowspan 不随其起始行一起布局，而是"延迟"到最后一个跨越行完成时：
 - **优势**：布局时已知道所有跨越行在各页的精确高度，可以一次性生成正确数量的 frame
 - **挑战**：需要在 `finish_region()` 中逐行累计高度，维护 `heights` 向量和 `first_region` 等元数据
 - **实现**：通过队列 `rowspans: Vec<Rowspan>` + 完成条件检查（`y + rowspan == current_y + 1 && is_last`）
 
+### 6.5 分级降级策略
+
+| 场景 | 降级策略 | 位置 |
+|------|---------|------|
+| rowspan 模拟 5 次不收敛 | 假设所有 gutter 被移除，保守扩展 | [rowspans.rs L800-L822](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L800-L822) |
+| unbreakable rowspan 跨 auto 行 | 强制单页布局 | [layouter.rs L1299-L1314](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L1299-L1314) |
+| 无法换页但 header 放不下 | 放弃孤儿预防，强制放置 | [repeated.rs L345-L349](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L345-L349) |
+| 跳过区域后 footer 高度变化 | 重新模拟 footer | [repeated.rs L502-L509](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L502-L509) |
+| 第一帧只有 Tag | 换页重测 | [layouter.rs L1338-L1377](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L1338-L1377) |
+
 ---
 
-## 六、代码文件索引
+## 七、代码文件索引
 
 | 文件 | 核心功能 |
 |------|---------|
@@ -582,4 +1192,4 @@ Rowspan 不随其起始行一起布局，而是"延迟"到最后一个跨越行�
 | [grid/layouter.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs) | GridLayouter 核心：列宽测量、行布局循环、区域完成、线条/填充渲染 |
 | [grid/lines.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/lines.rs) | 线段分段生成、stroke 折叠、优先级处理 |
 | [grid/rowspans.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs) | Rowspan 布局、不可断行组模拟、rowspan 测量与预测 |
-| [grid/repeated.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs) | Header/Footer 重复、孤儿预防、级别冲突 |
+| [grid/repeated.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs) | Header/Footer 重复、孤儿预防、级别冲突、高度重算 |
