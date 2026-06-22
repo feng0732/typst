@@ -209,6 +209,8 @@ let icc = icc.custom().or_else(|| {
 
 提取后的 ICC 存入 `RasterImageInner.icc: Option<Bytes>`，后续渲染阶段使用。
 
+**重要**：ICC 是图像身份的一部分（参与 `RasterImageInner` 的 `Hash` 实现，见 `crates/typst-library/src/visualize/image/raster.rs#L200-L207`），因此会**级联影响所有依赖 `Image` hash 的渲染缓存**——即使某个后端不使用 ICC 做色彩管理，ICC 变化也会导致该后端的图像缓存失效并重建。
+
 #### 3.3.3 解码后的附加处理
 
 1. **EXIF 旋转**（`crates/typst-library/src/visualize/image/raster.rs#L85-L93`）：`exif::Reader` 读取 Orientation tag，然后 `apply_rotation()` 翻转动态图像。**旋转被 baked 进像素数据**（JPEG 除外，PDF 输出时会用 transform 处理）。
@@ -329,7 +331,7 @@ fn to_sk_color(color: ProcessColor) -> sk::Color {
 
 Spot 颜色先 `Color::to_process()` → 用 fallback 颜色渲染。
 
-**注意**：PNG 渲染路径中**不做图像 ICC profile 的颜色管理**。`build_texture` 直接使用解码后的像素值，假设其就是 sRGB。ICC profile 在 PNG 输出中不起作用，仅在 PDF / SVG 导出时被嵌入/保留。
+**注意**：PNG 渲染路径中**不做图像 ICC profile 的颜色管理**。`build_texture` 直接使用解码后的像素值，假设其就是 sRGB；ICC 虽然不参与像素级色彩管理，但它是图像身份的一部分（参与 `RasterImageInner` hash），会**间接影响 PNG 缓存的命中**——改变 ICC 会被视为不同图像而触发重建，尽管重建后的像素完全相同。
 
 #### 5.1.2 渐变采样（Gradient → 光栅）
 
@@ -811,7 +813,7 @@ Arc<sk::Pixmap>           krilla::image::Image       WebImage { format, data }
 |-----|-------------------|----------------|----------------|------------------|
 | 缓存函数 | `build_texture` | `convert_raster`, `convert_pdf` | `WebImage::new`, `to_base64_url` | （与 SVG 共享上述两个缓存） |
 | 缓存 key 含尺寸 | ✅ 是（w, h） | ❌ 否 | ❌ 否 | ❌ 否 |
-| ICC 参与缓存 key | ❌ 否（PNG 不用 ICC） | ✅ 是（嵌入 PDF） | ✅ 是（嵌入 PNG/JPEG） | ✅ 是（同 SVG） |
+| ICC 影响缓存命中 | ✅ 是（间接，通过 Image hash；不用于色彩管理） | ✅ 是（ICC 嵌入 PDF 对象） | ✅ 是（ICC 嵌入图像文件） | ✅ 是（同 SVG） |
 | scaling 参与缓存 key | ✅ 是（影响 filter） | ✅ 是（interpolate） | ✅ 是（Image 包含 scaling） | ✅ 是（同 SVG） |
 | 缓存是否与显示尺寸相关 | ✅ 强相关 | ❌ 不相关 | ❌ 不相关 | ❌ 不相关 |
 | 旋转是否影响缓存 | ✅ 是（w, h 增大） | ❌ 否（PDF 矩阵变换） | ❌ 否（SVG transform） | 路径 A：❌；路径 B：✅ |
@@ -897,9 +899,9 @@ Arc<sk::Pixmap>           krilla::image::Image       WebImage { format, data }
 | 解码缓存粒度 | 源数据 + 格式 + ICC 三元组作为 key，与显示尺寸无关 | `crates/typst-library/src/visualize/image/raster.rs#L49-L53` |
 | PNG 渲染缓存粒度 | 按图像 + 目标像素尺寸缓存，scaling 隐含在 Image hash 中 | `crates/typst-render/src/image.rs#L68-L69` |
 | PDF 图像缓存粒度 | 按光栅图 + interpolate 缓存，与显示尺寸无关 | `crates/typst-pdf/src/image.rs#L190-L193` |
-| ICC 在 PNG 中的作用 | 不参与颜色转换，仅作为元数据存储（PNG 渲染不做色彩管理） | `crates/typst-render/src/image.rs#L76-L95` |
+| ICC 在 PNG 渲染中的作用 | 不参与颜色转换（tiny_skia 不做色彩管理），但 ICC 是图像身份的一部分，参与 Image hash 并间接影响缓存命中 | `crates/typst-render/src/image.rs#L68-L95`, `crates/typst-library/src/visualize/image/raster.rs#L200-L207` |
 | PNG 缓存的身份级联 | Image → ImageInner → ImageKind → RasterImageInner (data + format + icc) | `crates/typst-library/src/visualize/image/raster.rs#L200-L207` |
-| ICC → PNG 缓存的关联 | ICC 参与 Image hash → 改变 ICC 会触发 build_texture 重建，但 tiny_skia 不读 ICC，像素无变化 | 同上 |
+| ICC → 所有后端缓存的级联 | ICC 是 RasterImageInner hash 的字段 → 改变 ICC 会触发所有后端（PNG/PDF/SVG/HTML）的图像缓存重建，无论该后端是否实际使用 ICC 做色彩管理 | 同上 |
 | HTML 颜色策略 | 分两条路径：ToCss trait 实现（CSS color）+ svg_in_html（SVG 颜色） | `crates/typst-html/src/css/encode.rs#L396-L479` |
 | HTML Paint 支持度 | 只支持 Solid 纯色，Gradient/Tiling 通过 w.fail() 拒绝 | `crates/typst-html/src/css/encode.rs#L386-L393` |
 | HTML 图像嵌入双路径 | 普通 image() → `<img>`；html.frame/figure → 内联 `<svg>` | `crates/typst-html/src/rules.rs#L774-L819`, `crates/typst-html/src/convert.rs#L140-L154` |
