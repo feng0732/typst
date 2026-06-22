@@ -286,27 +286,197 @@ SystemFiles::load() (typst-cli/world.rs 或 typst-kit/files.rs)
 10. 返回 Module，供 import 使用
 ```
 
-## 八、关键设计要点
+## 八、异常路径分析
 
-### 8.1 三级缓存设计
+### 8.1 缓存目录未配置时的下载行为
+
+缓存目录（`cache`）是自动下载的必要前提。在 [`SystemPackages::obtain()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L95-L124) 中，下载逻辑完全包裹在 `if let Some(cache) = &self.cache` 块内：
+
+```
+obtain(spec)
+  │
+  ├─ data 目录检查
+  │
+  └─ if cache.is_some()   ← 整个下载逻辑在这个条件内
+        ├─ cache 目录检查
+        └─ 下载并缓存
+```
+
+**结论**：当缓存目录未配置（`cache` 为 `None`）时：
+- **不会触发下载**，即使包名属于 `preview` 命名空间
+- 只会在 data 目录中查找
+- 找不到时返回 `PackageError::NotFound`
+
+**什么情况下 cache 会是 None**：
+- `dirs::cache_dir()` 返回 `None`（无可用的系统缓存目录）
+- 调用方通过 `from_parts()` 显式传入 `None`
+
+注意：`data` 目录为 `None` 不影响下载，只要 `cache` 存在即可。
+
+### 8.2 下载失败的影响
+
+下载过程可能在多个阶段失败，每种失败对版本选择和后续加载的影响不同。
+
+#### 8.2.1 包下载失败
+
+在 [`UniversePackages::package()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L351-L380) 中，失败分为两类：
+
+| 失败场景 | 错误类型 | 对 `obtain()` 的影响 | 对版本选择的影响 |
+|---------|---------|---------------------|----------------|
+| 命名空间不是 `preview` | `NotFound` | 返回错误 | — |
+| HTTP 404（包或版本不存在） | `VersionNotFound`（包存在但版本错）或 `NotFound` | 返回错误，**不回退** | 触发时会先调用 `latest_version()` 尝试获取最新版本号，用于错误提示 |
+| 网络错误（超时、连接失败等） | `NetworkFailed` | 返回错误 | 不影响版本选择的缓存状态 |
+
+**关键细节**：当返回 404 时，代码会额外调用 `self.latest_version()` 来判断是包不存在还是版本不存在：
+- 如果能找到该包的其他版本 → `PackageError::VersionNotFound(spec, latest_version)`
+- 如果包本身不存在 → `PackageError::NotFound(spec)`
+
+这意味着下载失败（404）时会**额外触发一次索引查询**，但索引查询的结果仅用于生成更友好的错误消息，不会改变错误本身。
+
+#### 8.2.2 包索引下载失败
+
+[`UniversePackages::latest_version()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L385-L412) 依赖 `index.json` 的下载。索引下载失败时：
+
+- `latest_version()` 返回 `Err`，无法获取最新版本号
+- `OnceCell` 不会被填充，下次调用会**重新尝试下载**（不会缓存失败状态）
+- 对于模板创建等需要先确定版本的场景，会直接失败
+- 对于明确指定版本的包导入（`@preview/pkg:1.0.0`），**不受影响**，因为 `obtain()` 不依赖索引
+
+#### 8.2.3 解压失败（归档损坏）
+
+下载成功后，在 [`cache.store()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L111-L115) 的回调中解压 `tar.gz` 归档可能失败：
+
+- 错误类型：`PackageError::MalformedArchive`
+- 此时临时目录中可能有部分解压的文件
+- 由于 [`Tempdir`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L282-L307) 的 `Drop` 实现，临时目录会被自动清理
+- **不会污染 cache 目录**（因为还没执行重命名）
+- 后续重新调用 `obtain()` 会重新下载
+
+### 8.3 缓存损坏的影响
+
+#### 8.3.1 哪些情况算"缓存损坏"
+
+缓存损坏指缓存目录中包的文件不完整或内容错误，包括：
+- `typst.toml` 缺失或格式错误
+- `entrypoint` 指定的文件不存在
+- 部分文件缺失
+- 文件内容损坏
+
+#### 8.3.2 损坏检测时机
+
+[`FsPackages::obtain()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L191-L195) 仅通过 `dir.exists()` 判断包是否存在，**不做任何完整性检查**：
+
+```rust
+pub fn obtain(&self, spec: &PackageSpec) -> Option<FsRoot> {
+    let subdir = eco_format!("{}/{}/{}", spec.namespace, spec.name, spec.version);
+    let dir = self.path().join(subdir.as_str());
+    dir.exists().then_some(FsRoot::new(dir))
+}
+```
+
+因此，缓存损坏**不会在 `obtain()` 阶段被发现**，而是在后续文件加载时才暴露：
+
+1. `resolve_package()` 读取 `typst.toml` 时
+   - 文件不存在 → `FileError::NotFound`
+   - TOML 格式错误 → "package manifest is malformed"
+   - 名称/版本不匹配 → 验证失败
+2. 加载 `entrypoint` 指定的入口文件时
+   - 文件不存在 → `FileError::NotFound`
+
+#### 8.3.3 损坏后的行为
+
+**缓存损坏不会触发自动重新下载**。原因是：
+- `obtain()` 看到目录存在就直接返回 `FsRoot`
+- 后续文件加载失败发生在 `World::file()` / `World::source()` 层
+- 该层没有机制通知 `SystemPackages` "这个包坏了，请重新下载"
+
+用户需要手动删除损坏的缓存目录来触发重新下载。
+
+#### 8.3.4 Data 目录 vs Cache 目录的损坏行为
+
+两者行为一致：都只检查目录存在性，不验证完整性。但 data 目录是用户手动管理的，损坏时预期用户自行修复。
+
+### 8.4 临时目录清理
+
+#### 8.4.1 清理机制
+
+临时目录由 [`Tempdir`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L282-L307) 结构体管理，通过 `Drop` trait 实现自动清理：
+
+```rust
+impl Drop for Tempdir {
+    fn drop(&mut self) {
+        _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+```
+
+**正常流程**：
+1. 创建临时目录 `.tmp-{version}-{random}`
+2. 解压/写入包内容
+3. 原子重命名为目标版本号目录
+4. `Tempdir` 被 drop 时，尝试删除原路径（已被重命名，路径不存在，忽略错误）
+
+**异常流程（下载/解压失败）**：
+1. 创建临时目录
+2. 解压过程中出错
+3. 函数返回错误，`Tempdir` 离开作用域
+4. `drop` 被调用，删除整个临时目录
+
+#### 8.4.2 清理失败的情况
+
+以下情况临时目录可能**残留**：
+
+- **进程被强制终止**（如 `kill -9`、断电、蓝屏）：`Drop` 不会执行
+- **文件系统错误**：`remove_dir_all` 可能因权限等原因失败（错误被 `_ =` 静默忽略）
+
+残留的临时目录命名为 `.tmp-{version}-{u32}`，位于包的版本目录同级。
+
+#### 8.4.3 残留临时目录的影响
+
+- **不影响包查找**：`obtain()` 只查找严格匹配版本号的目录（如 `1.2.3`），`.tmp-1.2.3-xxxx` 不会被误认为有效包
+- **不影响后续下载**：每次下载使用新的随机数，不会与残留目录冲突
+- **占用磁盘空间**：残留的临时目录会一直占用空间，直到用户手动清理
+- **不影响版本选择**：`latest_version()` 解析目录名为版本号，`.tmp-*` 目录解析失败会被过滤掉
+
+### 8.5 对版本选择的综合影响
+
+| 异常情况 | 对 `latest_version()` 的影响 | 对 `obtain()` 的影响 |
+|---------|----------------------------|---------------------|
+| data 目录未配置 | 非 preview 命名空间返回错误 | 正常降级，仅跳过 data 检查 |
+| cache 目录未配置 | 不影响（不查 cache） | **无法下载**，找不到直接返回 NotFound |
+| 网络不可用 | preview 命名空间返回错误 | preview 包无法下载，返回 NotFound |
+| 索引下载失败 | 返回错误，**下次重试** | 不影响（明确指定版本时） |
+| 缓存目录损坏 | 不影响（不查 cache） | 返回 FsRoot，但后续加载文件时失败 |
+| 临时目录残留 | 无影响（解析失败被过滤） | 无影响 |
+
+## 九、关键设计要点
+
+### 9.1 三级缓存设计
 
 - **Data 目录**：用户手动放置的包，优先级最高，不会被自动修改
 - **Cache 目录**：自动下载的包，可随时清理，不影响用户数据
 - **内存缓存**：`FileStore` 的内存缓存和 `UniversePackages` 的索引缓存，提升重复访问性能
 
-### 8.2 并发安全
+### 9.2 并发安全
 
 - 下载使用临时目录 + 原子重命名，避免部分下载的包
 - `FileStore` 使用 `Mutex` 保护内部哈希表
 
-### 8.3 版本策略
+### 9.3 版本策略
 
 - 明确指定版本的包（`@preview/pkg:1.0.0`）直接使用指定版本
 - 未指定版本时（如模板创建），`preview` 命名空间查远程，其他查本地 data 目录
 - 包清单中可指定最低编译器版本，运行时进行兼容性检查
 
-### 8.4 可扩展性
+### 9.4 可扩展性
 
 - `Downloader` trait 允许自定义下载实现
 - `FsPackages` 可自定义 data/cache 路径
 - `SystemPackages::from_parts()` 可灵活组合三个来源
+
+### 9.5 失败处理原则
+
+- **缓存目录是下载的前提**：没有 cache 就不下载，避免"下载了但没地方存"的问题
+- **目录存在 ≠ 包有效**：`obtain()` 只做存在性检查，完整性校验延迟到文件加载阶段
+- **错误静默降级**：`dirs::cache_dir()` 等系统调用失败时，静默降级为 None，不导致整体崩溃
+- **临时目录自清理**：正常 panic 和错误路径下 Tempdir 都能自动清理，仅极端情况（强杀进程）可能残留
