@@ -368,7 +368,7 @@ pub fn compile_once(
 **设计意图**：
 - 编译错误（语法错误、未定义引用等）是 **用户需要修复的正常错误**，watch 模式不应退出
 - 用户修改文件保存后，自动重新编译验证
-- 只有系统级错误（如无法写文件、无法打印诊断信息）才会向上传播，导致 watch 退出
+- 只有真正的系统级错误（如无法打印诊断信息、终端不可写）才会向上传播，导致 watch 退出
 
 ### 6.2 watch 循环中的错误传播
 
@@ -384,18 +384,123 @@ timer.record(&mut world, |world| compile_once(world, &mut config))??;
 
 **会导致 watch 退出的错误（系统级）**：
 1. `timer.record` 写入计时文件失败
-2. `print_diagnostics` 打印诊断失败
-3. `write_deps` 写入依赖文件失败
-4. `watcher.update` 监听注册失败
-5. `watcher.wait` 事件接收失败（notify-rs 内部错误）
+2. `print_diagnostics` 打印诊断失败（如终端不可写）
+3. `open_output` 打开输出文件失败
+4. `write_deps` 写入依赖文件失败
+5. `watcher.update` 监听注册失败
+6. `watcher.wait` 事件接收失败（notify-rs 内部错误）
 
-**不会导致 watch 退出的错误（用户级）**：
+**不会导致 watch 退出的错误（用户/环境级）**：
 1. 语法错误、解析错误
 2. 类型错误、未定义引用等语义错误
 3. 图片/字体等资源加载失败（编译时错误）
-4. 任何 `SourceDiagnostic` 级别的诊断
+4. **输出文件写入失败**（磁盘满、权限不足等）
+5. 任何 `SourceDiagnostic` 级别的诊断
 
-### 6.3 编译失败后的依赖跟踪
+### 6.3 输出文件写入失败的错误传播分析
+
+**核心问题**：输出文件写入失败（如磁盘满、权限不足）是否会导致 watch 退出？
+
+**答案**：**不会退出**。输出文件写入失败会被包装为 `SourceDiagnostic` 错误，走与编译语法错误相同的处理路径 —— 打印错误但不退出，继续等待下一次文件变化。
+
+#### 6.3.1 错误类型定义
+
+`SourceResult<T>` 的定义见 `crates/typst-library/src/diag.rs` [diag.rs#L210](crates/typst-library/src/diag.rs#L210-L210)：
+
+```rust
+pub type SourceResult<T> = Result<T, EcoVec<SourceDiagnostic>>;
+```
+
+即：编译和导出阶段的所有错误（包括语法错误、语义错误、写入错误）都被收集为 `SourceDiagnostic` 列表。
+
+#### 6.3.2 写入错误的完整传播链
+
+以 PDF 导出为例，代码见 `crates/typst-cli/src/compile.rs` [compile.rs#L379-L388](crates/typst-cli/src/compile.rs#L379-L388)：
+
+```rust
+fn export_pdf(...) -> SourceResult<()> {
+    let buffer = typst_pdf::pdf(document, &options)?;
+    config.output.write(&buffer)
+        .map_err(|err| eco_format!("failed to write PDF file ({err})"))
+        .at(Span::detached())?;  // 包装为 SourceDiagnostic
+    Ok(())
+}
+```
+
+完整的错误转换链路：
+
+```
+std::fs::write() 失败
+  → io::Error
+  → .map_err() 包装为 EcoString 错误消息
+  → .at(Span::detached()) 包装为 SourceDiagnostic::error
+  → 收集到 EcoVec<SourceDiagnostic>
+  → compile_and_export 返回 Warned { output: Err(EcoVec<SourceDiagnostic>), ... }
+```
+
+所有导出格式的写入错误处理方式一致：
+- **HTML**: `export_html` [compile.rs#L343-L357](crates/typst-cli/src/compile.rs#L343-L357) — `failed to write HTML file`
+- **PNG**: `export_image_page` [compile.rs#L566-L592](crates/typst-cli/src/compile.rs#L566-L592) — `failed to write PNG file`
+- **SVG**: `export_image_page` [compile.rs#L566-L592](crates/typst-cli/src/compile.rs#L566-L592) — `failed to write SVG file`
+- **Bundle**: `write_virtual_fs` [compile.rs#L418-L438](crates/typst-cli/src/compile.rs#L418-L438) — `failed to write file`
+
+#### 6.3.3 在 compile_once 中的处理
+
+代码见 `crates/typst-cli/src/compile.rs` [compile.rs#L295-L305](crates/typst-cli/src/compile.rs#L295-L305)：
+
+```rust
+match &output {
+    Ok(_) => { /* ... */ }
+    Err(errors) => {
+        set_failed();                   // 设置进程退出码
+        if config.watching {
+            Status::Error.print(config).unwrap();  // 显示错误状态
+        }
+        print_diagnostics(world, errors, &warnings, config.diagnostic_format)
+            .map_err(|err| eco_format!("failed to print diagnostics ({err})"))?;
+    }
+}
+```
+
+**关键判断点**：
+- 如果 `print_diagnostics` **成功**（终端可写）：错误被内部消化，函数走到最后返回 `Ok(())`，watch 循环继续
+- 如果 `print_diagnostics` **失败**（如终端被关闭、磁盘不可读导致诊断打印失败）：通过 `?` 向上传播错误，导致 watch 退出
+
+#### 6.3.4 写入失败后的行为
+
+输出文件写入失败后，watch 的行为与语法错误完全一致：
+
+```
+用户保存文件 → 编译成功 → 写入 PDF 失败（磁盘满）
+  │
+  ├─ compile_and_export 返回 Err([SourceDiagnostic])
+  ├─ Status::Error.print() → 显示 "compiled with errors"
+  ├─ print_diagnostics() → 打印 "failed to write PDF file (Permission denied)"
+  ├─ compile_once() 返回 Ok(()) → 不退出
+  ├─ comemo::evict(10) → 清理缓存
+  │
+  ├─ 回到循环顶
+  │
+  ├─ watcher.update(world.dependencies())
+  │    └─ 注意：编译成功但写入失败，所有依赖文件都已被访问 → 监听范围完整
+  │
+  ├─ watcher.wait() → 继续等待
+  │
+  └─ 用户清理磁盘空间后再次保存 → 重新编译 → 写入成功
+```
+
+**重要细节**：写入失败发生在编译成功之后，所以 `FileStore` 中所有依赖文件的 `FileSlot` 都已被标记为非 `Empty`，`dependencies()` 返回完整的依赖列表，监听范围不受影响。
+
+#### 6.3.5 设计意图
+
+输出文件写入失败被归类为"可恢复错误"的原因：
+1. **写入失败通常是暂时性的**：磁盘满、权限问题等，用户可以在不退出 watch 的情况下修复
+2. **保持监视循环的连续性**：如果因一次写入失败就退出，用户需要重新启动 watch，体验不佳
+3. **与编译错误保持一致的处理模型**：所有 `SourceDiagnostic` 级别的错误都采用相同的处理策略 —— 打印错误 + 继续等待
+
+**例外**：`--open` 打开输出文件失败会导致退出（见 `compile_once` 中的 `open_output(config)?`），因为这是在 `match` 块之外的独立调用，直接通过 `?` 传播。但 `--open` 只在首次编译生效，后续编译不会重复打开。
+
+### 6.4 编译失败后的依赖跟踪
 
 **问题**：编译失败时，`world.dependencies()` 还能返回正确的依赖列表吗？
 
@@ -418,7 +523,7 @@ dependencies() 返回：[main.typ, a.typ, b.typ] —— 三个都在 ✓
 
 这确保了：**即使编译失败，watch 仍然能正确监听所有相关文件**，用户修复任何一个文件后都能触发重编译。
 
-### 6.4 Reset 与下一轮的衔接
+### 6.5 Reset 与下一轮的衔接
 
 `world.reset()` 的实现见 `crates/typst-cli/src/world.rs` [world.rs#L104-L107](crates/typst-cli/src/world.rs#L104-L107)：
 
@@ -457,7 +562,7 @@ fn reset(&mut self) {
 
 注意：编译失败时（`Parsed(Err(...))`），`stale` 为 `None`，即不保留旧源码 —— 失败文件下次需要从头解析。
 
-### 6.5 错误恢复的完整场景
+### 6.6 错误恢复的完整场景
 
 **场景 1：初始文件不存在**
 ```
@@ -501,7 +606,36 @@ fn reset(&mut self) {
   └─ 用户修复错误并保存 → 重新编译 → 成功
 ```
 
-**场景 3：系统级错误（watch 退出）**
+**场景 3：输出文件写入失败（不退出）**
+```
+用户保存文件 → 编译成功 → 写入 PDF 时磁盘已满
+  │
+  ├─ compile_and_export 中 export_pdf() 写入失败
+  │    ├─ config.output.write() 返回 io::Error
+  │    ├─ .map_err() 包装为 "failed to write PDF file"
+  │    └─ .at(Span::detached()) 包装为 SourceDiagnostic
+  │
+  ├─ compile_and_export 返回 Warned { output: Err([SourceDiagnostic]), ... }
+  ├─ match output 进入 Err 分支
+  │    ├─ set_failed() — 设置进程退出码
+  │    ├─ Status::Error.print() — 显示 "compiled with errors"
+  │    └─ print_diagnostics() — 打印写入错误信息
+  │
+  ├─ compile_once() 返回 Ok(()) — 不向上传播
+  │
+  ├─ comemo::evict(10) — 清理缓存
+  │
+  ├─ 回到循环顶部
+  │
+  ├─ watcher.update(world.dependencies())
+  │    └─ 编译成功过，所有依赖文件都已被访问 → 监听范围完整
+  │
+  ├─ watcher.wait() — 继续等待
+  │
+  └─ 用户清理磁盘空间 → 再次保存 → 重新编译 → 写入成功
+```
+
+**场景 4：系统级错误（watch 退出）**
 ```
 编译过程中磁盘突然不可用
   │
@@ -606,7 +740,8 @@ comemo::evict(10);
 │     ├─ world.reset()                    清除文件缓存 + 刷新时间戳       │
 │     │                                                                 │
 │     ├─ compile_once()                   重编译 + 导出 (+ 图片缓存)      │
-│     │    ├─ 编译成功 → Status::Success/PartialSuccess                  │
+│     │    ├─ 编译成功 → 写入成功 → Status::Success/PartialSuccess        │
+│     │    ├─ 编译成功 → 写入失败 → Status::Error + set_failed（不退出！）│
 │     │    └─ 编译失败 → Status::Error + set_failed（不退出！）          │
 │     │                                                                 │
 │     └─ comemo::evict(10)               清理增量编译缓存                │
@@ -630,4 +765,24 @@ comemo::evict(10);
         ├─ watcher.wait() — 正常等待
         │
         └─ 用户修复后保存 → 触发下一轮重编译
+```
+
+**错误恢复路径**（输出文件写入失败场景）：
+```
+  compile_once 编译成功 → export_pdf 写入失败（磁盘满）
+        │
+        ├─ io::Error → SourceDiagnostic（不直接向上传播）
+        │
+        ├─ 打印写入错误诊断（不返回 Err）
+        │
+        ├─ 返回 Ok(()) → 继续 comemo::evict
+        │
+        ├─ 回到循环顶
+        │
+        ├─ watcher.update(dependencies)
+        │    └─ 编译成功过，依赖列表完整
+        │
+        ├─ watcher.wait() — 正常等待
+        │
+        └─ 用户清理磁盘 → 再次保存 → 写入成功
 ```
