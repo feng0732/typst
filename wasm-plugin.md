@@ -139,9 +139,139 @@ fn transition(&self, func: &str, args: Vec<Bytes>) -> StrResult<Plugin> {
 ```
 
 **关键边界**：
-- `fingerprint` 是 `(原始bytes, func名, 参数)` 的链式哈希，保证 comemo 能正确区分不同 transition 产生的 Plugin
+- `fingerprint` 是纯哈希链：`h_new = hash128(&(h_old, func名, 参数))`，**不含原始bytes**，初始 `h_0 = 0`
 - 仅快照**线性内存**，不快照 WASM globals（文档中明确标注的限制）
-- `Plugin` 的 `PartialEq` 和 `Hash` 同时使用 `base.bytes` 和 `fingerprint`
+- `Plugin` 的 `PartialEq` 同时比较 `base.bytes` 和 `fingerprint`
+- `PluginFunc` 的 `PartialEq` 通过 `Arc<Plugin>` 间接比较 `base.bytes` 和 `fingerprint`
+
+### 1.5 指纹与相等性深度解析
+
+这是整个插件系统最容易混淆的部分。整个相等性链条分为 4 层，每层使用不同的相等性策略：
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│  层级关系与相等性策略                                        │
+│                                                                 │
+│  Plugin (私有结构相等)                                              │
+│  ├─ 定义：[plugin.rs#L389-L399](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L389-L399) │
+│  ├─ PartialEq: self.base.bytes == other.base.bytes          │
+│  │             && self.fingerprint == other.fingerprint             │
+│  └─ Hash:      self.base.bytes.hash(state)                       │
+│                 self.fingerprint.hash(state)                     │
+│                                                                 │
+│      ▲                                                         │
+│      │ Arc<Plugin> 会 deref 到 Plugin::eq                       │
+│      │                                                           │
+│  PluginFunc (derive PartialEq/Hash)                                  │
+│  ├─ 定义：[plugin.rs#L205](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L205) │
+│  ├─ 字段: plugin: Arc<Plugin>                                  │
+│  └─ 字段: name: EcoString                                     │
+│  └─ 相等: *self.plugin == *other.plugin && self.name == other.name │
+│                                                                 │
+│      ▲                                                         │
+│      │ comemo memoize 用 PluginFunc 作为 key 的一部分               │
+│      │                                                           │
+│  comemo memoize 缓存键                                             │
+│  ├─ PluginFunc::call(self, args)                                  │
+│  └─ PluginFunc::transition(self, args)                              │
+│  └─ 键 = (self, args)，self 是 &PluginFunc                         │
+│                                                                 │
+│      ▲                                                         │
+│      │ 命中缓存时返回同一个对象                                     │
+│      │                                                           │
+│  Module (指针相等 Arc::ptr_eq)                                       │
+│  ├─ 定义：[module.rs#L177-L181](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/module.rs#L177-L181) │
+│  └─ PartialEq: self.name == other.name                           │
+│             && Arc::ptr_eq(&self.inner, &other.inner)                    │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.5.1 fingerprint 计算的正确理解
+
+**之前的错误理解**：`fingerprint = hash(base.bytes, func, args)` 链式哈希
+
+**代码实际计算**：
+[plugin.rs#L330](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs#L330)
+
+```rust
+// 初始 Plugin::new() 中：fingerprint = 0
+
+// 每次 transition 中：
+let fingerprint = typst_utils::hash128(&(self.fingerprint, func, &args));
+```
+
+fingerprint 是**纯哈希链**，仅包含：
+- `self.fingerprint`（前一个状态的哈希值）
+- `func`（当前调用的函数名）
+- `args`（当前调用的参数）
+
+**注意**：`base.bytes` 不在 fingerprint 中！它只在 `Plugin::PartialEq` 和 `Plugin::Hash` 中单独使用，用于区分**不同的 WASM 模块**。
+
+这意味着：
+- 两个不同的 WASM 文件即使经历完全相同的 transition 序列，也会因为 `base.bytes` 不同而不相等
+- 同一个 WASM 文件不同 transition 路径（顺序不同），会因为 fingerprint 不同而不相等
+
+#### 1.5.2 测试用例为什么 `hello == hello2` 返回 true
+
+看测试 [plugin.typ#L39-L41](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/tests/suite/foundations/plugin.typ#L39-L41)
+
+```typst
+#let hello = plugin.transition(empty.add, bytes("hello"))
+#let hello2 = plugin.transition(empty.add, bytes("hello"))
+#test(hello == hello2, true)
+```
+
+**相等性链条**：
+
+1. `hello` 和 `hello2` 是 `Module` 类型，`Module::eq` 使用 `Arc::ptr_eq`（比较内部 Arc 指针是否相同
+
+2. 第一次调用 `plugin.transition(empty.add, bytes("hello"))：
+   - 参数：`func = empty.add`（`PluginFunc { plugin: Arc<empty_plugin>, name: "add" }`
+   - `args = [bytes("hello")]`
+   - 进入 `#[comemo::memoize]` 的 `PluginFunc::transition(self, args)`
+   - comemo 计算 key：`(self, args)`
+   - 未命中缓存，实际执行 transition，返回新 Module，存入缓存
+
+3. 第二次调用 `plugin.transition(empty.add, bytes("hello"))：
+   - `func = empty.add` 与第一次的 empty.add 来自同一个 empty 插件，`PluginFunc` 相等（相同的 `Plugin` 部分 + 相同 name "add"）
+   - `args = [bytes("hello")]` 内容相同
+   - comemo 命中缓存，**返回同一个 Module**（clone 出的 Arc 指针相同
+
+4. `hello == hello2` 比较 `Arc::ptr_eq`，返回 true
+
+#### 1.5.3 测试用例为什么 `hello == world` 返回 false
+
+```typst
+#let hello = plugin.transition(empty.add, bytes("hello"))
+#let world = plugin.transition(empty.add, bytes("world"))
+#test(hello == world, false)
+```
+
+**不相等的原因**：
+- `args` 分别是 `bytes("hello") vs `bytes("world")`，内容不同
+- comemo 不命中缓存，返回两个**不同的 Module**
+- `Arc::ptr_eq` 比较两个不同的 Arc 指针，返回 false
+
+#### 1.5.4 相等性策略总结表
+
+| 类型 | 相等性策略 | 目的 |
+|------|------------|------|
+| `Plugin` | **结构相等** <br> `base.bytes == && fingerprint ==` | 区分不同 WASM 文件 + 不同 transition 历史 |
+| `PluginFunc` | **结构相等** <br> `*plugin == && name ==` | 确保相同插件的相同函数相等，作为 comemo 缓存键 |
+| `Module` | **指针相等** <br> `Arc::ptr_eq` | 确保只有同一个 comemo 缓存返回的 Module 才相等 |
+| `Func`（当 inner 是 Plugin 时） | **结构相等** <br> 通过 `PluginFunc` 的相等 | FuncInner 是 derive PartialEq |
+
+#### 1.5.5 comemo memoize 的位置与作用
+
+三处关键的 memoize：
+
+| 函数 | memoize 键 | 效果 |
+|------|------------|------|
+| `Plugin::module(bytes)` | `bytes` | 相同 WASM 字节只编译一次 |
+| `PluginFunc::call(self, args)` | `(self, args)` | 相同插件函数 + 相同参数，结果缓存 |
+| `PluginFunc::transition(self, args)` | `(self, args)` | 相同 transition 参数返回同一个 Module Arc |
+
+注意：`Plugin::module(bytes)` 是 `#[comemo::memoize]`，但它是私有函数，只在 `plugin()` 函数内部被调用。
 
 ---
 
@@ -483,7 +613,7 @@ match code {
 2. **`DataSource` vs `Loaded` vs `Bytes`**：
    - `DataSource`：用户输入（可能是路径字符串，也可能是原始字节），带 span
    - `Loaded`：解析后的结果，附带 `LoadSource`（路径FileId或纯Bytes元数据）
-   - `Bytes`：最终进入 WASM 编译器的纯字节序列，Plugin::module 只接收 Bytes
+   - `Bytes`：最终进入 WASM 编译器的纯字节序列，`Plugin::module` 只接收 Bytes
 
 3. **返回值 `0/1` 与 trap 的区别**：
    - 返回 `1` 是**预期内**的业务错误，插件作者明确决定返回可读消息
@@ -492,6 +622,24 @@ match code {
 4. **Transition 的"不可变性"**：
    - 旧 Plugin 和 新 Plugin 共享 `PluginBase`（字节码+链接器），这部分是纯不可变的
    - 但各自拥有独立的实例池、快照、指纹 —— mutation 被隔离在指纹分支中
+
+5. **fingerprint 的构成（易错点）**：
+   - ❌ 错误：`fingerprint = hash(base.bytes, func, args)` 链式
+   - ✅ 正确：`fingerprint` 是纯哈希链 `h_n = hash128(&(h_{n-1}, func, args)`，`h_0 = 0`
+   - `base.bytes` 只在 `Plugin::PartialEq` 和 `Plugin::Hash` 中使用，不在 fingerprint 内部
+
+6. **四层相等性策略（易错点）**：
+   - `Plugin`：**结构相等**（`base.bytes == && fingerprint ==`）
+   - `PluginFunc`：**结构相等**（通过 `Arc<Plugin>::eq` 比较 Plugin）
+   - `comemo` 缓存键：用 `PluginFunc` 结构相等判断是否命中
+   - `Module`：**指针相等**（`Arc::ptr_eq`，只有同一个缓存返回值才相等）
+   - 测试中 `hello == hello2` 成立的根本原因是 **comemo 命中**，不是结构相等
+
+7. **Transition 相等性与 comemo 的交互（易错点）**：
+   - 两次独立的 `plugin.transition(empty.add, bytes("hello"))` 调用
+   - 如果两次传入的 `empty.add` 是**结构相等**（同一个 `Plugin`，同一个函数名）
+   - 那么 `PluginFunc` 相等 + `args` 相等 → comemo 命中
+   - 返回同一个 `Module` → `Module::eq`（`Arc::ptr_eq`）返回 true
 
 ---
 
@@ -502,10 +650,17 @@ match code {
 | 插件加载入口 `plugin()` | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L148-L156 |
 | Transition 函数 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L192-L201 |
 | `Plugin` 结构与实例池 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L242-L400 |
+| `Plugin::transition` 指纹计算 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L328-L352 |
+| `Plugin::PartialEq` 和 `Hash` | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L389-L399 |
+| `PluginFunc` derive(PartialEq,Hash) | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L205 |
+| `PluginFunc::call` memoize | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L219-L224 |
+| `PluginFunc::transition` memoize | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L226-L231 |
+| `Module::PartialEq` ptr_eq | [module.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/module.rs) | L177-L181 |
 | `PluginInstance::call` 核心调用 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L447-L520 |
 | 快照/恢复机制 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L524-L545 |
 | 宿主导入函数实现 | [plugin.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/plugin.rs) | L577-L612 |
 | `Func` 对 Plugin 的分发 | [func.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/func.rs) | L353-L358 |
 | `DataSource` 与 `Load` trait | [loading/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/loading/mod.rs) | L46-L154 |
 | `Args::all::<T>()` 参数提取 | [args.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-library/src/foundations/args.rs) | L191-L210 |
-| 插件测试用例 | [plugin.typ](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/tests/suite/foundations/plugin.typ) | 全文 |
+| 插件测试用例（含 transition 相等性） | [plugin.typ](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/tests/suite/foundations/plugin.typ) | L23-L41 |
+| `typst_utils::hash128` | [hash.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/130-typst/crates/typst-utils/src/hash.rs) | L10-L30 |
