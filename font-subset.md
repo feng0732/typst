@@ -499,40 +499,136 @@ impl ShowSet for Packed<EquationElem> {
 - 字重设置为 450（略粗于常规 400）
 - 没有设置 `covers` 限制，因此这个字体会被加入 `used` 列表
 
-### 5.2 数学变体转换：字符级别的"回退"
+### 5.2 字符变体转换 vs 真正字体回退：两个不同层面
 
-数学公式的字体"回退"主要不是在字形处理阶段发生，而是发生在更早的**IR 解析阶段**。通过 [codex](https://github.com/typst/codex) 库的 `to_style` 函数，普通 Unicode 字符被转换为**数学 Unicode 变体区域**的字符。
+数学公式链路中存在**两个完全不同层面**的"转换/回退"机制，初学者极易混淆：
 
-[resolve_text](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/math/ir/resolve.rs#L272-L306) 中的转换：
+| 层面 | 发生阶段 | 作用对象 | 代码位置 | 本质 |
+|------|----------|----------|----------|------|
+| **字符变体转换** | IR 解析阶段（shaping 之前） | Unicode 码位本身 | [resolve_text L295](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/math/ir/resolve.rs#L293-L296)、[resolve_symbol L345](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/math/ir/resolve.rs#L343-L346) | 纯字符级 Unicode 转换，**与字体选择无关** |
+| **真正字体回退** | shaping 阶段 | 字体实例选择 | [get_font_and_covers L930-L937](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L930-L937) | 字体级别的 fallback，HarfBuzz 产生 tofu 或 covers 不匹配时触发 |
+
+---
+
+#### 层面一：字符变体转换（IR 阶段）
+
+[resolve_text](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/math/ir/resolve.rs#L272-L325) 和 [resolve_symbol](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/math/ir/resolve.rs#L330-L358) 中都执行相同的转换逻辑：
 
 ```rust
-fn resolve_text(...) {
-    let variant = styles.get(EquationElem::variant);  // 如 DoubleStruck, SansSerif
-    let bold = styles.get(EquationElem::bold);
-    let italic = styles.get(EquationElem::italic).or(Some(false));
+// resolve_text 中 (L293-L296)
+let styled_text: EcoString = text
+    .chars()
+    .flat_map(|c| to_style(c, MathStyle::select(c, variant, bold, italic)))
+    .collect();
 
-    let styled_text: EcoString = text
-        .chars()
-        .flat_map(|c| to_style(c, MathStyle::select(c, variant, bold, italic)))
-        .collect();
-    // ... 创建 TextItem 或 NumberItem
+// resolve_symbol 中 (L343-L346) —— 完全相同的转换逻辑
+let text: EcoString = cluster
+    .chars()
+    .flat_map(|c| to_style(c, MathStyle::select(c, variant, bold, italic)))
+    .collect();
+```
+
+**`MathStyle::select` 的变体选择**：
+
+| Typst 代码 | 样式参数 | 字符变化（码位层面） |
+|------------|----------|---------------------|
+| `math.bold(A)` | `variant=None, bold=true` | `A` (U+0041) → `𝐀` (U+1D400, Mathematical Bold) |
+| `math.italic(A)` | `variant=None, italic=true` | `A` (U+0041) → `𝐴` (U+1D434, Mathematical Italic) |
+| `math.bb(A)` | `variant=DoubleStruck` | `A` (U+0041) → `𝔸` (U+1D538, Double-Struck) |
+| `math.sans(A)` | `variant=SansSerif` | `A` (U+0041) → `𝖠` (U+1D5A0, Sans-Serif) |
+| `math.frak(A)` | `variant=Fraktur` | `A` (U+0041) → `𝔄` (U+1D504, Fraktur) |
+| `+`, `=`, `(` | 运算符/标点 | 通常不转换，保持原码位 |
+
+**设计意图**：
+- 数学 Unicode 区域（U+1D400–U+1D7FF）专门为数学排版设计，包含各种字母变体
+- 专业数学字体（如 New Computer Modern Math）在这个区域提供丰富的字形
+- **这是纯码位转换**：`'A'` 变成 `'𝐀'`，就像把 `'a'` 变成 `'A'` 一样，与字体无关
+- 转换后才进入 shaping 流程，此时 HarfBuzz 看到的已经是 U+1D400 等字符了
+
+---
+
+#### 层面二：真正的字体回退（shaping 阶段）
+
+字符变体转换完成后，数学文本通过 `layout_inline()` 进入**完全普通的字形处理流程**，与普通文本共享同一条字体回退链路。
+
+关键代码在 [get_font_and_covers](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L902-L953)：
+
+```rust
+// 阶段1：遍历用户字体列表（数学公式中只有 "New Computer Modern Math"）
+for family in families.by_ref() {
+    selection = book
+        .select(family.as_str(), ctx.variant())
+        .and_then(|id| world.font(id))
+        .map(|font| font.instantiate(ctx.variant(), ctx.size(), ctx.variations()))
+        .filter(|font| !ctx.used().contains(font));
+    if selection.is_some() {
+        covers = family.covers();
+        break;
+    }
+}
+
+// 阶段2：如果用户字体列表耗尽且 fallback=true，调用 select_fallback()
+if selection.is_none() && ctx.fallback() {
+    let first = ctx.first().map(|font| font.info());
+    selection = book
+        .select_fallback(first, ctx.variant(), text)  // ← 真正的字体回退
+        .and_then(|id| world.font(id))
+        .map(|font| font.instantiate(ctx.variant(), ctx.size(), ctx.variations()))
+        .filter(|font| !ctx.used().contains(font));
 }
 ```
 
-#### `MathStyle::select` 的变体选择
+**触发真正字体回退的条件**（数学文本场景下）：
+1. `"New Computer Modern Math"` 不包含某个数学变体字符（glyph_id == 0）
+2. 或者 covers 正则不匹配（数学公式默认 covers=None，所以通常是条件 1）
 
-| 函数 | 效果 | 字符变化示例 |
-|------|------|-------------|
-| `math.bold(A)` | `variant=None, bold=true` | `A` (U+0041) → `𝐀` (U+1D400) |
-| `math.italic(A)` | `variant=None, italic=true` | `A` (U+0041) → `𝐴` (U+1D434) |
-| `math.bb(A)` | `variant=DoubleStruck` | `A` (U+0041) → `𝔸` (U+1D538) |
-| `math.sans(A)` | `variant=SansSerif` | `A` (U+0041) → `𝖠` (U+1D5A0) |
-| `math.frak(A)` | `variant=Fraktur` | `A` (U+0041) → `𝔄` (U+1D504) |
+---
 
-**设计意图**：
-- 数学字体（如 New Computer Modern Math）在数学 Unicode 区域（U+1D400–U+1D7FF）提供了各种变体字形
-- 通过预先转换字符，而不是在字体回退阶段处理，确保数学符号的一致性
-- 这是"字符级转换"而非"字体级回退"
+#### 两层机制的完整交互示例
+
+```
+用户输入: $ math.bb(A) + math.bold(B) $
+        │
+        ▼
+EquationElem::show_set()
+  └─ 设置 font = ["New Computer Modern Math"]
+        │
+        ▼
+【层面一：IR 阶段，字符变体转换】
+resolve_text() / resolve_symbol()
+  ├─ to_style('A', DoubleStruck)  → '𝔸' (U+1D538)
+  ├─ to_style('+', Plain)        → '+'  (U+002B, 运算符不变)
+  └─ to_style('B', Bold)         → '𝐁' (U+1D401)
+        │
+        ▼
+【层面二：shaping 阶段，真正的字体回退】
+shape_segment(text="𝔸+𝐁", families=["New Computer Modern Math"])
+  │
+  ├─ get_font_and_covers()
+  │     └─ book.select("New Computer Modern Math") → 找到字体
+  │
+  ├─ HarfBuzz shape(text="𝔸+𝐁", font=NCM_Math)
+  │     ├─ 假设 '𝔸': glyph_id=2401 (有字形)
+  │     ├─ 假设 '+': glyph_id=501  (有字形)
+  │     └─ 假设 '𝐁': glyph_id=0    (tofu！这个字重下没有 Bold 变体)
+  │
+  └─ 遍历 glyphs:
+        ├─ '𝔸': 正常 → 添加到 ctx.glyphs
+        ├─ '+': 正常 → 添加到 ctx.glyphs
+        └─ '𝐁': tofu(glyph_id=0)
+              │
+              ├─ 递归调用 shape_segment(text="𝐁", families=[...])
+              │     │
+              │     ├─ get_font_and_covers():
+              │     │     ├─ NCM Math 已在 used 中 → 跳过
+              │     │     └─ fallback=true → book.select_fallback(text="𝐁")
+              │     │           └─ 搜索所有字体中包含 U+1D401 的字体
+              │     │                 （可能找到 Cambria Math 或其他数学字体）
+              │     │
+              │     └─ 用回退字体渲染 '𝐁'
+              │
+              └─ 递归返回
+```
 
 ### 5.3 数学文本的 layout 流程
 
@@ -540,7 +636,7 @@ fn resolve_text(...) {
 
 ```rust
 pub fn layout_text(...) {
-    let text = &item.text;  // 已转换为数学 Unicode 变体
+    let text = &item.text;  // 注意：这里的 text 已经完成字符变体转换！
     let elem = TextElem::packed(text).spanned(span);
     
     // 通过 layout_inline 进入普通文本 shaping 流程
@@ -552,477 +648,548 @@ pub fn layout_text(...) {
 }
 ```
 
-**完整链路**：
-
-```
-数学公式输入: $ math.bb(A) + math.bold(B) $
-        │
-        ▼
-EquationElem::show_set()
-  ├─ 设置 font = ["New Computer Modern Math"]
-  └─ 设置 weight = 450
-        │
-        ▼
-math/ir/resolve.rs: resolve_text() / resolve_symbol()
-  ├─ variant = styles.get(EquationElem::variant)
-  ├─ bold = styles.get(EquationElem::bold)
-  ├─ italic = styles.get(EquationElem::italic)
-  └─ to_style(c, MathStyle::select(c, variant, bold, italic))
-        │
-        ├─ 'A' → '𝔸' (U+1D538, DoubleStruck)
-        ├─ '+' → '+' (运算符，无变体转换)
-        └─ 'B' → '𝐁' (U+1D401, Bold)
-        │
-        ▼
-layout_inline() → shape_range() → shape() → shape_segment()
-  ├─ families = ["New Computer Modern Math"]
-  ├─ 检查字体是否包含 𝔸 (U+1D538)
-  ├─ 如果包含 → 正常输出字形
-  └─ 如果不包含 → 触发字体回退（进入普通回退链路）
-        │
-        ├─ 阶段1: 遍历用户字体列表（只有 "New Computer Modern Math"）
-        ├─ 阶段2: 如果 fallback=true，select_fallback() 查找包含该字符的字体
-        └─ 阶段3: 如果都失败，shape_tofus() 显示豆腐块
-        │
-        ▼
-ShapedText.build() → TextItem → PDF 子集化
-  └─ 与普通文本相同的子集化流程
-```
-
 ### 5.4 数学字体回退的特殊性
 
-1. **字体列表单一**：数学公式默认只有 `"New Computer Modern Math"` 一个字体
-2. **回退发生晚**：先尝试字符转换，转换后才进入字形处理回退
-3. **数学区域字符特殊**：U+1D400–U+1D7FF 区域的字符通常只有专业数学字体才包含
-4. **连字处理**：数学字体可能有特殊的连字（如 `:=` → `≔`），通过 `flac` OpenType 特性处理
+1. **两步走设计**：先做字符级变体转换（IR 阶段），再做字体级回退（shaping 阶段），两者解耦
+2. **字体列表单一**：默认只有 `"New Computer Modern Math"`，回退余地小，依赖 fallback=true 时的全局搜索
+3. **数学区域字符特殊**：U+1D400–U+1D7FF 区域的字符通常只有专业数学字体才包含，`select_fallback` 的搜索空间有限
+4. **无 covers 限制**：数学字体默认 covers=None，一旦被选中就会 push 到 used，避免在同一次递归中反复尝试
 
 ### 5.5 数学字体特性：`dtls` 和 `flac`
 
-[layout_glyph](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/math/text.rs#L69-L119) 中处理了数学字体的特殊特性：
+[layout_glyph](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/math/text.rs#L69-L119) 中处理了数学字体的特殊 OpenType 特性：
 
-- **`dtls` (Dotless Forms)**：用于将 `i` 和 `j` 转换为无点形式 `ı` 和 `ȷ`，避免与上方重音冲突
-- **`flac` (Flattened Accents)**：用于压扁上方的重音符号
+- **`dtls` (Dotless Forms)**：用于将 `i` 和 `j` 转换为无点形式 `ı` 和 `ȷ`，避免与上方重音符号视觉冲突
+- **`flac` (Flattened Accents)**：用于压扁上方的重音符号，使其贴合基字符
 
-这些 OpenType 特性在数学字体中很常见，确保数学符号的正确显示。
+这些是 OpenType 特性层面的字形替换，**发生在 HarfBuzz shaping 内部**，不属于字符变体转换或字体回退。
 
 ---
 
 ## 六、covers 与 used 的 push/pop 栈关系
 
-### 6.1 `used` 列表的生命周期
+### 6.1 关键数据结构与函数签名
 
-`used` 是 `ShapingContext` 中的一个 `Vec<FontInstance>`，行为上像一个**栈**，用于追踪"已用尽"的字体（没有 `covers` 限制的字体）。
+要理解 covers 与 used 的交互，首先需要明确三个核心元素的关系：
 
 ```rust
+// [shaping.rs L836-L848] ShapingContext 的生命周期贯穿整个 shape() 调用
 struct ShapingContext<'a> {
-    used: Vec<FontInstance>,  // 栈：push 在 get_font_and_covers，pop 在 shape_segment 末尾
+    used: Vec<FontInstance>,   // 栈：push 在 get_font_and_covers，pop 在 shape_segment 末尾
+    fallback: bool,             // 是否启用全局回退
     // ...
+}
+
+// [shaping.rs L902-L953] get_font_and_covers：从 families 迭代器中选择下一个可用字体
+pub fn get_font_and_covers<'a, C, F>(
+    ctx: &mut C,
+    text: &str,
+    mut families: impl Iterator<Item = &'a FontFamily>,  // ← 注意：by_ref 会消耗迭代器！
+    mut shape_tofus: F,
+) -> Option<(FontInstance, Option<&'a Regex>)>
+
+// [shaping.rs L956-L961] shape_segment：每次递归携带 families 迭代器的克隆
+fn shape_segment<'a>(
+    ctx: &mut ShapingContext<'a>,
+    base: usize,
+    text: &str,
+    mut families: impl Iterator<Item = &'a FontFamily> + Clone,  // ← Clone 是关键！
+)
+```
+
+**三个核心元素**：
+
+| 元素 | 类型 | 作用 |
+|------|------|------|
+| `used` | `Vec<FontInstance>`（栈） | 标记"已用尽"的字体（covers=None 的字体），通过 `ctx.used().contains(font)` 避免重复选择 |
+| `families` | `impl Iterator + Clone` | 用户字体列表 + fallback 列表的迭代器，**消耗性**，每个 family 每一层只会被尝试一次 |
+| `covers` | `Option<Regex>` | 决定字体是否被 push 到 used，以及 glyph 是否被 `is_covered` 接受 |
+
+---
+
+### 6.2 families 迭代器的消耗性与递归克隆
+
+这是最容易被忽略但最关键的机制。让我们看 [get_font_and_covers L917-L927](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L917-L927)：
+
+```rust
+for family in families.by_ref() {   // ← by_ref() 消耗迭代器！
+    selection = book.select(family.as_str(), ctx.variant())
+        .and_then(|id| world.font(id))
+        .map(|font| font.instantiate(...))
+        .filter(|font| !ctx.used().contains(font));
+    if selection.is_some() {
+        covers = family.covers();
+        break;   // ← 一旦选中一个字体，迭代器就停在这个位置
+    }
 }
 ```
 
-### 6.2 完整的栈操作时序
+然后在 [shape_segment L1151](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1151) 递归时：
 
-让我们以文本 `"中A文"`，字体列表 `[(name: "Inria Serif", covers: "latin-in-cjk"), "Noto Serif CJK SC"]` 为例：
+```rust
+// 发现 tofu 序列，递归处理
+shape_segment(ctx, base + start, &text[start..end], families.clone());
+//                                                ^^^^^^^^^^^^^^^^
+//                                                克隆当前迭代器状态！
+```
+
+**关键理解**：
+- `families.clone()` 克隆的是**迭代器的当前消耗状态**（已经跳过的 family 不会再回来）
+- 外层迭代器和内层克隆迭代器**各自独立消耗**，但起点相同
+- 每一层 `shape_segment` 内部**只调用一次** `get_font_and_covers`（在函数开头），所以每一层最多消耗一个 family
+
+---
+
+### 6.3 完整时序追踪：`"中A文"` 示例
+
+让我们用文本 `"中A文"`，字体列表 `[(name: "Inria Serif", covers: "latin-in-cjk"), "Noto Serif CJK SC"]`，逐步追踪：
 
 ```
-初始状态: used = []
+初始状态:
+  used = []
+  families_iter = [Inria(latin-in-cjk), NotoCJK]  ← 指向第 0 个
 
-shape_segment(ctx, 0, "中A文", families)
-  │
-  ├─▶ get_font_and_covers()
-  │     ├─ family1: "Inria Serif", covers: latin-in-cjk
-  │     │     ├─ book.select() → 找到字体
-  │     │     ├─ covers = Some(regex)  ← 有覆盖限制
-  │     │     └─ 不 push 到 used  ← 关键：有 covers 不加入 used
+═══════════════════════════════════════════════
+第 1 层 shape_segment(ctx, 0, "中A文", families_iter)
+═══════════════════════════════════════════════
+
+  ├─▶ get_font_and_covers(ctx, "中A文", families_iter.by_ref())
   │     │
-  │     └─ 返回 (font_inria, Some(latin_in_cjk_regex))
+  │     ├─ for family in families_iter.by_ref():
+  │     │     ├─ 第 0 个: Inria(latin-in-cjk)
+  │     │     │     ├─ book.select("Inria Serif") → 找到字体
+  │     │     │     ├─ !used.contains(Inria) → true（used 为空）
+  │     │     │     ├─ covers = Some(latin_in_cjk_regex)
+  │     │     │     └─ break  ← 迭代器停在第 1 个位置
+  │     │     │
+  │     │     └─ （循环结束，families_iter 现在指向 [NotoCJK]）
+  │     │
+  │     ├─ covers.is_none()? → false（有 covers）
+  │     │   └─ 不 push 到 used！used 仍为 []
+  │     │
+  │     └─ 返回 (Inria_font, Some(latin_in_cjk_regex))
   │
-  ├─ rustybuzz.shape_with_plan(font_inria, ...)
-  │     └─ infos: [glyph_id=0(cluster=0), glyph_id=120(cluster=1), glyph_id=0(cluster=2)]
-  │                "中" (tofu)           "A" (ok)            "文" (tofu)
+  ├─ HarfBuzz shape(Inria_font, "中A文")
+  │     结果: [
+  │       glyph_id=0, cluster=0,   // "中" tofu（或者不在 covers 内）
+  │       glyph_id=120, cluster=1, // "A" 正常
+  │       glyph_id=0, cluster=2    // "文" tofu（或者不在 covers 内）
+  │     ]
   │
   └─ 遍历 glyphs:
         │
-        ├─ i=0: glyph_id=0, "中"
+        ├─ i=0: glyph_id=0, cluster=0 ("中")
         │     │
         │     ├─ is_covered(0)?
-        │     │     └─ "中" 不在 latin-in-cjk 的覆盖范围 → false
+        │     │     └─ "中" 是否匹配 latin-in_cjk_regex? → false
         │     │
-        │     ├─ 找到连续 tofu 序列: [0..1] ("中")
-        │     ├─ 递归调用: shape_segment(ctx, 0, "中", families.clone())
-        │     │     │
-        │     │     ├─▶ get_font_and_covers()
-        │     │     │     ├─ family1: "Inria Serif"
-        │     │     │     │     ├─ !used.contains(font_inria) → true  ← 仍可用（因为没 push）
-        │     │     │     │     └─ 但是 "中" 不在覆盖范围 → 继续
-        │     │     │     │
-        │     │     │     ├─ family2: "Noto Serif CJK SC", covers: None
-        │     │     │     │     ├─ book.select() → 找到字体
-        │     │     │     │     ├─ covers = None  ← 无覆盖限制
-        │     │     │     │     └─ ctx.used().push(font_cjk)  ← push!
-        │     │     │     │        used = [font_cjk]
-        │     │     │     │
-        │     │     │     └─ 返回 (font_cjk, None)
-        │     │     │
-        │     │     ├─ rustybuzz.shape_with_plan(font_cjk, ...)
-        │     │     │     └─ "中" 字形正常 (glyph_id=xxx)
-        │     │     │
-        │     │     ├─ 添加正常字形到 ctx.glyphs
-        │     │     │
-        │     │     └─ ctx.used.pop()  ← pop!
-        │     │              used = []
+        │     ├─ 找到 tofu 序列: start=0, end=1 ("中")
         │     │
-        │     └─ 递归返回，"中" 已处理
+        │     ├─ 递归调用 shape_segment(ctx, 0, "中", families_iter.clone())
+        │     │     │     ↑ 注意：克隆时迭代器状态是 [NotoCJK]（已消耗 Inria）
+        │     │     │
+        │     │     ══════════════════════════════════════════════
+        │     │     第 2 层 shape_segment(ctx, 0, "中", cloned_iter=[NotoCJK])
+        │     │     ══════════════════════════════════════════════
+        │     │       │
+        │     │       ├─▶ get_font_and_covers(ctx, "中", cloned_iter.by_ref())
+        │     │       │     │
+        │     │       │     ├─ for family in cloned_iter.by_ref():
+        │     │       │     │     └─ 第 0 个: NotoCJK (covers=None)
+        │     │       │     │           ├─ book.select() → 找到字体
+        │     │       │     │           ├─ !used.contains(NotoCJK) → true
+        │     │       │     │           ├─ covers = None
+        │     │       │     │           └─ break
+        │     │       │     │
+        │     │       │     ├─ covers.is_none()? → true
+        │     │       │     │   └─ ctx.used().push(NotoCJK)  ← push!
+        │     │       │     │       used = [NotoCJK]
+        │     │       │     │
+        │     │       │     └─ 返回 (NotoCJK_font, None)
+        │     │       │
+        │     │       ├─ HarfBuzz shape(NotoCJK_font, "中") → glyph_id 正常
+        │     │       ├─ 添加正常字形到 ctx.glyphs
+        │     │       │
+        │     │       └─ ctx.used.pop()  ← pop!
+        │     │              used = []    （平衡：第 2 层 push 的 NotoCJK 被弹出）
+        │     │
+        │     └─ 递归返回
         │
-        ├─ i=1: glyph_id=120, "A"
-        │     ├─ is_covered(1)? → "A" 匹配 latin-in-cjk → true
+        ├─ i=1: glyph_id=120, cluster=1 ("A")
+        │     ├─ is_covered(1)? → "A" 匹配 latin-in_cjk_regex → true
         │     └─ 添加正常字形到 ctx.glyphs
         │
-        └─ i=2: glyph_id=0, "文"
-              ├─ 类似 "中" 的处理流程
-              └─ 递归到 Noto Serif CJK SC 处理
-        │
-        └─ ctx.used.pop()  ← 对应 get_font_and_covers 中为 Inria Serif 的 push？不！
-                           ← 注意：Inria Serif 有 covers，所以没有 push，这里 pop 的是什么？
+        └─ i=2: glyph_id=0, cluster=2 ("文")
+              ├─ 与 "中" 完全相同的流程
+              ├─ 递归 shape_segment(ctx, 2, "文", families_iter.clone())
+              │     └─ cloned_iter 仍然是 [NotoCJK]（外层迭代器没变！）
+              │         ├─ get_font_and_covers: 选中 NotoCJK, push → used=[NotoCJK]
+              │         ├─ shape → 正常
+              │         └─ pop → used=[]
+              │
+              └─ ctx.used.pop()  ← pop!
+                               used = []
+                  ↑ 这里弹出的是什么？
+                  ↑ 注意：第 1 层的 Inria 有 covers，没有 push！
+                  ↑ 所以这里 pop 的是…… 一个空 Vec 的 pop()？返回 None，不影响。
 ```
 
-**等等，这里有一个关键点需要澄清**：`ctx.used.pop()` 总是在 `shape_segment` 末尾调用，但如果字体有 `covers` 限制，就没有对应的 `push`。这意味着什么？
+---
 
-让我重新审视代码：
+### 6.4 push/pop "不平衡"的设计真相
 
-[get_font_and_covers](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L947-L950):
-```rust
-// This font has been exhausted and will not be used again.
-if covers.is_none() {
-    ctx.used().push(font.clone());  // 只有无 covers 的字体才 push
-}
-```
+上一节的末尾揭示了核心问题：**第 1 层的 Inria 有 covers 所以没 push，但第 1 层末尾仍然执行了 pop**。这是 bug 吗？
 
-[shape_segment](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1157):
-```rust
-ctx.used.pop();  // 总是 pop，不管有没有 push
-```
-
-### 6.3 栈不平衡的设计意图
-
-这种"可能 push 也可能不 push，但总是 pop"的设计实际上是**栈帧平衡**的：
+让我们重新审视代码的精确执行顺序。答案在 [shape_segment L1151](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1151) 的递归调用时机：
 
 ```
-父调用 shape_segment:
-  used = []
-  get_font_and_covers(covers=None) → push(fontA), used = [fontA]
-  发现 tofu，递归子调用
-    子调用 shape_segment:
-      get_font_and_covers(covers=None) → push(fontB), used = [fontA, fontB]
-      处理完成
-      used.pop() → used = [fontA]  ← 平衡：子调用的 push 被子调用的 pop 抵消
-  继续处理
-  used.pop() → used = []  ← 平衡：父调用的 push 被父调用的 pop 抵消
+第 1 层 (Inria, covers=Some):
+  push? → 不 push (used=[])
+  递归处理 "中":
+    第 2 层 (NotoCJK, covers=None):
+      push → used=[NotoCJK]
+      pop  → used=[]   ← 第 2 层自己平衡
+  递归处理 "文":
+    第 2 层 (NotoCJK, covers=None):
+      push → used=[NotoCJK]
+      pop  → used=[]   ← 第 2 层自己平衡
+  pop → used=[]        ← 第 1 层的 pop，此时 used 本来就是空
 ```
 
-如果字体有 `covers` 限制（不 push），则 `pop` 实际上会弹出**更外层**的字体：
+**关键设计洞察**：
+
+1. **每个 `shape_segment` 帧对应一次 push 或 0 次 push，但对应 1 次 pop**
+2. 当 `covers=Some` 时（0 次 push），末尾的 pop 相当于"空操作"（如果 used 为空则返回 None）
+3. 当 `covers=None` 时（1 次 push），末尾的 pop 恰好平衡
+4. **递归深度 = push 次数 + covers=None 的字体数**，pop 次数 = 递归深度，所以整体是平衡的
+
+但有一种情况值得特别关注——当外层字体 covers=None，内层字体 covers=Some 时：
 
 ```
-父调用 shape_segment:
-  used = [fontA]  ← 之前已 push 的无 covers 字体
-  get_font_and_covers(covers=Some(...)) → 不 push, used = [fontA]
-  发现 tofu，递归子调用
-    子调用 shape_segment:
-      get_font_and_covers(covers=None) → push(fontB), used = [fontA, fontB]
-      处理完成
-      used.pop() → used = [fontA]  ← 子调用平衡
-  继续处理
-  used.pop() → used = []  ← 弹出的是 fontA！
+第 1 层 (Arial, covers=None):
+  push → used=[Arial]
+  递归处理 tofu:
+    第 2 层 (Inria, covers=Some):
+      push? → 不 push (used=[Arial])
+      递归处理 tofu:
+        第 3 层 (NotoCJK, covers=None):
+          push → used=[Arial, NotoCJK]
+          pop  → used=[Arial]   ← 第 3 层平衡
+      pop → used=[]             ← 第 2 层 pop 掉了第 1 层 push 的 Arial！
+  pop → used=??                 ← 第 1 层 pop，此时已经空了
 ```
 
-**设计意图**：
-- `used` 列表追踪的是"全局已用尽"的字体，而不是"当前调用帧使用"的字体
-- 当一个无 `covers` 的字体被选择时，它被标记为"已用尽"（push），避免在递归中被重复选择
-- 当 `shape_segment` 返回时，该字体在**这个分支**已处理完毕，可以"释放"（pop），允许在其他分支（如果有的话）重新使用
-- 有 `covers` 的字体永远不会被标记为"已用尽"，因为它们只处理特定字符，可以被重复使用
+**这不是 bug，而是有意的设计**：
+- 当一个 covers=Some 的字体（Inria）处理完成时，它 pop 掉外层 covers=None 的字体（Arial），意味着：**Arial 对后续 tofu 不再是"已用尽"状态**
+- 为什么需要这样？因为 Inria 是一个"有限覆盖"字体，它只处理了部分字符，剩下的 tofu 可能需要 Arial 再次尝试（在不同的 text 上下文中）
+- 但实际上 Arial 不会被再次选择——因为 **families 迭代器已经消耗过 Arial 了**，双重保险！
 
-### 6.4 实际场景中的栈行为
+---
 
-让我们用一个更完整的例子 `"A中B"`，字体列表 `["Arial", (name: "Inria Serif", covers: "latin-in-cjk"), "Noto Serif CJK SC"]`：
+### 6.5 避免无限循环的双重保险机制
 
-```
-初始: used = []
+| 保险机制 | 工作原理 | 适用场景 |
+|----------|----------|----------|
+| **保险 1: `used.contains(font)` 过滤** | `get_font_and_covers L922` 的 `.filter(\|font\| !ctx.used().contains(font))` 跳过已 push 的字体 | covers=None 的字体在递归深度内被跳过 |
+| **保险 2: `families` 迭代器消耗** | `for family in families.by_ref()` 消耗迭代器，每个 family 在每一层只会被尝试一次 | 所有字体，无论是否有 covers，每一层都只试一次 |
 
-shape_segment("A中B", [Arial, Inria(latin-in-cjk), NotoCJK])
-  │
-  ├─ get_font_and_covers()
-  │   ├─ Arial: covers=None → push(Arial), used=[Arial]
-  │   └─ 返回 (Arial, None)
-  │
-  ├─ rustybuzz.shape(Arial, "A中B")
-  │   └─ A(good), 中(tofu), B(good)
-  │
-  ├─ 处理:
-  │   ├─ A: good → 添加
-  │   ├─ 中: tofu → 递归 shape_segment("中", [Arial, Inria, NotoCJK])
-  │   │     │
-  │   │     ├─ get_font_and_covers()
-  │   │     │   ├─ Arial: !used.contains(Arial)? → false（已在 used 中！）
-  │   │     │   │                         ← 跳过 Arial，避免循环
-  │   │     │   │
-  │   │     │   ├─ Inria: covers=latin-in-cjk → 不 push, used=[Arial]
-  │   │     │   │   "中" 不在覆盖范围 → 继续
-  │   │     │   │
-  │   │     │   └─ NotoCJK: covers=None → push(NotoCJK), used=[Arial, NotoCJK]
-  │   │     │
-  │   │     ├─ rustybuzz.shape(NotoCJK, "中") → good
-  │   │     ├─ 添加字形
-  │   │     └─ used.pop() → used=[Arial]
-  │   │
-  │   └─ B: good → 添加
-  │
-  └─ used.pop() → used=[]
-```
+**为什么需要双重保险？**
 
-**关键点**：
-1. `used` 列表在递归调用中被**共享**（`&mut` 引用）
-2. 无 `covers` 的字体被 push 后，在递归子调用中会被 `!used.contains(font)` 过滤掉，避免重复尝试
-3. 有 `covers` 的字体不会被 push，可以在递归中被重复尝试（但每次只处理其覆盖范围内的字符）
-4. 每次 `shape_segment` 返回时的 `pop` 确保了栈的整体平衡
+- 仅用 `used.contains`：无法处理 covers=Some 的字体（它们不 push，used.contains 永远返回 false）
+- 仅用 `families` 消耗：递归时 `families.clone()` 会克隆当前状态，如果只有 covers=Some 的字体被消耗，深层递归可能会重复选择同一个无 covers 字体
+- 两者结合：`used` 控制"是否标记为已用尽"，`families` 控制"这一层是否已经尝试过"
 
-### 6.5 避免无限循环的机制
-
-```rust
-.filter(|font| !ctx.used().contains(font))
-```
-
-这个过滤条件确保了：
-- 一旦某个无 `covers` 的字体被标记为"已用尽"（push 到 used），在它被 pop 之前，不会被再次选择
-- 这防止了"字体A缺字 → 回退到字体A → 还是缺字 → 无限循环"的情况
+---
 
 ### 6.6 与 covers 的交互总结
 
-| 场景 | push? | pop? | 结果 |
-|------|-------|------|------|
-| `covers=None` | ✓ 是 | ✓ 是 | 该字体在递归中被跳过，不会重复尝试 |
-| `covers=Some(...)` | ✗ 否 | ✓ 是 | 弹出的是外层的字体，该字体可在递归中重复使用 |
+| 场景 | push? | pop? | `used.contains` 效果 | `families` 消耗效果 | 结果 |
+|------|-------|------|---------------------|---------------------|------|
+| `covers=None` | ✓ 是 | ✓ 是 | 递归中被跳过 | 每一层只尝试一次 | 该字体在整个递归深度内不会被重复选择 |
+| `covers=Some(...)` | ✗ 否 | ✓ 是 | 永远不被跳过 | 每一层只尝试一次 | 该字体可在不同递归分支中重复处理不同字符段，但每层只尝试一次 |
 
 ---
 
 ## 七、fi 连字和 ActualText/ToUnicode 在文本提取中的分工
 
-### 7.1 连字（Ligature）在 HarfBuzz 中的处理
+### 7.1 文本提取信息的端到端链路总览
 
-当文本包含 `"fi"` 时，HarfBuzz 可能会将其转换为一个连字 glyph。让我们看具体的数据流：
+PDF 文本提取的正确性依赖一条完整的数据链路，任何一环出错都会导致提取文本不完整。以 `"fi"` 连字为例：
 
 ```
-输入文本: "fi" (UTF-8: 0x66 0x69)
+阶段 0: 原始文本
+  "fi" (Unicode: U+0066 U+0069)
         │
         ▼
-rustybuzz.shape_with_plan(font, plan, buffer)
+阶段 1: HarfBuzz Shaping (shaping.rs L1026-L1029)
+  rustybuzz.shape_with_plan(font, plan, buffer)
+        │
+        ├─ 输入: Unicode 文本 "fi"
+        ├─ 输出: [GlyphInfo { glyph_id: 42, cluster: 0 }]
+        └─ 关键信息: cluster = 0（只保留起始偏移，丢失了长度信息）
         │
         ▼
-输出 glyph_infos: [
-  GlyphInfo { glyph_id: 42, cluster: 0 },  // "fi" 连字，对应原始文本 0..2
-]
+阶段 2: Typst Range 扩展 (shaping.rs L1050-L1086)
+  通过相邻 glyph 的 cluster 差异计算完整文本范围
+        │
+        ├─ 输入: cluster = 0, 下一个不同 cluster = None（已到末尾）
+        ├─ 计算: start = base + 0 = 0, end = base + text.len() = 0 + 2 = 2
+        └─ 输出: ShapedGlyph { glyph_id: 42, range: 0..2, ... }
+        │
+        ▼
+阶段 3: ShapedText.build → TextItem (shaping.rs L437-L446)
+  同字体 glyph 分组，从原始文本切片构建 text 字段
+        │
+        ├─ 输入: [ShapedGlyph { glyph_id: 42, range: 0..2 }]
+        ├─ 计算: text = original_text[0..2] = "fi"
+        └─ 输出: TextItem {
+                   font,
+                   glyphs: [Glyph { id: 42, range: 0..2 }],
+                   text: "fi"   ← 完整原始文本
+                 }
+        │
+        ▼
+阶段 4: PdfGlyph 转换 (typst-pdf/src/text.rs L106-L148)
+  Glyph → PdfGlyph，实现 krilla::text::Glyph trait
+        │
+        ├─ glyph_id() → GlyphId::new(42)
+        └─ text_range() → 0..2  （原样透传）
+        │
+        ▼
+阶段 5: Krilla draw_glyphs (typst-pdf/src/text.rs L50-L57)
+  surface.draw_glyphs(glyphs, krilla_font, "fi", 12.0)
+        │
+        ├─ 输入: glyphs=[PdfGlyph(42, 0..2)], text="fi"
+        ├─ 判定: text[0..2].len() = 2 > 1 → 需要 ActualText！
+        ├─ ToUnicode CMap: glyph_id=42 → "f"（只映射第一个字符）
+        └─ PDF 内容流:
+             /Span <</ActualText (fi)>> BDC
+             [42] TJ
+             EMC
+        │
+        ▼
+阶段 6: PDF 阅读器文本提取
+  阅读器遇到 /ActualText → 使用 "fi"，忽略 ToUnicode
+  最终结果: "fi" ✓
 ```
 
-**Cluster 值的含义**：
-- HarfBuzz 的 cluster 值表示字形对应的原始文本起始偏移
-- 对于连字，两个字形被合并为一个，cluster 值为第一个字符的偏移（0）
-- 没有第二个 glyph，因为 `f` 和 `i` 被合并了
+---
 
-### 7.2 Typst 中对连字 glyph 的文本范围计算
+### 7.2 阶段 1-2: HarfBuzz Cluster 的信息丢失与 Typst Range 扩展
 
-[shape_segment](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1050-L1086) 中，Typst 通过查找相邻 glyph 的 cluster 来计算文本范围：
+[shaping.rs L1026-L1029](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1026-L1029)：
 
 ```rust
-// 对于连字 "fi" (glyph_id=42, cluster=0)：
-let start = base + cluster;  // 0 + 0 = 0
-let mut k = i;  // k = 0
-let step: isize = if ltr { 1 } else { -1 };  // step = 1
-
-let end = loop {
-    let Some((next, next_info)) = k.checked_add_signed(step)
-        .and_then(|n| infos.get(n).map(|info| (n, info)))
-    else {
-        break base + text.len();  // 没有下一个 glyph，end = 0 + 2 = 2
-    };
-    // ...
-};
-
-// 结果：range = 0..2
+let buffer = rustybuzz::shape_with_plan(font.rusty(), &plan, buffer);
+let infos = buffer.glyph_infos();
+let pos = buffer.glyph_positions();
 ```
 
-**代码中的示例**（注释非常有启发性）：
+**HarfBuzz cluster 的含义和局限**：
+
+| 场景 | 输入文本 | HarfBuzz 输出 (glyph_id, cluster) |
+|------|----------|----------------------------------|
+| 独立字符 | `"fi"`（无连字） | `[(42, 0), (43, 1)]` |
+| **连字 "fi"** | `"fi"`（有连字） | `[(42, 0)]` ← **一个 glyph 对应两个字符** |
+| 阿拉伯语合字 | `"ال"` | `[(100, 0)]` ← 两个阿拉伯字母合并 |
+| 重音组合 | `"A\u{0300}"`（À） | `[(70, 0)]` 或 `[(65, 0), (768, 0)]` ← 可能 1 个或 2 个 glyph |
+
+**问题**：cluster 只记录了**起始偏移**，丢失了"这个 glyph 对应几个原始字符"的信息。如果只有 cluster=0，你无法区分这个 glyph 是只代表 `'f'` 还是代表整个 `"fi"`。
+
+---
+
+**Range 扩展算法** ([shaping.rs L1050-L1086](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1050-L1086))：
+
+代码注释直接说明了设计意图：
+
 ```rust
-// Assume we have the following sequence of (glyph_id, cluster):
-// [(120, 0), (80, 0), (3, 3), (755, 4), (69, 4), ...]
-//
-// We then want the sequence of (glyph_id, text_range) to look as follows:
-// [(120, 0..3), (80, 0..3), (3, 3..4), (755, 4..13), (69, 4..13), ...]
-//
 // Each glyph in the same cluster should be assigned the full text range.
 // This is necessary because only this way krilla can properly assign
 // `ActualText` attributes in complex shaping scenarios.
 ```
 
-### 7.3 ToUnicode CMap 与 ActualText 的分工
-
-PDF 文本提取依赖两个互补的机制：
-
-| 机制 | 用途 | 适用场景 | 示例 |
-|------|------|----------|------|
-| **ToUnicode CMap** | glyph_id → Unicode 字符的映射表 | 简单的 1:1 映射 | glyph 42 → U+0066 ('f') |
-| **ActualText** | PDF 字符串属性，标注一段内容的原始文本 | 复杂的多对多映射 | 连字 "fi"、合字、阿拉伯语形变 |
-
-#### ToUnicode CMap 的局限
-
-ToUnicode CMap 本质上是一个简单的映射表：
+算法示意：
 ```
-42 beginbfchar
-<002A> <0066>  // glyph 42 → 'f'
-endbfchar
+给定 glyph_infos 序列（按 visual order，LTR）:
+  index:       0      1      2      3      4
+  glyph_id:   120    80      3    755    69
+  cluster:     0      0      3      4      4
+
+对每个 glyph，查找下一个不同 cluster 的位置作为 end：
+
+  glyph 0 (cluster=0): 下一个不同 cluster 在 index=2 → end = cluster[2] = 3 → range = 0..3
+  glyph 1 (cluster=0): 同上 → range = 0..3
+  glyph 2 (cluster=3): 下一个不同 cluster 在 index=3 → end = cluster[3] = 4 → range = 3..4
+  glyph 3 (cluster=4): 下一个不同 cluster 在 index=5（超出）→ end = text.len() → range = 4..x
+  glyph 4 (cluster=4): 同上 → range = 4..x
 ```
 
-对于连字 "fi"，如果只有 ToUnicode 映射：
-- glyph 42 → 只能映射到一个 Unicode 字符（如 `f`）
-- 丢失了 `i` 的信息
-- 文本提取结果会是 `"f"` 而不是 `"fi"`
+连字 "fi" 的特殊情况：
+- 只有一个 glyph (cluster=0)
+- 查找下一个不同 cluster → 已到末尾
+- end = base + text.len() = 0 + 2 = 2
+- 结果: range = 0..2 ✓
 
-#### ActualText 的作用
+### 7.3 阶段 3: TextItem.text 的来源——保留原始文本
 
-ActualText 是 PDF 内容流中的一个标记：
-```
-/Span <</ActualText (fi)>> BDC
-... 绘制连字 glyph ...
-EMC
-```
-
-当 PDF 阅读器遇到这个标记时，它会使用括号中的 `"fi"` 作为文本提取结果，而不是尝试从 glyph_id 映射。
-
-### 7.4 Krilla 中的具体分工
-
-当 Typst 调用 [surface.draw_glyphs()](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L50-L57) 时：
+[ShapedText.build](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L437-L446)：
 
 ```rust
-surface.draw_glyphs(
-    krilla::geom::Point::from_xy(0.0, 0.0),
-    glyphs,         // &[PdfGlyph]，每个实现了 krilla::text::Glyph trait
-    font.clone(),
-    text,           // &str = "fi"
-    size.to_f32(),
-    false,
-);
+// 伪代码
+fn build(glyphs: &[ShapedGlyph], original_text: &str) -> Vec<TextItem> {
+    let mut items = vec![];
+    for group in glyphs.group_by_key(|g| g.font.clone()) {
+        let font = group[0].font.clone();
+        let start = group.first().unwrap().range.start;
+        let end = group.last().unwrap().range.end;
+        let glyphs_out: Vec<Glyph> = group.iter()
+            .map(|g| Glyph { id: g.glyph_id, range: g.range.clone(), ... })
+            .collect();
+        items.push(TextItem {
+            font,
+            glyphs: glyphs_out,
+            text: original_text[start..end].into(),  // ← 关键：从原始文本切片！
+        });
+    }
+    items
+}
 ```
 
-Krilla 内部的处理：
+**设计要点**：
+- `TextItem.text` **不是**从 glyph 反向推导出来的
+- `TextItem.text` **直接来自原始输入文本的切片**
+- 这意味着即使字体回退把一段文本拆成了多个 TextItem，每个 TextItem 的 text 仍然是原始文本的正确子串
+- 连字、合字、重音等复杂字形的原始文本信息被完整保留在 `text` 字段中
 
-1. **遍历 glyphs**，对每个 glyph：
-   ```rust
-   let range = glyph.text_range();  // 0..2 （对于 "fi" 连字）
-   let unicode_text = &text[range]; // "fi"
-   let gid = glyph.glyph_id();       // 42
-   ```
+### 7.4 阶段 4-5: Krilla 中的分工决策
 
-2. **构建 ToUnicode CMap**（子集化字体的一部分）：
-   - 如果 `unicode_text` 是单个字符 → 直接映射 `gid → unicode_text`
-   - 如果 `unicode_text` 是多个字符 → 映射到第一个字符（不完整）
+当 Typst 调用 [surface.draw_glyphs()](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L50-L57) 时，Krilla 收到：
+- `glyphs`: `&[PdfGlyph]`，每个实现了 `krilla::text::Glyph` trait
+- `text`: `&str`，即 `TextItem.text`（原始文本切片）
 
-3. **决定是否需要 ActualText**：
-   - 如果 `unicode_text.len() > 1` → 需要 ActualText（连字、合字等）
-   - 如果同 cluster 有多个 glyph → 需要 ActualText（多字形表示一个字符）
-   - 否则 → 只需要 ToUnicode
+[PdfGlyph](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L106-L148) 的两个关键方法：
 
-4. **生成 PDF 内容流**：
-   ```
-   /Span <</ActualText (fi)>> BDC
-   [42] TJ  % 绘制 glyph 42
-   EMC
-   ```
+```rust
+impl krilla::text::Glyph for PdfGlyph {
+    fn glyph_id(&self) -> GlyphId {
+        GlyphId::new(self.0.id as u32)
+    }
 
-### 7.5 连字 "fi" 的完整数据流
+    fn text_range(&self) -> Range<usize> {
+        self.0.range.start as usize..self.0.range.end as usize
+    }
+}
+```
+
+**Krilla 的决策流程**：
 
 ```
-原始文本: "fi"
-    │
-    ▼
-shape_segment:
-  ├─ rustybuzz.shape() → glyph_id=42, cluster=0
-  ├─ 计算 range: 0..2（下一个 cluster 是 2，或文本结尾）
-  └─ ShapedGlyph { glyph_id: 42, range: 0..2, ... }
-    │
-    ▼
-ShapedText.build():
-  ├─ group_by_key(font): 同字体字形分组
-  ├─ 计算 group 的总 range: 0..2
-  ├─ 构建 Glyph { id: 42, range: 0..2 }
-  └─ TextItem { font, glyphs: [Glyph { id: 42, range: 0..2 }], text: "fi" }
-    │
-    ▼
-handle_text():
-  ├─ convert_font(font) → krilla_font
-  ├─ glyphs: &[PdfGlyph] = wrap_slice(&[Glyph { id: 42, range: 0..2 }])
-  │    ├─ glyph_id() → GlyphId::new(42)
-  │    └─ text_range() → 0..2
-  └─ surface.draw_glyphs(glyphs, krilla_font, "fi", 12.0)
-    │
-    ▼
-krilla 内部:
-  ├─ 记录 glyph_id=42 到子集化集合
-  ├─ text[0..2] = "fi" → 长度 > 1
-  ├─ 需要 ActualText！
-  ├─ 生成 ToUnicode: 42 → "f"（第一个字符）
-  └─ 生成内容流:
-     /Span <</ActualText (fi)>> BDC
-     [42] TJ
-     EMC
-    │
-    ▼
-PDF 子集化字体嵌入:
-  ├─ 字体子集只包含 glyph 42
-  ├─ ToUnicode CMap: 42 → U+0066
-  └─ ActualText 确保文本提取得到 "fi"
+对每个 glyph:
+  range = glyph.text_range()       // 如 0..2
+  substr = text[range]              // 如 "fi"
+  gid = glyph.glyph_id()            // 如 42
+
+  步骤 A: 构建 ToUnicode CMap（子集化字体嵌入）
+    if substr.chars().count() == 1:
+      ToUnicode[gid] = substr       // 简单 1:1 映射
+    else:
+      ToUnicode[gid] = substr.chars().next()  // 只取第一个字符（不完整！）
+      // 例如 "fi" → ToUnicode[42] = "f"（只保留了 'f'）
+
+  步骤 B: 决定是否生成 ActualText
+    if substr.len() > 1:
+      → 需要 ActualText！（连字、合字、多字形表示一字符等）
+      → 在 PDF 内容流中包裹:
+           /Span <</ActualText (fi)>> BDC
+           [42] TJ
+           EMC
+    else if 同 cluster 有多个 glyph（多 glyph 对应一字符）:
+      → 也需要 ActualText
+    else:
+      → 只需要 ToUnicode，不需要 ActualText
 ```
+
+### 7.5 ToUnicode 与 ActualText 的精确分工
+
+| 维度 | ToUnicode CMap | ActualText |
+|------|---------------|------------|
+| **所在位置** | 嵌入字体的 CMap 字典（PDF Font 对象内部） | PDF 内容流中的 Marked Content 标记 |
+| **映射关系** | glyph_id → 单个 Unicode 字符 | 一段内容 → 任意 Unicode 字符串 |
+| **适用场景** | 简单的 1 个 glyph → 1 个字符 | 复杂的 n 个 glyph → m 个字符（n,m ≥ 1） |
+| **"fi" 连字映射** | glyph 42 → U+0066（只映射 `'f'`，丢失 `'i'`） | `/ActualText (fi)` → 完整 `"fi"` |
+| **触发条件** | 所有使用的 glyph 都有 entry | `text[text_range].len() > 1`，或多 glyph 共享同一 cluster |
+| **阅读器优先级** | 低（没有 ActualText 时才使用） | 高（有 ActualText 时优先使用） |
+| **PDF/A 合规** | 必需（字体子集必须包含） | 推荐（确保可访问性和文本提取正确性） |
+
+**为什么需要两者配合？**
+- ToUnicode 是 PDF 字体规范的**必需组成部分**——没有 ToUnicode，字体子集无法正常工作
+- 但 ToUnicode 只能做 1:1 映射，对连字（1 glyph → 2 chars）无能为力
+- ActualText 是 PDF Marked Content 的**补救机制**——专门解决 ToUnicode 覆盖不到的多对多映射
+- 两者配合：ToUnicode 提供基础映射，ActualText 修复复杂场景
 
 ### 7.6 回退场景下的连字处理
 
-如果字体回退发生在连字的中间，情况会更复杂。例如 `"fi"` 在字体 A 中不是连字，但在字体 B 中是：
+如果字体回退发生在连字的边界，整条链路仍然能正确工作：
 
 ```
-文本: "fi"，字体列表: [字体A, 字体B]
+文本: "fi"，字体列表: [字体A（不支持 fi 连字）, 字体B（支持 fi 连字）]
 
-shape_segment("fi", [A, B]):
-  ├─ get_font_and_covers() → 字体A (covers=None), push(A), used=[A]
-  ├─ rustybuzz.shape(A, "fi") → f(glyph_id=42, cluster=0), i(glyph_id=43, cluster=1)
-  │     两个独立字形，没有连字
-  ├─ 假设 f 是 tofu (glyph_id=0)
-  │
-  ├─ 找到 tofu 序列 [0..2]（两个都在连续 tofu？）
-  ├─ 递归 shape_segment("fi", [A, B])
-  │     ├─ get_font_and_covers():
-  │     │   ├─ A: used.contains(A) → true → 跳过
-  │     │   └─ B: covers=None → push(B), used=[A, B]
-  │     │
-  │     ├─ rustybuzz.shape(B, "fi") → fi(glyph_id=100, cluster=0)
-  │     │     一个连字字形！
-  │     │
-  │     ├─ 计算 range: 0..2（因为是最后一个 glyph）
-  │     ├─ 添加 ShapedGlyph { glyph_id=100, range: 0..2 }
-  │     └─ used.pop() → used=[A]
-  │
-  └─ used.pop() → used=[]
+═════════════════════════════════════════════════
+第 1 层 shape_segment("fi", [A, B])
+═════════════════════════════════════════════════
+  get_font_and_covers() → 选中字体A，push(A), used=[A]
+  HarfBuzz.shape(A, "fi") → 没有连字！
+    输出: f(glyph_id=0, cluster=0), i(glyph_id=43, cluster=1)
+                          ↑
+                     tofu（字体A缺 f 的字形）
 
-结果：
-  TextItem { font: B, glyphs: [Glyph { id: 100, range: 0..2 }], text: "fi" }
-  → 连字正常，文本提取正确
+  找到 tofu 序列 [0..1]（只有 f 是 tofu）
+  递归调用 shape_segment("f", [A, B].clone())
+
+═════════════════════════════════════════════════
+第 2 层 shape_segment("f", cloned=[B])   （A 已消耗）
+═════════════════════════════════════════════════
+  get_font_and_covers():
+    A 在 used 中 → 跳过
+    B: covers=None → push(B), used=[A, B]
+  HarfBuzz.shape(B, "f") → glyph_id=100, cluster=0
+  range: 0..1（只有一个字符）
+  添加 ShapedGlyph { glyph_id: 100, range: 0..1 }
+  pop → used=[A]
+
+═════════════════════════════════════════════════
+回到第 1 层继续处理
+═════════════════════════════════════════════════
+  i(glyph_id=43, cluster=1): 正常 → 添加
+  pop → used=[]
+
+最终结果（两个独立的 TextItem）:
+  TextItem { font: B, glyphs: [Glyph { id: 100, range: 0..1 }], text: "f" }
+  TextItem { font: A, glyphs: [Glyph { id: 43, range: 1..2 }], text: "i" }
+
+PDF 输出:
+  字体B: glyph 100 → ToUnicode → "f"（不需要 ActualText，1:1）
+  字体A: glyph 43 → ToUnicode → "i"（不需要 ActualText，1:1）
+  文本提取结果: "f" + "i" = "fi" ✓
 ```
 
-### 7.7 分工总结
+**关键点**：即使连字因为回退被拆成了两个独立字形，`TextItem.text` 的切片和 `PdfGlyph.text_range` 的匹配保证了文本提取的正确性。
 
-| 组件 | 职责 | 位置 |
-|------|------|------|
-| **HarfBuzz cluster** | 标记 glyph 对应的原始文本起始位置 | shaping 阶段 |
-| **Typst range 计算** | 扩展 cluster 为完整文本范围（考虑同 cluster 的多 glyph） | [shape_segment](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1068-L1086) |
-| **TextItem.text** | 保存完整原始文本 | [ShapedText.build](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L437-L446) |
-| **PdfGlyph::text_range** | 告诉 krilla 每个 glyph 对应 text 的哪个子串 | [PdfGlyph::text_range](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L117-L119) |
-| **ToUnicode CMap** | 基础的 glyph_id → Unicode 映射 | krilla 子集化阶段 |
-| **ActualText** | 复杂映射（连字、合字）的补救标记 | krilla 内容流生成阶段 |
+### 7.7 分工总结与各阶段职责
+
+| 阶段 | 组件 | 职责 | 关键代码 |
+|------|------|------|---------|
+| **1. Shaping** | HarfBuzz cluster | 标记每个 glyph 对应的原始文本**起始偏移**（丢失长度信息） | HarfBuzz 内部 |
+| **2. Range 扩展** | Typst shape_segment | 查找下一个不同 cluster 的位置，扩展为完整 `range` | [shape_segment](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1068-L1086) |
+| **3. TextItem 构建** | ShapedText.build | 从**原始输入文本**切片得到 `TextItem.text`，不依赖 glyph 反向推导 | [ShapedText.build](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L437-L446) |
+| **4. PDF Glyph 转换** | PdfGlyph trait | 通过 `glyph_id()` 和 `text_range()` 暴露字形 id 和原始文本范围 | [PdfGlyph](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L106-L148) |
+| **5. Krilla 决策** | Krilla | 判断使用 ToUnicode 还是 ActualText，生成 PDF 内容流 | Krilla 内部 |
+| **6. 字体子集化** | Krilla subset | 嵌入字体子集 + ToUnicode CMap，确保 PDF 自包含 | Krilla 内部 |
+
+**整条链路的核心设计思想**：
+- **不丢失原始文本**：从 shaping 到 PDF 输出，原始文本信息始终通过 `range + text` 的组合传递
+- **gid 与 Unicode 解耦**：glyph_id 只负责绘制，文本提取完全依赖 `text[range]` 切片
+- **分层容错**：ToUnicode 提供基础映射，ActualText 修复复杂场景，即使两者其一失效也能部分工作
 
 ---
 
