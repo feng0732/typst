@@ -81,14 +81,14 @@ pub trait FromValue<V = Value>: Sized + Reflect {
 注意：`FromValue` 的默认泛型参数是 `Value`，但 `Args` 的各方法约束是 `T: FromValue<Spanned<Value>>`。对于 `Spanned<Value>`，有两个关键的 impl（[cast.rs#L280-L291](crates/typst-library/src/foundations/cast.rs#L280-L291)）：
 
 ```rust
-// 1. T 本身可以 from Value 时，Spanned<Value> → T：丢弃 span
+// impl A: Self = 任意 T（只要 T: FromValue）
 impl<T: FromValue> FromValue<Spanned<Value>> for T {
     fn from_value(value: Spanned<Value>) -> HintedStrResult<Self> {
-        T::from_value(value.v)  // 解包，丢掉 span
+        T::from_value(value.v)
     }
 }
 
-// 2. T 本身可以 from Value 时，Spanned<Value> → Spanned<T>：保留 span
+// impl B: Self = Spanned<T>（T: FromValue）
 impl<T: FromValue> FromValue<Spanned<Value>> for Spanned<T> {
     fn from_value(value: Spanned<Value>) -> HintedStrResult<Self> {
         let span = value.span;
@@ -97,7 +97,12 @@ impl<T: FromValue> FromValue<Spanned<Value>> for Spanned<T> {
 }
 ```
 
-由于 Rust 的方法解析优先选特化 impl，当目标类型 `T` 本身就是 `Spanned<Inner>` 时走第二条路径，否则走第一条路径丢弃 span——span 已在调用方通过 `.at(span)` 附加到 `SourceDiagnostic` 中了。
+**选择哪个 impl 完全由调用方的目标类型决定，不涉及特化或方法解析优先级**。这两个 impl 的 Self 类型不同——impl A 的 Self 是任意 `T`，impl B 的 Self 是 `Spanned<T>`。Rust 的 trait 解析根据调用点的具体 Self 类型匹配对应的 impl：
+
+- 当调用方的 `T` 是 `f64`、`Content` 等普通类型时，Self = `f64`，只匹配 impl A（`T = f64`），impl B 要求 Self 是 `Spanned<..>` 不匹配。此时 span 被丢弃——因为 span 已在调用方通过 `.at(span)` 附加到 `SourceDiagnostic` 上。
+- 当调用方的 `T` 是 `Spanned<Inner>` 时，Self = `Spanned<Inner>`，impl B（`T = Inner`）比 impl A（`T = Spanned<Inner>`）对 Self 的约束更具体，Rust trait 解析选择 impl B。此时 span 被保留在返回的 `Spanned<Inner>` 中。
+
+决定性因素是**调用方在 `T: FromValue<Spanned<Value>>` 中填入的具体目标类型**：普通类型走 impl A 丢弃 span，`Spanned<..>` 类型走 impl B 保留 span。
 
 ### 2.4 CastInfo：转换信息描述
 
@@ -422,8 +427,9 @@ fn at(self, span: Span) -> SourceResult<T> {
 eat() 找到第一个位置参数 Value::Bool(true)
   ↓
 T::from_value(Spanned<Value>{ v: Value::Bool(true), span })
-  ↓ FromValue<Spanned<Value>> for f64 → f64::from_value(Value::Bool(true))
-  ↓ (解包 spanned，调用 f64::from_value(Value::Bool(true)))
+  ↓ 目标类型 T = f64（普通类型，非 Spanned<..>）
+  ↓ 匹配 impl A: FromValue<Spanned<Value>> for T（T = f64）
+  ↓ 内部调用 f64::from_value(Value::Bool(true))
   ↓
 primitive! 展开的 from_value:
   match Value::Bool(true) {
@@ -515,7 +521,7 @@ SourceDiagnostic::error(span, "expected float, found boolean")
 
 2. **eat 不预筛是故意的**：`eat()` 假设调用方已经知道下一个位置参数的预期类型，不需要跳过。如果类型不匹配，说明用户传错了参数，应该立即报错。
 
-3. **Spanned<Value> 的双层解包**：`Args` 中的值已经是 `Spanned<Value>`，传给 `T::from_value(value)` 时走 `FromValue<Spanned<Value>> for T` 解包为 `T::from_value(value.v)`。span 在调用方的 `.at(span)` 中被使用，不参与 `from_value` 的转换逻辑。
+3. **Spanned<Value> 的 impl 选择由目标类型决定**：两个 `FromValue<Spanned<Value>>` impl 的 Self 类型不同（`for T` vs `for Spanned<T>`），Rust trait 解析根据调用方填入的具体目标类型匹配对应的 impl。普通类型走 `for T`（丢弃 span），`Spanned<..>` 类型走 `for Spanned<T>`（保留 span）。这不是特化，而是 Self 类型约束的自然结果。
 
 4. **HintedStrResult 的 At impl 保留提示**：普通的 `StrResult` 通过 `.at(span)` 会丢失提示，但 `from_value` 返回 `HintedStrResult`，其 `At` impl 会拆解 `HintedString` 的 vec，第一个做消息、其余做 hints，确保智能提示不丢失。
 
