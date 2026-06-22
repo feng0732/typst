@@ -29,7 +29,7 @@
 | 维度 | SVG 后端 (typst-svg) | HTML 后端 (typst-html) |
 |------|---------------------|----------------------|
 | **输入** | 布局完成的 `Frame` / `Page` | 语义内容树 `Content` + 样式链 |
-| **核心思路** | 将已布局结果逐像素翻译为 SVG 元素 | 通过 show rule 将语义元素映射为 HTML 标签 |
+| **核心思路** | 将已布局结果逐像素翻译为 SVG 元素 | 通过 show rule 将语义元素映射为 HTML 标签；未注册元素被忽略；只有用户显式 `#html.frame(...)` 才嵌入内联 SVG，无自动回退 |
 | **布局责任** | Typst 引擎完成全部布局 | 由浏览器 CSS 布局引擎负责 |
 | **输出粒度** | 单个 SVG 文档（单页/合并多页） | 完整 HTML 文档（含 DOM 树） |
 | **坐标系统** | 绝对坐标（pt 单位），精确到每个元素 | 文档流 + CSS 盒模型 |
@@ -207,11 +207,18 @@ HTML 后端内置 `SmartQuoter` 状态机（`convert.rs` 第 72-74 行构造）�
 - **硬帧 (FrameKind::Hard)**：强制生成 `<g>`，重置 `state.transform` 为 identity（第 336-347 行）
 - **裁剪路径 (clip)**：通过 `Deduplicator` 去重存储在 `<defs>`，`url(#c...)` 引用（第 354-359 行）
 
-### 3.2 HTML 后端：语义元素 + SVG 嵌入
+### 3.2 HTML 后端：语义元素 + 显式 FrameElem 触发内联 SVG
 
 **核心文件**：`crates/typst-html/src/rules.rs`（show rule 映射）+ `crates/typst-html/src/dom.rs`（`HtmlFrame` 定义）
 
-核心策略：**混合模式**——能用语义标签表示的用 HTML 原生标签，其余通过 `FrameElem` 嵌入精确 SVG。
+核心策略：**双路径无自动回退**——有 show rule 的转 HTML 标签；无 show rule 的发出警告后跳过；只有用户显式用 `#html.frame(...)` 包裹内容时才嵌入内联 SVG。
+
+> **关键区分**：`handle()`（`convert.rs` 第 93-163 行）是一个 if-else if-else 链：
+> 1. `TagElem` / `HtmlElem` / `SpaceElem` / `TextElem` / `LinebreakElem` 等基础语义元素 → 直接生成 DOM 节点
+> 2. `FrameElem`（即用户写 `#html.frame(...)`）→ 走 Paged 布局 → 嵌入内联 SVG（第 140-154 行）
+> 3. **所有其他元素** → else 分支，发出警告 `"{} was ignored during HTML export"` 并跳过（第 155-161 行）
+>
+> 因此：**HTML 后端没有任何机制会自动把不支持的元素转成 SVG**。`LineElem` 被忽略、含渐变内容被静默丢弃，都不会自动回退到 `html.frame`。
 
 #### 1. 语义化图形元素（Show Rule 映射）
 
@@ -229,9 +236,12 @@ HTML 后端内置 `SmartQuoter` 状态机（`convert.rs` 第 72-74 行构造）�
 
 **表格语义化**：`TABLE_RULE`（第 573-687 行）调用 `show_cellgrid()`（第 578-687 行）将 `CellGrid` 拆分为 `<thead>`/`<tbody>`/`<tfoot>`，处理 colspan/rowspan 以及 header 行在 body 中间出现的复杂情况。
 
-#### 2. FrameElem：精确布局内容的 SVG 嵌入
+#### 2. FrameElem：用户显式触发的 SVG 嵌入桥接
 
-对于无法用 HTML 语义标签表示、需要精确像素控制的内容（如图表、绘图），HTML 后端提供 `FrameElem`（`lib.rs` 第 137-141 行）桥接到 SVG 后端。
+当用户在 Typst 源码中显式写 `#html.frame(content)` 时（`lib.rs` 第 126-141 行 `FrameElem` 定义，`module()` 第 38 行注册为 `html.frame` 函数），`convert.rs` 第 140-154 行的 `FrameElem` 分支才会被触发，此时 HTML 后端才会：
+1. 切换到 `Target::Paged` 目标重新布局（绕过 HTML 语义布局）
+2. 调用 Typst 布局引擎得到精确 `Frame`
+3. 包装为 `HtmlFrame`，在最终编码时由 `write_frame()`（`encode.rs` 第 391-401 行）调用 `typst_svg::svg_in_html()` 生成内联 SVG 插入 HTML
 
 转换流程（`convert.rs` 第 140-154 行）：
 
@@ -258,17 +268,22 @@ converter.push(node);
 
 | 特性 | SVG 后端 | HTML 后端 | 差异根源代码 |
 |------|---------|----------|------------|
-| 图形表示 | 原生 SVG 矢量路径 | 混合：HTML 语义标签 + 内联 SVG | SVG: `<path>` 统一表示 `shape.rs` 第 19 行；HTML: show rule 注册 `rules.rs` 第 42-86 行 + `FrameElem` 桥接 `convert.rs` 第 140-154 行 |
-| 几何精度 | 精确 pt 级坐标 | 浏览器像素级渲染 | SVG: `SvgTransform` 矩阵 `write.rs` 第 206-241 行；HTML: 浏览器 CSS box model |
+| 图形表示 | 原生 SVG 矢量路径 | 混合：HTML 语义标签 + **显式** `html.frame()` 触发的内联 SVG | SVG: `<path>` 统一表示 `shape.rs` 第 19 行；HTML: show rule 注册 `rules.rs` 第 42-86 行 + `FrameElem` 分支 `convert.rs` 第 140-154 行（仅用户显式包裹时触发） |
+| 几何精度 | 精确 pt 级坐标 | 浏览器像素级渲染；内联 SVG 部分可精确到 pt | SVG: `SvgTransform` 矩阵 `write.rs` 第 206-241 行；HTML: 浏览器 CSS box model；`html.frame()` 内联 SVG 由 SVG 后端精确渲染 |
 | 表格 | 用路径绘制线条和文字 | 原生 `<table>`，语义化 | SVG: 无特殊处理，走 Frame→path；HTML: `TABLE_RULE` 拆成 `<thead>`/`<tbody>` `rules.rs` 第 573-687 行 |
 | 图片 | `<image>` 嵌入 | `<img>` Data URL | SVG: `image.rs` 模块；HTML: `IMAGE_RULE` 第 778-779 行 `to_base64_url()` |
-| 矩形/圆形 | 统一转为 `<path>` | 需通过 FrameElem 嵌入 SVG | SVG: `Geometry::Rect → SvgPathBuilder::rect()` `path.rs` 第 67-73 行；HTML: 无对应原生标签 |
-| 几何直线 | `Geometry::Line` → `<path>` | 无 show rule，导出时被忽略 | SVG: `shape.rs` 第 181 行；HTML: `convert.rs` 第 155-161 行 else 分支（发出警告并跳过） |
-| 裁剪遮罩 | 原生 `clip-path` 支持 | 依赖 CSS clip-path 或 SVG 嵌入 | SVG: `clip_paths` Deduplicator `lib.rs` 第 354-359 行；HTML: 无专门代码 |
+| 矩形/圆形 | 统一转为 `<path>` | **默认被忽略**，需用户显式 `html.frame(...)` 包裹后嵌入 SVG | SVG: `Geometry::Rect → SvgPathBuilder::rect()` `path.rs` 第 67-73 行；HTML: 无对应 show rule → `convert.rs` 第 155-161 行 else 分支警告跳过 |
+| 几何直线 | `Geometry::Line` → `<path>` | **默认被忽略**，需用户显式 `html.frame(...)` 包裹后嵌入 SVG | SVG: `shape.rs` 第 181 行；HTML: 无 LineElem show rule → `convert.rs` 第 155-161 行 else 分支（"line was ignored during HTML export"警告） |
+| 裁剪遮罩 | 原生 `clip-path` 支持 | **默认被忽略**；可通过 `html.frame()` 包裹获得 SVG 的 clip-path | SVG: `clip_paths` Deduplicator `lib.rs` 第 354-359 行；HTML: 无裁剪相关 show rule |
 | 布局控制 | 完全由 Typst 控制 | 浏览器盒模型 + 文档流 | SVG: 消费 `Frame` 绝对坐标 `lib.rs` 第 314-315 行 `pre_translate`；HTML: 文档流语义标签 |
 | 可访问性 | 弱（纯图形） | 强（语义标签 + ARIA） | SVG: 仅 `data-typst-label` `lib.rs` 第 350-352 行；HTML: `HEADING_RULE` 用 `<h2>`/ARIA `rules.rs` 第 235-260 行 |
 
-**差异核心**：SVG 后端是**统一抽象**——一切皆路径；HTML 后端是**分层策略**——能用语义的用语义（表格、图片、分割线），不能用的退回 FrameElem 走 SVG。这也解释了为什么 HTML 文件更小、更可访问，但几何一致性更弱。
+**差异核心**：SVG 后端是**统一抽象**——一切皆路径；HTML 后端是**两条明确路径**，没有自动回退：
+- **路径 1（语义转换）**：注册了 show rule 的元素（`DividerElem`→`<hr>`、`TableElem`→`<table>`、`ImageElem`→`<img>` 等约 40 个）直接转成 HTML 标签，由浏览器布局
+- **路径 2（用户主动回退）**：用户在 Typst 代码中显式写 `#html.frame(content)` 时（`lib.rs` 第 126-141 行 `FrameElem` 定义），`convert.rs` 第 140-154 行走 Paged 布局 → 调 `typst_svg::svg_in_html()` 嵌入内联 SVG
+- **路径 3（被忽略）**：未注册 show rule 且未被显式 `html.frame()` 包裹的元素（如 `LineElem`、`RectElem`、含渐变的文字等）走 `convert.rs` 第 155-161 行 else 分支，发出警告 `"X was ignored during HTML export"` 后直接跳过，不会自动嵌入 SVG
+
+这也解释了为什么 HTML 文件更小、更可访问，但对无 show rule 的几何元素会静默丢失。
 
 ---
 
@@ -388,7 +403,7 @@ SVG 1.1 无原生锥形渐变，`write_gradients()` 的 `Gradient::Conic` 分支
 |------|---------|----------|------------|
 | 样式载体 | SVG 元素属性（fill/stroke 等） | CSS 属性（内联 style） | SVG: `write_fill/write_stroke` `paint.rs` 32-57 行 / `shape.rs` 128-173 行；HTML: `resolve_inline_styles()` `css/resolve.rs` 11-37 行 |
 | 填充 | `fill` 属性 | 不支持渐变/图案填充；纯色仅有限支持 | SVG: Paint→fill 三路全支持 `paint.rs` 40-52 行；HTML: `ToCss for Paint` 仅 `Solid` 支持，`Gradient`/`Tiling` 调用 `w.fail()` 丢弃 `css/encode.rs` 第 386-394 行 |
-| 描边 | `stroke-*` 系列 7 个属性 | 不支持；需通过 FrameElem 回退 SVG | SVG: `shape.rs` 135-172 行 完整描边族；HTML: 无描边 show rule |
+| 描边 | `stroke-*` 系列 7 个属性 | **不支持**，默认被忽略；需用户显式 `html.frame()` 包裹后由 SVG 后端渲染 | SVG: `shape.rs` 135-172 行 完整描边族；HTML: 无描边 show rule，含描边的几何元素走 else 分支被忽略 |
 | 渐变 | `<linearGradient>/<radialGradient>/<pattern>` + url() | **不支持**，CSS 编码直接 fail 并丢弃 | SVG: `push_gradient()` 两级去重 `paint.rs` 66-85 行；HTML: `Paint::Gradient(_) => w.fail("gradient")` `css/encode.rs` 第 390 行，属性被静默忽略 |
 | 锥形渐变 | 360 段扇形模拟 | **不支持**（同渐变，CSS 编码 fail） | SVG: `paint.rs` 160-236 行 Conic 分支；HTML: `Paint::Gradient` 统一 fail，不区分锥形/线性/径向 |
 | 变换 | `transform` 属性（智能选择 matrix/scale/translate） | CSS `transform` 属性 | SVG: `SvgTransform` `write.rs` 206-241 行 智能格式选择；HTML: 通过 `display` 和文档流自然布局 |
@@ -397,7 +412,7 @@ SVG 1.1 无原生锥形渐变，`write_gradients()` 的 `Gradient::Conic` 分支
 | 字体样式 | 字形层面处理（路径已固化大小、粗细、形状） | **大部分未支持**，仅 `font-variant-caps` 和 `text-decoration` | SVG: 字形路径已固化大小 `text.rs` 67 行预缩放；HTML: `TextElem::fill`（文字颜色）尚未支持 `rules.rs` 第 759 行注释 "temporary workaround until `TextElem::fill` is supported"；`TextElem::size` 仅用于 `HtmlFrame.text_size` 缩放 SVG（`dom.rs` 第 528 行），不输出 CSS `font-size`；唯一输出的字体 CSS 为 `font-variant-caps`（`SMALLCAPS_RULE` `rules.rs` 第 718-724 行）和 `text-decoration`（`UNDERLINE_RULE`/`OVERLINE_RULE`） |
 | 可覆盖性 | 难（属性写死在 SVG） | 易（用户 CSS 可覆盖） | SVG: 属性值硬编码；HTML: class 标记 + CSS 级联优先级 |
 
-**差异核心**：SVG 后端的样式目标是**精确还原**——属性写死、两级去重优化文件体积、锥形渐变手动模拟。HTML 后端的样式能力**远比 SVG 有限**：渐变和图案填充在 CSS 编码层直接 fail 丢弃（`css/encode.rs` 第 390-391 行）；描边无对应 show rule；字体颜色/大小/粗细/族系均未输出 CSS 属性（`TextElem::fill` 尚未支持，`rules.rs` 第 759 行有明确注释）。HTML 后端目前只支持纯色填充、`font-variant-caps`、`text-decoration` 等有限样式，其余需用户通过 FrameElem 手动回退到 SVG 后端渲染。
+**差异核心**：SVG 后端的样式目标是**精确还原**——属性写死、两级去重优化文件体积、锥形渐变手动模拟。HTML 后端的样式能力**远比 SVG 有限**：渐变和图案填充在 CSS 编码层直接 fail 丢弃（`css/encode.rs` 第 390-391 行）；描边无对应 show rule；字体颜色/大小/粗细/族系均未输出 CSS 属性（`TextElem::fill` 尚未支持，`rules.rs` 第 759 行有明确注释）。HTML 后端目前只支持纯色填充、`font-variant-caps`、`text-decoration` 等有限样式。**含渐变、描边、几何图形的内容不会被 HTML 后端自动降级为 SVG**——必须用户显式使用 `#html.frame(...)` 包裹（`convert.rs` 第 140-154 行），否则会走 else 分支被静默忽略并发出警告。
 
 ---
 
@@ -521,14 +536,14 @@ HTML 后端内置大量 DPUB-ARIA 角色和语义标签：
 ### 设计哲学
 
 - **SVG 后端**：*所见即所得*。忠实还原 Typst 布局引擎的每一个像素，输出是自包含的矢量图像。输入是布局完成的 `Frame`，所有内容都转为 `<path>` 或嵌入图像，保证跨设备完全一致。
-- **HTML 后端**：*语义优先*。保留文档的结构和语义，利用浏览器的布局和渲染能力，兼顾可访问性和可扩展性。输入是语义 `Content` 树，能映射 HTML 标签的映射，不能映射的退回 `FrameElem` 嵌入 SVG。
+- **HTML 后端**：*语义优先 + 用户显式回退*。保留文档的结构和语义，利用浏览器的布局和渲染能力，兼顾可访问性和可扩展性。输入是语义 `Content` 树，有 show rule 的元素映射 HTML 标签；无 show rule 的元素发出警告后被**直接忽略**；仅当用户在源码中显式写 `#html.frame(...)` 时（`lib.rs` 第 126-141 行 `FrameElem` 定义），才会调 SVG 后端嵌入内联 SVG——**没有任何自动回退机制**。
 
 ### 三类导出差异的代码对应关系总结
 
 | 差异维度 | SVG 后端的选择 | 对应关键代码 | HTML 后端的选择 | 对应关键代码 |
 |---------|--------------|------------|--------------|------------|
 | **文本处理** | 字形转路径/图像，嵌入文档，保证一致性 | `crates/typst-svg/src/text.rs` 第 29-161 行 (`render_text`+`render_glyph`)；`RenderedGlyph` 第 16-23 行 | 直接输出文本节点，依赖浏览器字体，额外处理空白折叠 | `crates/typst-html/src/convert.rs` 第 252-334 行 (`handle_text`)；第 591-683 行 (`protect_spaces`+`pre_wrap`) |
-| **图形处理** | 一切几何统一为 `<path>`，绝对坐标精确绘制 | `crates/typst-svg/src/shape.rs` 第 13-48 行 (`render_shape`)；第 178-201 行 (`convert_geometry_to_path`) | 混合策略：语义标签（`<table>/<img>/<hr>`）+ FrameElem 回退内联 SVG；几何 `line` 等被忽略 | `crates/typst-html/src/rules.rs` 第 573-820 行 (TABLE/IMAGE/DIVIDER rules)；`crates/typst-html/src/convert.rs` 第 140-154 行 (`FrameElem` 分支)；第 155-161 行 (未注册元素→警告跳过) |
+| **图形处理** | 一切几何统一为 `<path>`，绝对坐标精确绘制 | `crates/typst-svg/src/shape.rs` 第 13-48 行 (`render_shape`)；第 178-201 行 (`convert_geometry_to_path`) | 三条独立路径无自动回退：show rule 转语义标签 / 用户显式 `#html.frame()` 嵌入内联 SVG / 其余元素被忽略 | `crates/typst-html/src/rules.rs` 第 573-820 行 (TABLE/IMAGE/DIVIDER rules)；`crates/typst-html/src/convert.rs` 第 140-154 行 (`FrameElem` 分支，需用户显式调用)；第 155-161 行 (未注册元素→警告跳过) |
 | **样式处理** | 属性式样式 + 两级渐变去重 + 锥形手动模拟，追求精确和体积 | `crates/typst-svg/src/paint.rs` 第 32-331 行 (`write_fill`+`push_gradient`+`write_gradients`)；`crates/typst-svg/src/shape.rs` 第 128-173 行 (`write_stroke`) | 样式能力有限：渐变/图案 fail 丢弃，字体样式大部分未支持，仅 `font-variant-caps`/`text-decoration` | `crates/typst-html/src/css/encode.rs` 第 386-394 行 (`Paint::Gradient/Tiling → w.fail()`)；`crates/typst-html/src/rules.rs` 第 759 行 (`TextElem::fill` 尚未支持注释)；`crates/typst-html/src/css/resolve.rs` 第 11-37 行 (`resolve_inline_styles`) |
 
 ### 适用场景
@@ -538,7 +553,7 @@ HTML 后端内置大量 DPUB-ARIA 角色和语义标签：
 | 打印 / 印刷 / 出版 | SVG / PDF | 精确控制，所见即所得，不依赖系统字体 |
 | 网页阅读 / 博客 | HTML | 响应式、可访问、可搜索，体积小 |
 | 技术文档 / 知识库 | HTML | 语义化、可锚点跳转、屏幕阅读器支持 |
-| 数据可视化 / 图表 | SVG（或 HTML + FrameElem） | 精确的图表像素级布局 |
+| 数据可视化 / 图表 | SVG（或 HTML + 用户显式 `#html.frame()` 包裹内容） | 精确的图表像素级布局，需用户主动调用 `html.frame` 才会嵌入 SVG |
 | 电子书 / 无障碍文档 | HTML | DPUB-ARIA 角色、屏幕阅读器友好 |
 | 跨平台一致性展示 | SVG | 字形内嵌，无需系统字体，所有设备相同 |
 
