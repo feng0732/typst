@@ -952,8 +952,11 @@ while !fits(header_height) {
 - 如果 header 包含 Rel 行，跳页后 `regions.full` 变化会导致 header 实际高度变化
 - 但跳页判断时使用的是旧的 header 高度，可能导致：
   - 多跳了不必要的页面
-  - 或者跳页不够，需要再次跳页
-- 最终实际布局时会重新测量，所以结果仍然正确，但换页位置可能不是最优
+  - 跳页不够，header 在当前页放不下
+  - 临界条件下的边界判断偏差
+- **⚠️ 修正之前的过度说法**："结果仍然正确" 仅在 header 组不可断且当前页至少能放下 header 的前提下成立
+- 如果实际高度显著大于预测量高度，且当前页剩余空间不足以容纳，**可能导致内容溢出**
+- 详细分析见 3.6 节
 
 #### 3.5.6 已知的 TODO 问题
 
@@ -971,6 +974,225 @@ while !fits(header_height) {
 - 普通布局的跳页循环中，Header 高度应该和 Footer 一样在每次跳页后重新模拟
 - 目前只有 Footer 重新模拟了，Header 没有
 - 这是一个已知的待改进点，但在大多数情况下影响不大，因为最终实际布局时会重新测量
+
+---
+
+### 3.6 普通重复表头的跳页影响深度分析
+
+本节深入分析三个关键机制之间的相互作用：
+1. **旧表头高度用于跳页判断**
+2. **表头组不可断**
+3. **实际布局不在组内递归换页**
+
+#### 3.6.1 三者关系的完整代码路径
+
+[`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L203-L352) 的完整流程如下：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 阶段 1: 预测量 - 使用旧 regions.full 模拟 header 高度     │
+└─────────────────────────────┬───────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────┐
+│ 阶段 2: 跳页判断循环                                      │
+│                                                          │
+│ L222: while unbreakable_rows_left == 0                   │
+│          && !fits(header_height)  ← 使用旧高度判断!      │
+│          && may_progress()                               │
+│ {                                                        │
+│     finish_region_internal() → 跳页                       │
+│     regions.full 可能变化！                               │
+│     ⚠️  Header 高度不更新！（TODO 问题）                   │
+│     footer_height 在循环结束后才更新                       │
+│ }                                                        │
+└─────────────────────────────┬───────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────┐
+│ 阶段 3: Footer 重算（如果跳过了区域）                     │
+│ L245-L256: simulate_footer() → 重新计算 footer 高度       │
+└─────────────────────────────┬───────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────┐
+│ 阶段 4: 表头组标记为不可断                                │
+│                                                          │
+│ L264-L267:                                               │
+│ // Group of headers is unbreakable.                      │
+│ // Thus, no risk of 'finish_region' being recursively   │
+│ // called from within 'layout_row'.                      │
+│ unbreakable_rows_left += header_rows + pending_rows;     │
+│                                                          │
+│ 关键设计：设置 unbreakable_rows_left > 0                 │
+└─────────────────────────────┬───────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────┐
+│ 阶段 5: 实际布局 header 行                                │
+│                                                          │
+│ for header in repeating_headers:                         │
+│     layout_header_rows() → 调用 layout_row_with_state()   │
+│         → layout_row_internal()                           │
+│                                                          │
+│ L435: 🔒  关键锁：                                       │
+│ if unbreakable_rows_left == 0                            │
+│     && is_full() && is_content_row                       │
+│ {                                                        │
+│     finish_region() → 只有 unbreakable_rows_left == 0    │
+│                        才会触发换页！                     │
+│ }                                                        │
+│                                                          │
+│ → 所以布局 header 期间不会换页！                          │
+└─────────────────────────────┬───────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────┐
+│ 阶段 6: 每行布局后递减计数器                              │
+│ L461: unbreakable_rows_left -= 1                        │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 3.6.2 设计意图分析
+
+**为什么使用旧高度判断 + 不可断组 + 不递归换页的组合？**
+
+| 机制 | 设计目的 | 代价 |
+|------|---------|------|
+| **旧高度预判断** | 避免在实际布局时才发现空间不够，导致需要回退 | 高度可能不准确 |
+| **表头组不可断** | 确保 header 完整出现在一页顶部，不被拆分 | 失去了布局期间换页的能力 |
+| **不递归换页** | 防止"header 放不下→换页→又要放 header→又放不下"的无限递归 | 一旦预判断错误，没有补救机会 |
+
+**三者的依赖关系**：
+- 如果没有"不可断组"标记，实际布局期间可能触发换页，导致递归调用 `layout_active_headers()`
+- 如果没有"旧高度预判断"，就无法预先确定 header 应该放在哪一页
+- 两个机制共同作用，确保了布局的终止性，但牺牲了一定的灵活性
+
+#### 3.6.3 修正"结果一定正确"的过度说法
+
+之前的说法 **"最终实际布局时会重新测量，所以结果仍然正确"** 是不准确的。
+
+**正确的边界条件分析**：
+
+实际布局时 header 会重新测量高度，但 **由于 `unbreakable_rows_left > 0`，即使测量发现高度超过了当前区域，也不会触发换页**。
+
+```rust
+// layout_row_internal() L435
+if self.unbreakable_rows_left == 0  // ← 布局 header 期间不为 0！
+    && self.regions.is_full()
+    && is_content_row
+{
+    self.finish_region(engine, false)?;  // ← 不会执行！
+}
+```
+
+**所以结果正确性取决于：**
+
+| 场景 | 结果 | 正确性 |
+|------|------|--------|
+| 实际高度 ≤ 预测量高度 | 当前页能放下 | ✅ 正确 |
+| 实际高度 > 预测量高度，但 ≤ 当前区域剩余空间 | 当前页能放下，只是占了更多空间 | ✅ 结果正确，但后续行可用空间减少 |
+| 实际高度 > 预测量高度，且 > 当前区域剩余空间 | **内容溢出** | ❌ 错误！ |
+
+**⚠️ 关键结论**：
+- ❌ **过度说法**："最终实际布局时会重新测量，所以结果仍然正确"
+- ✅ **正确说法**："如果预测量高度大于等于实际高度，或者实际高度虽然更大但仍能适应当前区域，结果是正确的。如果实际高度显著超过预测量且当前区域空间不足，**会发生内容溢出**。"
+
+#### 3.6.4 多跳页、溢出、边界偏差的触发条件
+
+##### 触发条件 1：Header 包含 Rel 行且 `regions.full` 变化
+
+```rust
+// simulate_unbreakable_row_group() L332
+Sizing::Rel(v) => v.resolve(self.styles).relative_to(regions.base().y),
+```
+
+- Rel 行的高度是相对于 `regions.base().y`（即 `regions.full`）解析的
+- 如果跳页前 `regions.full` 是 `inf`（如在 float 容器中），跳页后是有限值（如 A4 纸高度）
+- 预测量时使用 `inf` 解析，Rel 行高度为 `0pt`（因为 `x% of inf = 0`）
+- 实际布局时使用有限值解析，Rel 行高度为 `x% of page_height`
+- **预测量高度 < 实际高度**，可能导致溢出
+
+##### 触发条件 2：Footer 高度重算进一步压缩可用空间
+
+```rust
+// layout_active_headers() L251-L255
+self.regions.size.y += self.current.footer_height;  // 加回旧 footer 高度
+self.current.footer_height = simulate_footer(...);  // 重算，可能更大
+self.regions.size.y -= self.current.footer_height;  // 减去新 footer 高度
+```
+
+- 如果 footer 也包含 Rel 行，跳页后 footer 高度也会增加
+- 这进一步压缩了 header 可用的空间
+- 即使 header 本身高度没变化，也可能因为 footer 变大而放不下
+
+##### 触发条件 3：边界条件判断刚好处于临界点
+
+假设：
+- 预测量 header 高度 = 98pt
+- 当前区域剩余空间 = 100pt
+- 98pt ≤ 100pt → 不跳页
+- 实际 header 高度 = 101pt（因为包含 Rel 行）
+- 101pt > 100pt → **溢出**
+
+这是最容易出现问题的场景：预测量刚好满足，但实际差一点点。
+
+##### 触发条件 4：多跳不必要的页面
+
+反过来，如果预测量高度 > 实际高度：
+- 预测量 header 高度 = 120pt
+- 当前区域剩余空间 = 100pt
+- 120pt > 100pt → 跳页
+- 实际 header 高度 = 80pt
+- 80pt ≤ 100pt → **本来可以放在当前页，但多跳了一页**
+
+这虽然不会导致溢出，但会产生不必要的空白页。
+
+#### 3.6.5 不可断组设计的风险分析
+
+**`unbreakable_rows_left` 的双刃剑效应**：
+
+```rust
+// L264-L267 注释明确说明了设计意图
+// Group of headers is unbreakable.
+// Thus, no risk of 'finish_region' being recursively called from within 'layout_row'.
+```
+
+**优点**：
+- ✅ 防止无限递归（header 放不下→换页→放 header→又放不下→...）
+- ✅ 确保 header 完整性，不被换页拆分
+- ✅ 简化了状态管理，不需要处理部分布局的 header 回滚
+
+**风险**：
+- ❌ 一旦预判断错误，没有补救机制
+- ❌ 实际布局期间发现空间不够也不能换页，只能溢出
+- ❌ 没有回滚机制（header 行已经部分布局到 `lrows` 中）
+
+**与其他不可断组的区别**：
+- 普通不可断行组（内容行）：`check_for_unbreakable_rows()` 会先模拟整组高度，空间不够就换页
+- Header 不可断组：只模拟了 header 高度，但模拟时使用的 `regions.full` 可能已经变化
+- 关键区别：普通不可断组的模拟和布局使用相同的 `regions`，而 header 组的模拟（预测量）和布局可能使用不同的 `regions.full`
+
+#### 3.6.6 可能的改进方向
+
+基于代码中的 TODO 注释和上述分析，可能的改进包括：
+
+1. **在跳页循环中更新 header 高度**（TODO 已经指出）：
+   ```rust
+   while !fits(header_height) {
+       finish_region_internal();
+       header_height = simulate_header_height(new_regions);  // ← 添加这行
+       footer_height = simulate_footer(new_regions);         // ← 也更新 footer
+   }
+   ```
+
+2. **增加溢出检查和降级处理**：
+   - 实际布局 header 后检查是否溢出
+   - 如果溢出且可以换页，撤销 header 布局并换页重试
+
+3. **使用更保守的预测量**：
+   - 考虑到 `regions.full` 可能变化，预测量时使用最小可能的 `full` 值
+   - 或者同时模拟多个可能的 `full` 值，取最大高度
 
 ---
 
