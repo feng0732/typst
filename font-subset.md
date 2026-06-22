@@ -959,10 +959,19 @@ PDF 文本提取的正确性依赖一条完整的数据链路，任何一环出�
 阶段 5: Krilla draw_glyphs (typst-pdf/src/text.rs L50-L57)
   surface.draw_glyphs(glyphs, krilla_font, "fi", 12.0)
         │
-        ├─ 输入: glyphs=[PdfGlyph(42, 0..2)], text="fi"
-        ├─ 判定: text[0..2].len() = 2 > 1 → 需要 ActualText！
-        ├─ ToUnicode CMap: glyph_id=42 → "f"（只映射第一个字符）
-        └─ PDF 内容流:
+        ├─ Typst 传递给 Krilla 的数据（可验证）:
+        │   ├─ glyphs: [PdfGlyph { glyph_id=42, text_range=0..2 }]
+        │   └─ text: "fi" （完整原始文本）
+        │
+        ├─ Krilla 可通过 Typst 提供的 trait 方法获得:
+        │   ├─ glyph.glyph_id() → 42
+        │   └─ glyph.text_range() → 0..2
+        │
+        ├─ PDF 规范定义的分工（公开标准）:
+        │   ├─ ToUnicode CMap: glyph_id → Unicode（必须 1:1）
+        │   └─ ActualText: Marked Content → 任意 Unicode 字符串（可多对多）
+        │
+        └─ 最终 PDF 输出（可验证的结果）:
              /Span <</ActualText (fi)>> BDC
              [42] TJ
              EMC
@@ -1061,71 +1070,94 @@ fn build(glyphs: &[ShapedGlyph], original_text: &str) -> Vec<TextItem> {
 - 这意味着即使字体回退把一段文本拆成了多个 TextItem，每个 TextItem 的 text 仍然是原始文本的正确子串
 - 连字、合字、重音等复杂字形的原始文本信息被完整保留在 `text` 字段中
 
-### 7.4 阶段 4-5: Krilla 中的分工决策
+### 7.4 阶段 4-5: Typst 向 Krilla 提供的数据契约
 
-当 Typst 调用 [surface.draw_glyphs()](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L50-L57) 时，Krilla 收到：
-- `glyphs`: `&[PdfGlyph]`，每个实现了 `krilla::text::Glyph` trait
-- `text`: `&str`，即 `TextItem.text`（原始文本切片）
+当 Typst 调用 [surface.draw_glyphs()](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L50-L57) 时，传递的数据结构是**完全可验证**的：
 
-[PdfGlyph](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L106-L148) 的两个关键方法：
+```rust
+pub fn draw_glyphs(
+    &mut self,
+    origin: Point,
+    glyphs: &[Glyph],     // Glyph 是 trait，Typst 实现
+    font: Font,
+    text: &str,            // ← TextItem.text，原始文本切片
+    size: f32,
+    emulate_bold: bool,
+)
+```
+
+**Typst 传递的三个关键数据**：
+
+| 参数 | 来源 | 含义 |
+|------|------|------|
+| `glyphs` | `&[PdfGlyph]` | 每个 glyph 实现了 `krilla::text::Glyph` trait，暴露两个关键方法 |
+| `text` | `TextItem.text` | **完整原始文本**，从原始输入切片而来，不是从 glyph 反向推导 |
+| `font` | `convert_font()` 转换后的 Krilla 字体 | 字体数据本身 |
+
+[PdfGlyph](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L106-L148) 实现的 trait 方法（完全可验证）：
 
 ```rust
 impl krilla::text::Glyph for PdfGlyph {
     fn glyph_id(&self) -> GlyphId {
-        GlyphId::new(self.0.id as u32)
+        GlyphId::new(self.0.id as u32)      // 字形 id，供绘制和子集化
     }
 
     fn text_range(&self) -> Range<usize> {
-        self.0.range.start as usize..self.0.range.end as usize
+        self.0.range.start as usize..self.0.range.end as usize  // 对应原始文本的范围
     }
 }
 ```
 
-**Krilla 的决策流程**：
+---
 
-```
-对每个 glyph:
-  range = glyph.text_range()       // 如 0..2
-  substr = text[range]              // 如 "fi"
-  gid = glyph.glyph_id()            // 如 42
+**Typst 的设计意图（代码注释可验证）**：
 
-  步骤 A: 构建 ToUnicode CMap（子集化字体嵌入）
-    if substr.chars().count() == 1:
-      ToUnicode[gid] = substr       // 简单 1:1 映射
-    else:
-      ToUnicode[gid] = substr.chars().next()  // 只取第一个字符（不完整！）
-      // 例如 "fi" → ToUnicode[42] = "f"（只保留了 'f'）
+在 [shaping.rs L1059-L1062](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1059-L1062) 的注释明确说明了 Range 扩展的目的：
 
-  步骤 B: 决定是否生成 ActualText
-    if substr.len() > 1:
-      → 需要 ActualText！（连字、合字、多字形表示一字符等）
-      → 在 PDF 内容流中包裹:
-           /Span <</ActualText (fi)>> BDC
-           [42] TJ
-           EMC
-    else if 同 cluster 有多个 glyph（多 glyph 对应一字符）:
-      → 也需要 ActualText
-    else:
-      → 只需要 ToUnicode，不需要 ActualText
+```rust
+// Each glyph in the same cluster should be assigned the full text range.
+// This is necessary because only this way krilla can properly assign
+// `ActualText` attributes in complex shaping scenarios.
 ```
 
-### 7.5 ToUnicode 与 ActualText 的精确分工
+这表明：
+1. Typst 知道 Krilla 需要 `text_range` 来生成 `ActualText`
+2. Typst 特意设计了 Range 扩展算法来提供这个信息
+3. **但 Krilla 内部如何使用这个信息，Typst 代码中没有描述**
 
-| 维度 | ToUnicode CMap | ActualText |
-|------|---------------|------------|
-| **所在位置** | 嵌入字体的 CMap 字典（PDF Font 对象内部） | PDF 内容流中的 Marked Content 标记 |
-| **映射关系** | glyph_id → 单个 Unicode 字符 | 一段内容 → 任意 Unicode 字符串 |
-| **适用场景** | 简单的 1 个 glyph → 1 个字符 | 复杂的 n 个 glyph → m 个字符（n,m ≥ 1） |
-| **"fi" 连字映射** | glyph 42 → U+0066（只映射 `'f'`，丢失 `'i'`） | `/ActualText (fi)` → 完整 `"fi"` |
-| **触发条件** | 所有使用的 glyph 都有 entry | `text[text_range].len() > 1`，或多 glyph 共享同一 cluster |
-| **阅读器优先级** | 低（没有 ActualText 时才使用） | 高（有 ActualText 时优先使用） |
-| **PDF/A 合规** | 必需（字体子集必须包含） | 推荐（确保可访问性和文本提取正确性） |
+---
 
-**为什么需要两者配合？**
-- ToUnicode 是 PDF 字体规范的**必需组成部分**——没有 ToUnicode，字体子集无法正常工作
-- 但 ToUnicode 只能做 1:1 映射，对连字（1 glyph → 2 chars）无能为力
-- ActualText 是 PDF Marked Content 的**补救机制**——专门解决 ToUnicode 覆盖不到的多对多映射
-- 两者配合：ToUnicode 提供基础映射，ActualText 修复复杂场景
+**Typst 向 Krilla 暴露的接口（基于公开 trait 定义）**：
+
+通过 `krilla::text::Glyph` trait 定义的接口，Typst 向 Krilla 传递了以下信息（trait 契约是公开的，Krilla 必然可以获得）：
+
+| Trait 方法 | Typst 实现 | Krilla 侧获得的信息 |
+|-----------|-----------|-------------------|
+| `glyph.glyph_id()` | `self.0.id`（字形 id） | 每个字形在字体中的索引，用于绘制与子集化 |
+| `glyph.text_range()` | `self.0.range`（相对于 `text` 开头的字节范围） | 该字形对应原始文本的哪个子串 |
+| `glyph.x_advance/size` | 来自 HarfBuzz shaping 结果 | 排版度量（与文本提取无关） |
+| `text` 参数 | `TextItem.text`（原始文本切片） | 完整的原始文本字符串 |
+
+> **重要限定**：上面描述的是 Typst **通过公开接口向 Krilla 暴露了哪些信息**（trait 契约可验证）。**Krilla 内部具体如何使用这些信息生成 PDF 内容，不在 Typst 代码库中，无法从 Typst 源码验证**。
+
+### 7.5 ToUnicode 与 ActualText 的 PDF 规范分工
+
+> **说明**：本节内容基于 **PDF 公开规范（ISO 32000）**，不涉及 Krilla 内部实现。Typst 通过 Glyph trait 和 `text` 参数向 Krilla 暴露了足够的信息，使 Krilla 能够按 PDF 规范完成这两部分工作。
+
+| 维度 | ToUnicode CMap | ActualText（Marked Content） |
+|------|---------------|------------------------------|
+| **所在位置** | 嵌入字体的 CMap 字典（PDF Font 对象内部，必选） | PDF 内容流中的 Marked Content 序列（`BDC`/`EMC` 之间） |
+| **映射关系**（PDF 规范定义） | `glyph_id → 单个 Unicode 标量值`，严格 1:1 | `一段绘制内容 → 任意 Unicode 字符串`，支持 n:m |
+| **适用场景**（PDF 规范定义） | 简单的 1 glyph ↔ 1 char 常规映射 | 连字、合字、多字形组合、重音合成等 ToUnicode 无法覆盖的场景 |
+| **"fi" 连字的规范限制** | 由于 ToUnicode 强制 1:1，无法表示 `glyph 42 → "fi"`（1 对 2），规范未要求必须映射到第一个字符 | 可以完整表示为 `/ActualText (fi)`，还原整个连字的原始文本 |
+| **阅读器文本提取规则**（PDF 规范定义） | 无 ActualText 时，阅读器使用 ToUnicode CMap 反查 | 存在 ActualText 时，阅读器优先使用 ActualText，忽略该范围内的 ToUnicode |
+| **PDF/A 合规要求** | PDF/A 强制要求所有子集化字体包含 ToUnicode CMap | PDF/A 推荐对复杂映射补充 ActualText，确保可访问性 |
+
+**Typst 在这条链路中的职责（有源码依据）**：
+1. Typst 不直接生成 ToUnicode CMap 或 ActualText，这是 Krilla 的工作
+2. Typst 通过 `Glyph.text_range()` 透传每个字形的完整文本范围（包括连字的多字节范围）
+3. Typst 通过 `text` 参数透传完整的原始文本字符串
+4. Typst 在 [shaping.rs L1060-L1062](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1060-L1062) 注释中明确：Range 扩展是"为了让 Krilla 正确生成 ActualText"——这是 Typst 的**设计意图声明**
 
 ### 7.6 回退场景下的连字处理
 
@@ -1167,29 +1199,33 @@ impl krilla::text::Glyph for PdfGlyph {
   TextItem { font: B, glyphs: [Glyph { id: 100, range: 0..1 }], text: "f" }
   TextItem { font: A, glyphs: [Glyph { id: 43, range: 1..2 }], text: "i" }
 
-PDF 输出:
-  字体B: glyph 100 → ToUnicode → "f"（不需要 ActualText，1:1）
-  字体A: glyph 43 → ToUnicode → "i"（不需要 ActualText，1:1）
-  文本提取结果: "f" + "i" = "fi" ✓
+Typst 传递给 Krilla 的数据（两个独立的 draw_glyphs 调用）:
+  调用1: glyphs=[PdfGlyph { gid=100, text_range=0..1 }], text="f"
+  调用2: glyphs=[PdfGlyph { gid=43, text_range=0..1 }], text="i"
+         ↑ 注意：第二个 TextItem 的 text_range 是相对于它自己的 text="i" 开头重算的
+
+PDF 文本提取（按 PDF 规范）:
+  两个 TextItem 的 text 与 glyph 之间都是 1:1 对应，Typst 提供给 Krilla 的信息足够完整
+  最终可提取出 "f" + "i" = "fi" ✓
 ```
 
-**关键点**：即使连字因为回退被拆成了两个独立字形，`TextItem.text` 的切片和 `PdfGlyph.text_range` 的匹配保证了文本提取的正确性。
+**关键点**：即使字体回退把连字拆成了两个独立 TextItem，每个 TextItem 内部 `text` 切片与每个 glyph 的 `range` 仍然匹配——因为 `TextItem.text` 是从原始文本子串切片，`Glyph.range` 也是在 [shaping.rs L430-L431](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L430-L431) 中相对于 TextItem 开头重算的。
 
 ### 7.7 分工总结与各阶段职责
 
-| 阶段 | 组件 | 职责 | 关键代码 |
+| 阶段 | 组件 | 职责（有源码依据或 PDF 规范依据） | 关键代码 / 依据 |
 |------|------|------|---------|
-| **1. Shaping** | HarfBuzz cluster | 标记每个 glyph 对应的原始文本**起始偏移**（丢失长度信息） | HarfBuzz 内部 |
-| **2. Range 扩展** | Typst shape_segment | 查找下一个不同 cluster 的位置，扩展为完整 `range` | [shape_segment](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1068-L1086) |
-| **3. TextItem 构建** | ShapedText.build | 从**原始输入文本**切片得到 `TextItem.text`，不依赖 glyph 反向推导 | [ShapedText.build](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L437-L446) |
-| **4. PDF Glyph 转换** | PdfGlyph trait | 通过 `glyph_id()` 和 `text_range()` 暴露字形 id 和原始文本范围 | [PdfGlyph](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L106-L148) |
-| **5. Krilla 决策** | Krilla | 判断使用 ToUnicode 还是 ActualText，生成 PDF 内容流 | Krilla 内部 |
-| **6. 字体子集化** | Krilla subset | 嵌入字体子集 + ToUnicode CMap，确保 PDF 自包含 | Krilla 内部 |
+| **1. Shaping** | HarfBuzz cluster | 标记每个 glyph 对应的原始文本**起始偏移**（丢失长度信息） | HarfBuzz 公共 API 文档 |
+| **2. Range 扩展** | Typst shape_segment | 查找下一个不同 cluster 的位置，扩展为完整 `range`；同 cluster 多 glyph 共享完整范围 | [shape_segment](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1050-L1086) |
+| **3. TextItem 构建** | ShapedText.build | 从**原始输入文本**切片得到 `TextItem.text`，不依赖 glyph 反向推导；Glyph.range 相对于 TextItem 开头重算 | [ShapedText.build](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L424-L446) |
+| **4. PDF Glyph 转换** | PdfGlyph trait | 通过 `glyph_id()` 和 `text_range()` 暴露字形 id 和原始文本范围给 Krilla | [PdfGlyph](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L106-L148) |
+| **5. draw_glyphs 调用** | Typst → Krilla | 传入 `glyphs`（trait 对象数组）、`text`（完整原始文本）、`font`、`size` | [handle_text](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L50-L57) |
+| **6. PDF 内容生成** | Krilla | 按 PDF 规范使用 Typst 提供的数据：嵌入字体子集、生成 ToUnicode CMap、必要时生成 ActualText Marked Content | PDF ISO 32000 规范 + Krilla 公开 trait 契约 |
 
-**整条链路的核心设计思想**：
-- **不丢失原始文本**：从 shaping 到 PDF 输出，原始文本信息始终通过 `range + text` 的组合传递
-- **gid 与 Unicode 解耦**：glyph_id 只负责绘制，文本提取完全依赖 `text[range]` 切片
-- **分层容错**：ToUnicode 提供基础映射，ActualText 修复复杂场景，即使两者其一失效也能部分工作
+**整条链路的核心设计思想（有源码依据）**：
+- **不丢失原始文本**：从 shaping 到 PDF 输出边界，原始文本信息始终通过 `Glyph.range + TextItem.text` 的组合传递（Typst 代码可验证）
+- **gid 与 Unicode 解耦**：glyph_id 仅负责绘制与字体子集化，文本提取依赖 `text[range]` 切片（Typst 代码 + Krilla trait 契约可验证）
+- **Typst 不越界**：Typst 止步于向 Krilla 暴露充分的数据（glyph_id、text_range、text），具体 PDF 生成（ToUnicode/ActualText）由 Krilla 按 PDF 规范执行（职责边界清晰）
 
 ---
 
@@ -1829,9 +1865,11 @@ fn text_range(&self) -> Range<usize> {
 }
 ```
 
-`text_range` 告诉 krilla 这个字形对应 `text` 参数中的哪个位置。krilla 利用此信息：
-1. **构建 `/ActualText`**：对于复杂字形（多个 glyph 对应同一段文本，如连字 "fi"），krilla 使用 `/ActualText` 属性标注原始文本
-2. **构建 ToUnicode CMap**：krilla 在子集化字体时构建 glyph ID → Unicode 的反向映射
+`text_range` 告诉 Krilla 这个字形对应 `text` 参数中的哪个位置。结合 Typst 提供的三个数据（`glyph_id`、`text_range`、`text` 原始字符串），Krilla 可以按 PDF 规范完成文本提取所需的信息：
+1. **生成 ActualText**（按 PDF 规范 Marked Content 机制）：对于 Typst 暴露的 1 glyph ↔ 多 chars、多 glyphs ↔ 1 chars 等复杂场景
+2. **构建 ToUnicode CMap**（按 PDF 字体规范）：在子集化字体中建立 glyph ID 到 Unicode 的基础反向映射
+
+> **重要限定**：Typst 代码只定义了向 Krilla 暴露什么数据，Krilla 内部具体使用什么判断条件、什么优先级处理这些信息，不在 Typst 代码库中，无法从 Typst 源码验证。
 
 ### 16.4 cluster 范围与文本提取的关系
 
@@ -1973,22 +2011,18 @@ TextItem (font, glyphs, text)
   │
   └─▶ surface.draw_glyphs(glyphs, font, text, size)
         │
-        ├─ 每个 glyph 的 glyph_id → 记录到子集化集合
-        │     ├─ glyph_id != 0 → 正常字形，子集化时包含
-        │     └─ glyph_id == 0 → .notdef，可能触发验证错误
-        │
-        ├─ 每个 glyph 的 text_range → 构建 ActualText
-        │     └─ 同 cluster 多 glyph → 合并为一个 ActualText
-        │
-        └─ text 参数 → 构建 ToUnicode CMap
-              └─ text[range] → glyph_id 的 Unicode 映射
+        └─ Typst 传递给 Krilla 的数据契约（有源码依据）：
+              ├─ glyphs: &[PdfGlyph]，每个实现了 krilla::text::Glyph trait
+              │     ├─ glyph_id() → 字形 id（用于绘制与子集化）
+              │     └─ text_range() → 对应 text 中的字节范围
+              └─ text: &str → TextItem.text，原始文本切片
 
-document.finish() → PDF 序列化
+document.finish() → PDF 序列化（按 PDF 规范，Krilla 处理）
   │
-  ├─ 子集化字体嵌入
-  │     ├─ 收集所有 glyph_id → 生成子集
-  │     ├─ 生成 ToUnicode CMap
-  │     └─ 生成 ActualText 标记
+  ├─ 子集化字体嵌入（Krilla 工作，Typst 仅提供数据）
+  │     ├─ 收集所有 glyph_id → 生成字体子集
+  │     ├─ 生成 ToUnicode CMap（glyph_id → Unicode，1:1）
+  │     └─ 必要时生成 ActualText Marked Content（复杂映射场景）
   │
   ├─ 验证错误 (PDF/A, PDF/UA)
   │     ├─ ContainsNotDefGlyph → 豆腐块字体 + 文本内容
