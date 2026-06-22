@@ -115,7 +115,7 @@ pub struct SystemWorld {
 
 注意：
 - `library` 从未被 reset，它在整个 watch 生命周期内全局恒定
-- `fonts` 是 `LazyLock`，只在首次访问时初始化一次，后续不复用也不重置
+- `fonts` 是 `LazyLock<FontStore>`，在首次访问后**全程复用、永不重置**
 - **只有 `files` 和 `now` 会在每次编译前被 reset**
 
 ### 2.3 文件缓存重置：`FileStore::reset`
@@ -227,6 +227,139 @@ fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
 ```
 
 由于 `World` trait 被 `#[comemo::track]` 标记，`today()` 返回值的变化会通过 Tracked 依赖验证链路传播：如果下一轮日期不同，所有调用过 `world.today(...)` 的 memoized 函数其第二层验证会失败 → 重算。
+
+### 2.5 字体元数据缓存：永不重置的第三类缓存
+
+`SystemWorld.fonts` 是**第三种独立的缓存类别**——它既不像文件缓存那样每次 reset，也不像日期缓存那样有条件 reset，而是**初始化后全程复用、永不重置**。
+
+#### 2.5.1 初始化时机
+
+在 watch 模式下，字体缓存在**首次编译前**就被主动初始化（`crates/typst-cli/src/watch.rs:55-57`）：
+
+```rust
+// Eagerly scan fonts if we expect to need them so that it's not counted as
+// part of the displayed compilation time.
+if config.output_format.is_paged() {
+    world.scan_fonts();
+}
+```
+
+`SystemWorld::scan_fonts` 只是强制 `LazyLock` 初始化（`crates/typst-cli/src/world.rs:110-114`）：
+
+```rust
+pub fn scan_fonts(&mut self) {
+    LazyLock::force(&self.fonts);
+}
+```
+
+初始化闭包调用 `discover_fonts` 完成字体扫描（`crates/typst-cli/src/world.rs:79-81`）：
+
+```rust
+fonts: LazyLock::new(Box::new(|| {
+    crate::fonts::discover_fonts(&world_args.font)
+})),
+```
+
+`discover_fonts` 的完整流程（`crates/typst-cli/src/fonts.rs:38-55`）：
+
+```rust
+pub fn discover_fonts(args: &FontArgs) -> FontStore {
+    let mut fonts = FontStore::new();
+    if !args.ignore_system_fonts {
+        fonts.extend(fonts::system());      // 扫描系统字体
+    }
+    #[cfg(feature = "embedded-fonts")]
+    if !args.ignore_embedded_fonts {
+        fonts.extend(fonts::embedded());    // 加载嵌入字体
+    }
+    for path in &args.font_paths {
+        fonts.extend(fonts::scan(path));    // 扫描自定义字体目录
+    }
+    fonts
+}
+```
+
+#### 2.5.2 内部结构与两级缓存
+
+`FontStore` 内部有两级缓存（`crates/typst-kit/src/fonts.rs:24-27`）：
+
+```rust
+pub struct FontStore {
+    book: LazyHash<FontBook>,     // 第一级：字体元数据（家族名、变体、字符覆盖等）
+    slots: Vec<FontSlot>,         // 第二级：实际字体对象，延迟加载
+}
+```
+
+`FontSlot` 实现了按需加载（`crates/typst-kit/src/fonts.rs:86-97`）：
+
+```rust
+struct FontSlot {
+    source: Box<dyn FontSource>,  // 字体来源（文件路径或已加载对象）
+    font: OnceLock<Option<Font>>, // 实际字体对象，OnceLock 保证只加载一次
+}
+
+impl FontSlot {
+    fn get(&self) -> Option<Font> {
+        // OnceLock::get_or_init：首次调用时从 source.load() 加载，后续直接返回
+        self.font.get_or_init(|| self.source.load()).clone()
+    }
+}
+```
+
+`FontBook` 是字体元数据的索引结构（`crates/typst-library/src/text/font/book.rs:12-18`）：
+
+```rust
+#[derive(Debug, Default, Clone, Hash)]
+pub struct FontBook {
+    families: BTreeMap<String, Vec<usize>>,  // 小写家族名 → 字体索引列表
+    infos: Vec<FontInfo>,                    // 每个字体的元数据
+}
+```
+
+注意 `FontBook` 实现了 `Hash`，被 `LazyHash` 包装后哈希值一旦计算就缓存。
+
+#### 2.5.3 为什么不参与 reset
+
+**技术层面**：
+- `LazyLock<FontStore>` 一旦初始化就没有 reset 接口（Rust 标准库设计）
+- `FontSlot.font` 是 `OnceLock<Option<Font>>`，一旦 set 就无法清空
+- `LazyHash<FontBook>` 的哈希值一旦计算就缓存，不会重新计算
+
+**设计层面**（`crates/typst-library/src/lib.rs:51-54` 的注释明确说明）：
+
+> The compiler doesn't do the caching itself because the world has much more
+> information on when something can change. For example, fonts typically don't
+> change and can thus even be cached across multiple compilations (for
+> long-running applications like `typst watch`).
+
+翻译：字体**通常不会变化**，因此可以跨多次编译缓存。
+
+**性能层面**：
+- 系统字体扫描可能涉及上千个字体文件，是昂贵的 I/O + 解析操作
+- 每次编译前重新扫描会完全抵消增量编译的性能收益
+- watch 模式也不监听字体目录的变化（只监听源文件依赖）
+
+**语义层面**：
+`World::font()` 方法的注释（`crates/typst-library/src/lib.rs:84-88`）暗示字体索引跨轮次稳定：
+
+> Note that the index is not guaranteed to be in bounds of the font book
+> returned by this world's `book()` function. This is the case because
+> this function may be invoked with indices from an outdated or different
+> font book during incremental compilation validation.
+
+这说明 comemo 在缓存验证回放时，可能用"上一轮记录的字体索引"调用 `world.font(index)`，因此**字体索引在整个 watch 生命周期内必须保持稳定**。
+
+#### 2.5.4 参与缓存验证的方式
+
+由于 `World` trait 被 `#[comemo::track]` 标记，以下方法调用都会被记录为 Tracked 依赖：
+- `world.book()` → 返回 `&LazyHash<FontBook>`
+- `world.font(index)` → 返回 `Option<Font>`
+
+但因为：
+1. `FontBook` 内容永不改变 → `LazyHash<FontBook>` 的哈希值永远不变
+2. `FontSlot.get()` 一旦加载就永远返回相同的 `Font` 对象
+
+所以字体相关的 Tracked 依赖回放**永远通过**，不会成为缓存失效的原因。
 
 ---
 
@@ -428,9 +561,13 @@ world.reset()
   │   └─ A 的 FileSlot: Parsed(Ok(src), _) → Empty(Some(src))  ← 保留为 stale
   │      B 的 FileSlot: Parsed(Ok(src), _) → Empty(Some(src))  ← 保留为 stale
   │
-  └─ now.reset()  crates/typst-kit/src/datetime.rs:124
-      └─ TimeInner::System(lock) → lock.take()，清空 OnceLock
-         （如果是 TimeInner::Fixed 则什么都不做）
+  ├─ now.reset()  crates/typst-kit/src/datetime.rs:124
+  │   └─ TimeInner::System(lock) → lock.take()，清空 OnceLock
+  │      （如果是 TimeInner::Fixed 则什么都不做）
+  │
+  └─ fonts：不参与 reset，全程复用
+      └─ LazyLock<FontStore> 已初始化 → LazyHash<FontBook> 哈希不变
+         FontSlot.OnceLock 已加载的字体永远不变
     │
     ▼ 编译过程中首次访问 world.source(A_id)
     └─ crates/typst-kit/src/files.rs:190 source()
@@ -474,6 +611,7 @@ world.reset()
     │
     ▼ 所有细粒度函数
     ├─ 文本未变段落：create_shape_plan 的 text/font 参数相同 → ✅ 命中
+    │   （font 参数来自 world.font(index)，字体索引跨轮次稳定，OnceLock 已加载）
     └─ 文本已变段落：text 参数不同 → ❌ 重新塑形
     │
     ▼ crates/typst-cli/src/watch.rs:82
@@ -491,7 +629,7 @@ comemo::evict(10)
 | 函数/结构 | 仓库相对路径 | 说明 |
 |-----------|------------|------|
 | `watch()` 主循环 | `crates/typst-cli/src/watch.rs:18-84` | 文件监听 → reset → 编译 → evict 循环 |
-| `SystemWorld::reset` | `crates/typst-cli/src/world.rs:104-107` | 双重置入口 |
+| `SystemWorld::reset` | `crates/typst-cli/src/world.rs:104-107` | 双重置入口（files + now） |
 | `SystemWorld` 结构 | `crates/typst-cli/src/world.rs:25-38` | files + now + library + fonts |
 | `FileStore::reset` | `crates/typst-kit/src/files.rs:111-116` | 批量 reset 所有 FileSlot |
 | `FileSlot::reset` | `crates/typst-kit/src/files.rs:167-174` | Parsed→Empty(stale) 状态转换 |
@@ -501,6 +639,13 @@ comemo::evict(10)
 | `Time::reset` | `crates/typst-kit/src/datetime.rs:124-128` | 仅清空 System 的 OnceLock |
 | `Time::today` | `crates/typst-kit/src/datetime.rs:83-118` | get_or_init 保证单轮一致 |
 | `SystemWorld::today` | `crates/typst-cli/src/world.rs:142-144` | 直接转发 now.today |
+| `SystemWorld::scan_fonts` | `crates/typst-cli/src/world.rs:110-114` | 主动强制字体缓存初始化 |
+| `discover_fonts` | `crates/typst-cli/src/fonts.rs:38-55` | 扫描系统/嵌入/自定义字体 |
+| `FontStore` 结构 | `crates/typst-kit/src/fonts.rs:24-27` | book(LazyHash) + slots(FontSlot) |
+| `FontSlot` 结构 | `crates/typst-kit/src/fonts.rs:86-97` | source + OnceLock<Font> |
+| `FontBook` 结构 | `crates/typst-library/src/text/font/book.rs:12-18` | families + infos，derive Hash |
+| `World::font` 注释 | `crates/typst-library/src/lib.rs:84-88` | 暗示字体索引跨轮次稳定 |
+| `World` trait 注释 | `crates/typst-library/src/lib.rs:51-54` | 说明字体可跨编译缓存 |
 | `comemo::evict(10)` | `crates/typst-cli/src/watch.rs:82` | 保留最近 10 个缓存版本 |
 
 ### 6.2 Memoized 函数清单
@@ -565,11 +710,15 @@ comemo::evict(10)
 - **第一层（参数哈希）**：快速排除必然失效的情况。文件内容变了 → `Source` 的 `LazyHash` 直接不同，无需进入第二层。
 - **第二层（Tracked 依赖验证）**：精确捕获"实际用到了什么"。每一轮编译都产生新的 `Tracked<dyn World>` 实例，但只要实际调用过的方法（`source()`、`today()`、`book()` 等）返回值与上一轮一致，缓存就有效。这是增量编译能跨编译轮次复用缓存的根本原因。
 
-### 7.2 双重置机制
+### 7.2 三重缓存策略
 
-Watch 模式下的缓存重置分为两个独立维度：
-- **文件缓存**：通过 stale Source + 增量解析的方式，在"必须重新读取磁盘确认文件是否真的变了"和"尽量保持语法树稳定"之间取得平衡
-- **日期缓存**：通过 `OnceLock` 保证"单轮编译内日期一致"，通过 reset 保证"跨编译轮次日期能更新"，同时 `Fixed` 模式下全程不变用于可重现构建
+Watch 模式下的缓存分为三个独立维度，根据变化频率采用不同的重置策略：
+
+| 缓存类型 | 重置策略 | 核心机制 | 设计考量 |
+|---------|---------|---------|---------|
+| **文件缓存** | 每次编译前 reset | `FileStore::reset` → `FileSlot` 转为 `Empty(stale)`，保留陈旧 Source 用于增量解析 | 源文件可能随时变化，必须重新从磁盘确认，但尽量保持语法树稳定以利于缓存命中 |
+| **日期缓存** | 每次编译前条件 reset | `Time::reset` 仅清空 `System(OnceLock)`，`Fixed` 变体无视 | 日期可能跨天变化，但单轮编译内必须一致；固定时间戳模式下永远不变用于可重现构建 |
+| **字体元数据缓存** | 永不 reset | `LazyLock<FontStore>` + `LazyHash<FontBook>` + `OnceLock<Font>` | 字体通常不会变化，扫描成本高昂，且跨轮次稳定的字体索引是增量缓存验证的语义前提 |
 
 ### 7.3 稳定性设计：让 Hash 尽可能不变
 
