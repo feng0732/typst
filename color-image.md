@@ -58,7 +58,7 @@ enum ProcessColor {
 }
 ```
 
-底层类型来自 `palette` crate，并通过类型别名暴露（[color.rs#L22-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/color.rs#L22-L28)）：
+底层类型来自 `palette` crate，并通过类型别名暴露（`crates/typst-library/src/visualize/color.rs#L22-L28`）：
 
 ```rust
 pub type Oklab = palette::oklab::Oklaba<f32>;
@@ -69,7 +69,7 @@ pub type Luma  = palette::luma::Lumaa<encoding::Srgb, f32>;
 
 ### 2.2 跨颜色空间转换路径
 
-所有 `ProcessColor` 都实现了 `to_space(ProcessColorSpace) -> Self`，其核心实现见 [color.rs#L1758-L1873](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/color.rs#L1758-L1873)。
+所有 `ProcessColor` 都实现了 `to_space(ProcessColorSpace) -> Self`，其核心实现见 `crates/typst-library/src/visualize/color.rs#L1758-L1873`。
 
 **转换枢纽（Hub & Spoke 模型）**：
 
@@ -88,18 +88,18 @@ pub type Luma  = palette::luma::Lumaa<encoding::Srgb, f32>;
 
 关键实现：
 - **Oklab / sRGB / Luma / HSL / HSV** 之间：使用 `palette::FromColor` trait 自动完成
-- **CMYK → sRGB**：使用 **moxcms** 库进行 ICC profile 转换（[color.rs#L36-L56](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/color.rs#L36-L56)）
+- **CMYK → sRGB**：使用 **moxcms** 库进行 ICC profile 转换（`crates/typst-library/src/visualize/color.rs#L36-L56`）
   ```rust
   static CMYK_TO_XYZ: LazyLock<ColorProfile> = ...;  // CGATS TR 001-1995
   static SRGB_PROFILE: LazyLock<ColorProfile> = ...;
   static TO_SRGB: LazyLock<Arc<moxcms::Transform8BitExecutor>> = ...;
   ```
-- **sRGB → CMYK**：目前仍使用朴素公式（[color.rs#L2194-L2211](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/color.rs#L2194-L2211)）
+- **sRGB → CMYK**：目前仍使用朴素公式（`crates/typst-library/src/visualize/color.rs#L2194-L2211`）
 - **Spot Color → 过程色**：使用 `SpotColor::fallback()`，即 tint × fallback
 
 ### 2.3 颜色混合（mix_iter）
 
-在 [color.rs#L1136-L1236](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/color.rs#L1136-L1236) 中实现，流程：
+在 `crates/typst-library/src/visualize/color.rs#L1136-L1236` 中实现，流程：
 
 1. **resolve_color_space** 自动选择混合空间（默认 Oklab，spot 色使用自己的色板）
 2. **将所有颜色 to_space(target)** → 统一 vec4
@@ -118,7 +118,7 @@ pub type Luma  = palette::luma::Lumaa<encoding::Srgb, f32>;
 
 ### 3.1 图像元素与解码入口
 
-`ImageElem` 元素（[mod.rs#L52-L204](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/image/mod.rs#L52-L204)）字段：
+`ImageElem` 元素（`crates/typst-library/src/visualize/image/mod.rs#L52-L204`）字段：
 
 ```rust
 struct ImageElem {
@@ -131,7 +131,7 @@ struct ImageElem {
 }
 ```
 
-**解码入口**在 `Packed<ImageElem>::decode()`（[mod.rs#L213-L327](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/image/mod.rs#L213-L327)）：
+**解码入口**在 `Packed<ImageElem>::decode()`（`crates/typst-library/src/visualize/image/mod.rs#L213-L327`）：
 
 ```rust
 pub fn decode(&self, engine, styles) -> SourceResult<Image> {
@@ -161,16 +161,16 @@ pub fn decode(&self, engine, styles) -> SourceResult<Image> {
 
 | 缓存函数 | 所在文件 | 输入参数（决定缓存 key） | 输出 |
 |---------|---------|------------------------|------|
-| `RasterImage::new_impl` | `image/raster.rs#L47-L53` | `data: Bytes`, `format: RasterFormat`, `icc: Smart<Bytes>` | `RasterImage`（含解码后像素 + ICC + DPI） |
-| `SvgImage::new` | `image/svg.rs#L38-L40` | `data: Bytes` | `SvgImage`（无字体版） |
-| `SvgImage::with_fonts_images` | `image/svg.rs#L52-L59` | `data: Bytes`, `world: Tracked<dyn World>`, `families: &[&str]`, `svg_file: Option<FileId>` | `SvgImage`（带字体和嵌入图） |
-| `PdfDocument::new` | `image/pdf.rs#L21-L24` | `data: Bytes` | `PdfDocument` |
-| `PdfImage::new` | `image/pdf.rs#L61-L64` | `document: PdfDocument`, `page_index: usize` | `PdfImage`（单页） |
-| `Image::new_impl` | `image/mod.rs#L427-L434` | `kind: ImageKind`, `alt: Option<EcoString>`, `scaling: Smart<ImageScaling>` | `Image`（Arc + LazyHash 包装） |
+| `RasterImage::new_impl` | `crates/typst-library/src/visualize/image/raster.rs#L47-L53` | `data: Bytes`, `format: RasterFormat`, `icc: Smart<Bytes>` | `RasterImage`（含解码后像素 + ICC + DPI） |
+| `SvgImage::new` | `crates/typst-library/src/visualize/image/svg.rs#L38-L40` | `data: Bytes` | `SvgImage`（无字体版） |
+| `SvgImage::with_fonts_images` | `crates/typst-library/src/visualize/image/svg.rs#L52-L59` | `data: Bytes`, `world: Tracked<dyn World>`, `families: &[&str]`, `svg_file: Option<FileId>` | `SvgImage`（带字体和嵌入图） |
+| `PdfDocument::new` | `crates/typst-library/src/visualize/image/pdf.rs#L21-L24` | `data: Bytes` | `PdfDocument` |
+| `PdfImage::new` | `crates/typst-library/src/visualize/image/pdf.rs#L61-L64` | `document: PdfDocument`, `page_index: usize` | `PdfImage`（单页） |
+| `Image::new_impl` | `crates/typst-library/src/visualize/image/mod.rs#L427-L434` | `kind: ImageKind`, `alt: Option<EcoString>`, `scaling: Smart<ImageScaling>` | `Image`（Arc + LazyHash 包装） |
 
 ### 3.3 光栅图像解码的详细流程
 
-`RasterImage::new_impl` 是最核心的解码缓存点，定义于 [raster.rs#L47-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/image/raster.rs#L47-L152)：
+`RasterImage::new_impl` 是最核心的解码缓存点，定义于 `crates/typst-library/src/visualize/image/raster.rs#L47-L152`：
 
 #### 3.3.1 输入参数详解
 
@@ -193,7 +193,7 @@ pub fn decode(&self, engine, styles) -> SourceResult<Image> {
 
 #### 3.3.2 ICC profile 的提取与存储
 
-ICC 的提取逻辑在 `decode()` 内部函数中（[raster.rs#L58-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/image/raster.rs#L58-L74)）：
+ICC 的提取逻辑在 `decode()` 内部函数中（`crates/typst-library/src/visualize/image/raster.rs#L58-L74`）：
 
 ```rust
 let icc = icc.custom().or_else(|| {
@@ -211,9 +211,9 @@ let icc = icc.custom().or_else(|| {
 
 #### 3.3.3 解码后的附加处理
 
-1. **EXIF 旋转**（[raster.rs#L85-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/image/raster.rs#L85-L93)）：`exif::Reader` 读取 Orientation tag，然后 `apply_rotation()` 翻转动态图像。**旋转被 baked 进像素数据**（JPEG 除外，PDF 输出时会用 transform 处理）。
+1. **EXIF 旋转**（`crates/typst-library/src/visualize/image/raster.rs#L85-L93`）：`exif::Reader` 读取 Orientation tag，然后 `apply_rotation()` 翻转动态图像。**旋转被 baked 进像素数据**（JPEG 除外，PDF 输出时会用 transform 处理）。
 
-2. **DPI 提取**（[raster.rs#L362-L445](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/image/raster.rs#L362-L445)）：三级回退 EXIF → JFIF APP0 → PNG pHYs。
+2. **DPI 提取**（`crates/typst-library/src/visualize/image/raster.rs#L362-L445`）：三级回退 EXIF → JFIF APP0 → PNG pHYs。
 
 ### 3.4 解码后的 Image 结构
 
@@ -227,7 +227,7 @@ struct ImageInner {
 }
 ```
 
-注意：`Image::new_impl` 也被 `#[comemo::memoize]`（[mod.rs#L427-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/visualize/image/mod.rs#L427-L434)），因此同一张图即使被多个 `ImageElem` 引用，只要 `kind + alt + scaling` 相同，最终也只构造一次 `ImageInner`。
+注意：`Image::new_impl` 也被 `#[comemo::memoize]`（`crates/typst-library/src/visualize/image/mod.rs#L427-L434`），因此同一张图即使被多个 `ImageElem` 引用，只要 `kind + alt + scaling` 相同，最终也只构造一次 `ImageInner`。
 
 **`ImageScaling` 是 Image 的一部分**（通过 `scaling` 字段）。这意味着：
 - `scaling` 从 `Smooth` 改成 `Pixelated` → `Image` 的 hash 变化 → 所有依赖 `Image` 的渲染缓存都会失效
@@ -258,7 +258,7 @@ struct ImageInner {
 
 ### 4.1 `layout_image()` 流程
 
-见 [image.rs#L11-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-layout/src/image.rs#L11-L81)：
+见 `crates/typst-layout/src/image.rs#L11-L81`：
 
 ```
 1. decode() → 取得 Image（首次触发解码，后续走 comemo 缓存）
@@ -275,7 +275,7 @@ struct ImageInner {
 
 ### 4.2 Frame 与 FrameItem
 
-见 [frame.rs#L17-L30](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/layout/frame.rs#L17-L30) 与 [frame.rs#L486-L499](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-library/src/layout/frame.rs#L486-L499)：
+见 `crates/typst-library/src/layout/frame.rs#L17-L30` 与 `crates/typst-library/src/layout/frame.rs#L486-L499`：
 
 ```rust
 struct Frame {
@@ -318,7 +318,7 @@ enum FrameItem {
 
 #### 5.1.1 颜色路径
 
-所有颜色最终都到 `to_sk_color()`（[paint.rs#L286-L295](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-render/src/paint.rs#L286-L295)）：
+所有颜色最终都到 `to_sk_color()`（`crates/typst-render/src/paint.rs#L286-L295`）：
 
 ```rust
 fn to_sk_color(color: ProcessColor) -> sk::Color {
@@ -333,7 +333,7 @@ Spot 颜色先 `Color::to_process()` → 用 fallback 颜色渲染。
 
 #### 5.1.2 渐变采样（Gradient → 光栅）
 
-渐变的实际光栅化发生在 `GradientSampler::sample`（[paint.rs#L61-L78](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-render/src/paint.rs#L61-L78)）或 `cached()`（[paint.rs#L146-L172](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-render/src/paint.rs#L146-L172)）预渲染成 pixmap：
+渐变的实际光栅化发生在 `GradientSampler::sample`（`crates/typst-render/src/paint.rs#L61-L78`）或 `cached()`（`crates/typst-render/src/paint.rs#L146-L172`）预渲染成 pixmap：
 
 ```
 gradient.sample_at(pixel_xy, container_size)
@@ -358,13 +358,13 @@ gradient.sample_at(pixel_xy, container_size)
 
 #### 5.1.3 图像光栅化（build_texture 缓存）
 
-见 [image.rs#L68-L113](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-render/src/image.rs#L68-L113)，核心函数 `build_texture(image, w, h)` 被 `#[comemo::memoize]` 装饰。
+见 `crates/typst-render/src/image.rs#L68-L113`，核心函数 `build_texture(image, w, h)` 被 `#[comemo::memoize]` 装饰。
 
 **缓存 key 由两个参数决定**：
 - `image: &Image` — 图像对象（含 kind + alt + scaling）
 - `w: u32`, `h: u32` — 目标像素宽高
 
-**w, h 的计算**（[image.rs#L28-L44](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-render/src/image.rs#L28-L44)）：
+**w, h 的计算**（`crates/typst-render/src/image.rs#L28-L44`）：
 
 ```
 1. 从 state.transform 中提取旋转角 theta
@@ -379,7 +379,7 @@ gradient.sample_at(pixel_xy, container_size)
 - **图像有旋转变换 → w, h 会增大（采样过采样）→ 新缓存**
 - **布局尺寸变了（width/height 样式变了）→ w, h 变 → 新缓存**
 
-**缩放算法选择**（[image.rs#L82-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-render/src/image.rs#L82-L87)）：
+**缩放算法选择**（`crates/typst-render/src/image.rs#L82-L87`）：
 
 ```rust
 let filter = match image.scaling() {
@@ -399,7 +399,7 @@ let filter = match image.scaling() {
 
 #### 5.2.1 颜色策略：尽量保留原生空间
 
-见 `convert_process_solid()`（[paint.rs#L124-L137](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-pdf/src/paint.rs#L124-L137)）：
+见 `convert_process_solid()`（`crates/typst-pdf/src/paint.rs#L124-L137`）：
 
 ```
 ProcessColor  ──►  space 判定
@@ -411,11 +411,11 @@ ProcessColor  ──►  space 判定
 SpotColor     ──► krilla::separation::Color (专色 + fallback)
 ```
 
-**渐变**在复杂空间（Oklab / Oklch / HSL / HSV / LinearRgb）下会被「降级」为大量 RGB 插值 stops：见 `convert_gradient_stops()`（[paint.rs#L303-L402](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-pdf/src/paint.rs#L303-L402)）中 `generate_intermediate_stops_for_rgb_interpolation`。
+**渐变**在复杂空间（Oklab / Oklch / HSL / HSV / LinearRgb）下会被「降级」为大量 RGB 插值 stops：见 `convert_gradient_stops()`（`crates/typst-pdf/src/paint.rs#L303-L402`）中 `generate_intermediate_stops_for_rgb_interpolation`。
 
 #### 5.2.2 图像嵌入策略与缓存
 
-`convert_raster()`（[image.rs#L190-L211](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-pdf/src/image.rs#L190-L211)）是 PDF 的图像缓存点，被 `#[comemo::memoize]` 装饰。
+`convert_raster()`（`crates/typst-pdf/src/image.rs#L190-L211`）是 PDF 的图像缓存点，被 `#[comemo::memoize]` 装饰。
 
 **缓存 key**：`raster: RasterImage` + `interpolate: bool`
 
@@ -438,12 +438,12 @@ JPEG ──► Image::from_jpeg_with_icc(原始字节, ICC, interpolate)
            └─ color_space()：Rgb / Luma
 ```
 
-**ICC 在 PDF 中的保留条件**（[image.rs#L164-L178](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-pdf/src/image.rs#L164-L178)）：
+**ICC 在 PDF 中的保留条件**（`crates/typst-pdf/src/image.rs#L164-L178`）：
 - JPEG：始终保留（因为字节直通）
 - 其他格式：只有当动态图像本身就是 Luma8/LumaA8/Rgb8/Rgba8 时才保留 ICC
 - 如果需要格式转换（如从 16-bit 转 8-bit），则丢弃 ICC（因为转换后 ICC 可能不匹配）
 
-**EXIF 旋转**仅对 JPEG 作为 PDF transform 附加（不修改像素），对其他格式已在解码阶段 baked 进像素（[image.rs#L218-L266](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-pdf/src/image.rs#L218-L266)）。
+**EXIF 旋转**仅对 JPEG 作为 PDF transform 附加（不修改像素），对其他格式已在解码阶段 baked 进像素（`crates/typst-pdf/src/image.rs#L218-L266`）。
 
 #### 5.2.3 PDF 图像缓存失效条件
 
@@ -463,7 +463,7 @@ JPEG ──► Image::from_jpeg_with_icc(原始字节, ICC, interpolate)
 
 #### 5.3.1 颜色输出 CSS 函数（尽量表达丰富）
 
-`SvgDisplay for Color`（[paint.rs#L444-L505](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-svg/src/paint.rs#L444-L505)）：
+`SvgDisplay for Color`（`crates/typst-svg/src/paint.rs#L444-L505`）：
 
 | 源颜色空间 | SVG 输出 |
 |----------|---------|
@@ -473,11 +473,11 @@ JPEG ──► Image::from_jpeg_with_icc(原始字节, ICC, interpolate)
 | Oklch | `oklch(L% c h / a)` |
 | HSL | `hsl(hdeg s% l% / a)` |
 
-**渐变**：与 PDF 类似，Oklab/Oklch 等非原生空间也生成中间 stops 做 rgb 插值（[paint.rs#L244-L275](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-svg/src/paint.rs#L244-L275)）。
+**渐变**：与 PDF 类似，Oklab/Oklch 等非原生空间也生成中间 stops 做 rgb 插值（`crates/typst-svg/src/paint.rs#L244-L275`）。
 
 #### 5.3.2 图像策略与缓存
 
-`WebImage::new()`（[image.rs#L100-L131](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-svg/src/image.rs#L100-L131)）是 SVG 图像的第一个缓存点，被 `#[comemo::memoize]` 装饰。
+`WebImage::new()`（`crates/typst-svg/src/image.rs#L100-L131`）是 SVG 图像的第一个缓存点，被 `#[comemo::memoize]` 装饰。
 
 **缓存 key**：`image: &Image`
 
@@ -492,7 +492,7 @@ Svg               ──► 原样字节
 Pdf               ──► hayro_svg::convert(page) → SVG 字符串
 ```
 
-`to_base64_url()`（[image.rs#L136-L142](file:///d:/fz/0601-2/solo-dogfeeding/code/135-typst/crates/typst-svg/src/image.rs#L136-L142)）是第二个缓存点：
+`to_base64_url()`（`crates/typst-svg/src/image.rs#L136-L142`）是第二个缓存点：
 
 **缓存 key**：`&self`（WebImage 的 format + data）
 
