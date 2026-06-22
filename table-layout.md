@@ -780,68 +780,150 @@ self.current.footer_height = if skipped_region {
 
 ### 3.5 头部和尾部高度重算的影响
 
-#### 3.5.1 何时触发高度重算
+> **修正说明**：之前关于"Header 高度不会在换页时重算"的说法不准确。实际上 Header 和 Footer 的重算逻辑在**普通布局流程**和**Rowspan 模拟流程**中是不同的，需要分开讨论。
 
-**场景 1：layout_active_headers 中跳过区域后**
+#### 3.5.1 两种流程的代码路径对比
 
-[`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L245-L256)：
+表格布局中有两条独立的代码路径都会涉及 header/footer 高度计算：
+
+| 流程 | 代码位置 | 用途 |
+|------|---------|------|
+| **普通布局流程** | [repeated.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs) | 实际布局表格内容，生成真实的 Frame |
+| **Rowspan 模拟流程** | [rowspans.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1150-L1244) | 预测换页对 gutter 的影响，计算 auto 行需要扩展的高度 |
+
+#### 3.5.2 普通布局流程中的重算逻辑
+
+普通布局在每次换页时调用 [`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L203-L352)，其内部流程如下：
+
+```
+layout_active_headers():
+  │
+  ├─ 步骤 1: simulate_header_height() → 预测量 header 高度
+  │    （仅用于判断是否需要跳页，不用于最终布局）
+  │
+  ├─ 步骤 2: 跳页循环（如果空间不够）
+  │    │
+  │    ├─ finish_region_internal() → 跳页
+  │    │
+  │    ├─ ⚠️  TODO 问题点 [L234-L238]:
+  │    │   // re-calculate heights of headers and footers
+  │    │   // on each region if 'full' changes?
+  │    │   // (Assuming height doesn't change for now...)
+  │    │   → 此处 Header 高度没有重新模拟！
+  │    │
+  │    └─ ✅  Footer 重新模拟 [L245-L256]:
+  │         if skipped_region:
+  │             simulate_footer() → 重算 footer 高度
+  │
+  ├─ 步骤 3: 重置 header 高度 [L272-L275]
+  │    repeating_header_height = 0
+  │
+  ├─ 步骤 4: ✅  实际布局 repeating headers [L296-L322]
+  │    for header in repeating_headers:
+  │        layout_header_rows() → 真实布局，返回实际高度
+  │        repeating_header_height += header_height
+  │
+  └─ 步骤 5: ✅  实际布局 pending headers [L328-L339]
+       for header in pending_headers:
+           layout_header_rows() → 真实布局，返回实际高度
+```
+
+**关键结论（普通布局）**：
+
+| 阶段 | Header | Footer |
+|------|--------|--------|
+| 预测量（跳页判断） | ❌ 跳过区域后不重新模拟 | ✅ 跳过区域后重新模拟 |
+| 实际布局 | ✅ 每次换页都重新布局测量 | ✅ 每次换页都重新布局测量 |
+
+**修正之前的说法**：
+- ❌ 错误："Header 高度不会在换页时重算"
+- ✅ 正确：**Header 在实际布局时会重新测量，但在跳页判断的预模拟阶段不会重新模拟**（这是已知的 TODO 问题）
+- ✅ 正确：**Footer 在跳页判断和实际布局两个阶段都会重新模拟**
+
+#### 3.5.3 Rowspan 模拟流程中的重算逻辑
+
+Rowspan 模拟使用独立的 [`RowspanSimulator`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1006-L1051) 结构体，其换页时调用 [`simulate_header_footer_layout()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1150-L1244)：
 
 ```rust
-if let Some(footer) = &self.grid.footer
-    && footer.repeated
-    && skipped_region
-{
-    // Simulate the footer again; the region's 'full' might have
-    // changed.
-    self.regions.size.y += self.current.footer_height;
-    self.current.footer_height = self
-        .simulate_footer(footer, &self.regions, engine, disambiguator)?
-        .height;
-    self.regions.size.y -= self.current.footer_height;
+// We can't just use the initial header/footer height on each region,
+// because header/footer height might vary depending on region size if
+// it contains rows with relative lengths. Therefore, we re-simulate
+// headers and footers on each new region.
+fn simulate_header_footer_layout(...) {
+    // 1. 第一次模拟
+    let header_height = simulate_header_height(regions);
+    let footer_height = simulate_footer(regions);
+
+    // 2. 跳页循环
+    while !fits(header_height + footer_height) {
+        regions.next();
+        skipped_region = true;
+    }
+
+    // 3. ✅  跳过区域后，Header 重新模拟
+    if skipped_region {
+        header_height = simulate_header_height(new_regions);
+    }
+
+    // 4. ✅  跳过区域后，Footer 重新模拟
+    if skipped_region {
+        footer_height = simulate_footer(new_regions);
+    }
+
+    // 5. 扣除高度
+    regions.size.y -= header_height + footer_height;
 }
 ```
 
-**触发条件**：
-- 存在重复 footer
-- 跳过了至少一个区域（`skipped_region = true`）
+**关键结论（Rowspan 模拟）**：
+
+| 阶段 | Header | Footer |
+|------|--------|--------|
+| 首次模拟 | ✅ 模拟 | ✅ 模拟 |
+| 跳过区域后 | ✅ 重新模拟 | ✅ 重新模拟 |
+| 每次换页时 | ✅ 重新模拟 | ✅ 重新模拟 |
+
+**与普通布局的差异**：
+- Rowspan 模拟中 **Header 和 Footer 在每次换页和跳页后都会重新模拟**，比普通布局更严谨
+- 代码注释明确说明原因：header/footer 可能包含 Rel 行（相对高度，如 `10%`），其高度依赖于 `regions.full`
+
+#### 3.5.4 触发重算的完整场景总结
+
+| 场景 | 触发位置 | Header 重算 | Footer 重算 |
+|------|---------|------------|------------|
+| **普通布局 - 新页开始** | [`finish_region()` L1827-L1830](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/layouter.rs#L1827-L1830) → `layout_active_headers()` | ✅ 实际布局重新测量 | ✅ `prepare_footer()` + 实际布局 |
+| **普通布局 - 跳页判断阶段** | [`layout_active_headers()` L222-L256](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L222-L256) | ❌ 不重新模拟（TODO 问题） | ✅ 重新模拟 |
+| **普通布局 - prepare_footer 跳页** | [`prepare_footer()` L481-L509](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L481-L509) | ❌ 不涉及 | ✅ 跳过区域后重新模拟 |
+| **Rowspan 模拟 - 每次换页** | [`RowspanSimulator::finish_region()` L1259](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1259) | ✅ 重新模拟 | ✅ 重新模拟 |
+| **Rowspan 模拟 - 跳页后** | [`simulate_header_footer_layout()` L1207-L1234](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1207-L1234) | ✅ 重新模拟 | ✅ 重新模拟 |
 
 **重算原因**：
 - 跳过区域意味着进入了新的页面，新页面的 `regions.full` 可能与前一页不同
 - 例如：第一页是无限高度（如 float 容器），后续页面是有限高度
+- Rel 行的高度是相对于 `regions.full` 解析的，因此需要重新模拟
 
-**场景 2：prepare_footer 中跳过区域后**
+#### 3.5.5 高度差异对跨页表格测量的影响
 
-[`prepare_footer()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L502-L509) 同上。
-
-#### 3.5.2 高度重算对布局的影响
-
-**对 Auto 行测量的影响**：
+**影响 1：Auto 行测量的准确性**
 
 在 [`prepare_auto_row_cell_measurement()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L402-L436) 中：
 
 ```rust
-if breakable
-    && (!self.repeating_headers.is_empty()
-        || !self.pending_headers.is_empty()
-        || matches!(&self.grid.footer, Some(footer) if footer.repeated))
-{
-    let mapped_regions = self.regions.map(&mut custom_backlog, |size| {
-        Size::new(
-            size.x,
-            size.y
-                - self.current.repeating_header_height  // 减去 header
-                - self.current.footer_height,           // 减去 footer
-        )
-    });
-}
+let mapped_regions = self.regions.map(&mut custom_backlog, |size| {
+    Size::new(
+        size.x,
+        size.y
+            - self.current.repeating_header_height  // ← 依赖此值
+            - self.current.footer_height,           // ← 依赖此值
+    )
+});
 ```
 
-**影响点**：
-- Auto 行测量时，所有后续区域的高度都会预先减去 `repeating_header_height + footer_height`
-- 如果这些高度被重算，测量结果会不同
-- Rowspan 的 backlog 构造也依赖这些高度
+- Auto 行测量时，backlog 中的每个区域高度都要预先减去头尾高度
+- 如果头尾高度估计不准确，测量出的行高会有偏差
+- Rowspan 模拟流程因为每次都重算，所以更准确
 
-**对 rowspan 模拟的影响**：
+**影响 2：Rowspan 模拟的准确性**
 
 在 [`RowspanSimulator::new()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/rowspans.rs#L1044-L1045) 中：
 
@@ -850,12 +932,30 @@ header_height: current.repeating_header_height,
 footer_height: current.footer_height,
 ```
 
-- 模拟时也使用这些高度来计算每页的可用空间
-- 高度变化会影响模拟结果，进而影响 auto 行的扩展量
+- 模拟开始时使用当前的头尾高度作为初始值
+- 但后续每次换页都会通过 `simulate_header_footer_layout()` 重新计算
+- 这确保了模拟过程中高度始终与当前区域匹配
 
-#### 3.5.3 高度重算的潜在问题
+**影响 3：跳页判断的准确性（普通布局的 TODO 问题）**
 
-代码中有 TODO 注释指出了潜在问题：
+在 [`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L222-L243) 中：
+
+```rust
+// 跳过区域循环
+while !fits(header_height) {
+    finish_region_internal();  // 跳页
+    // ⚠️  Header 高度没有更新！
+    regions.size.y -= footer_height;  // footer 也还没更新（后面才更新）
+}
+```
+
+- 如果 header 包含 Rel 行，跳页后 `regions.full` 变化会导致 header 实际高度变化
+- 但跳页判断时使用的是旧的 header 高度，可能导致：
+  - 多跳了不必要的页面
+  - 或者跳页不够，需要再次跳页
+- 最终实际布局时会重新测量，所以结果仍然正确，但换页位置可能不是最优
+
+#### 3.5.6 已知的 TODO 问题
 
 [`layout_active_headers()`](file:///d:/fz/0601-2/solo-dogfeeding/code/124-typst/crates/typst-layout/src/grid/repeated.rs#L234-L238)：
 
@@ -867,10 +967,10 @@ footer_height: current.footer_height,
 // Would remove the footer height update below (move it here).
 ```
 
-**当前限制**：
-- Header 高度不会在换页时重算，假设其高度不变
-- 只有 Footer 高度在跳过区域后会重算
-- 这可能导致 header 在不同页面有细微差异时布局不准确
+**问题说明**：
+- 普通布局的跳页循环中，Header 高度应该和 Footer 一样在每次跳页后重新模拟
+- 目前只有 Footer 重新模拟了，Header 没有
+- 这是一个已知的待改进点，但在大多数情况下影响不大，因为最终实际布局时会重新测量
 
 ---
 
