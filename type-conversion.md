@@ -97,12 +97,38 @@ impl<T: FromValue> FromValue<Spanned<Value>> for Spanned<T> {
 }
 ```
 
-**选择哪个 impl 完全由调用方的目标类型决定，不涉及特化或方法解析优先级**。这两个 impl 的 Self 类型不同——impl A 的 Self 是任意 `T`，impl B 的 Self 是 `Spanned<T>`。Rust 的 trait 解析根据调用点的具体 Self 类型匹配对应的 impl：
+**两个 impl 的约束条件互不重叠，它们不是竞争候选，也不存在"选更具体的"优先级选择**。每个 impl 只在自己的约束范围内匹配：
 
-- 当调用方的 `T` 是 `f64`、`Content` 等普通类型时，Self = `f64`，只匹配 impl A（`T = f64`），impl B 要求 Self 是 `Spanned<..>` 不匹配。此时 span 被丢弃——因为 span 已在调用方通过 `.at(span)` 附加到 `SourceDiagnostic` 上。
-- 当调用方的 `T` 是 `Spanned<Inner>` 时，Self = `Spanned<Inner>`，impl B（`T = Inner`）比 impl A（`T = Spanned<Inner>`）对 Self 的约束更具体，Rust trait 解析选择 impl B。此时 span 被保留在返回的 `Spanned<Inner>` 中。
+```rust
+// impl A: Self = 任意 T，约束 T: FromValue（即 T 能从 Value 转换）
+impl<T: FromValue> FromValue<Spanned<Value>> for T {
+    fn from_value(value: Spanned<Value>) -> HintedStrResult<Self> {
+        T::from_value(value.v)   // 解包为 Value，调用 T: FromValue 的 from_value
+    }
+}
 
-决定性因素是**调用方在 `T: FromValue<Spanned<Value>>` 中填入的具体目标类型**：普通类型走 impl A 丢弃 span，`Spanned<..>` 类型走 impl B 保留 span。
+// impl B: Self = Spanned<T>，约束 T: FromValue（即内部 T 能从 Value 转换）
+impl<T: FromValue> FromValue<Spanned<Value>> for Spanned<T> {
+    fn from_value(value: Spanned<Value>) -> HintedStrResult<Self> {
+        let span = value.span;
+        T::from_value(value.v).map(|t| Spanned::new(t, span))
+    }
+}
+```
+
+**关键点：`FromValue` 是 `FromValue<V = Value>` 的简写，约束 `T: FromValue` 实际是 `T: FromValue<Value>`。**
+
+- **普通目标类型（如 `f64`、`Content`）**：Self = `f64`
+  - impl A：`T = f64`，约束 `f64: FromValue<Value>` ✓，匹配
+  - impl B：Self 要求是 `Spanned<..>`，与 `f64` 不匹配
+  - **只有 impl A 适用**，span 被丢弃——span 已在调用方通过 `.at(span)` 附加到 `SourceDiagnostic` 上。
+
+- **带位置目标类型（`Spanned<Inner>`）**：Self = `Spanned<Inner>`
+  - impl A：`T = Spanned<Inner>`，约束 `Spanned<Inner>: FromValue<Value>` ✗——`Spanned<Inner>` 从不单独实现 `FromValue<Value>`（`Spanned` 需要 span 信息才能构造，但 `Value` 本身没有 span），所以约束不成立
+  - impl B：Self = `Spanned<Inner>`，`T = Inner`，约束 `Inner: FromValue<Value>` ✓
+  - **只有 impl B 适用**，span 被保留在返回的 `Spanned<Inner>` 中。
+
+两个 impl 各自的 Self 类型和 trait bounds 决定了适用范围，不存在"两个候选都匹配、选更具体"的情形。
 
 ### 2.4 CastInfo：转换信息描述
 
@@ -521,7 +547,7 @@ SourceDiagnostic::error(span, "expected float, found boolean")
 
 2. **eat 不预筛是故意的**：`eat()` 假设调用方已经知道下一个位置参数的预期类型，不需要跳过。如果类型不匹配，说明用户传错了参数，应该立即报错。
 
-3. **Spanned<Value> 的 impl 选择由目标类型决定**：两个 `FromValue<Spanned<Value>>` impl 的 Self 类型不同（`for T` vs `for Spanned<T>`），Rust trait 解析根据调用方填入的具体目标类型匹配对应的 impl。普通类型走 `for T`（丢弃 span），`Spanned<..>` 类型走 `for Spanned<T>`（保留 span）。这不是特化，而是 Self 类型约束的自然结果。
+3. **Spanned<Value> 的两个 impl 约束互不重叠**：impl `for T` 要求 `T: FromValue<Value>`，impl `for Spanned<T>` 要求内部 `T: FromValue<Value>`。当目标是 `Spanned<Inner>` 时，impl `for T` 的约束退化为 `Spanned<Inner>: FromValue<Value>`——这从不成立，因为 `Spanned<..>` 不单独实现 `FromValue<Value>`。两个 impl 不是竞争候选，各自按自己的约束匹配适用范围。
 
 4. **HintedStrResult 的 At impl 保留提示**：普通的 `StrResult` 通过 `.at(span)` 会丢失提示，但 `from_value` 返回 `HintedStrResult`，其 `At` impl 会拆解 `HintedString` 的 vec，第一个做消息、其余做 hints，确保智能提示不丢失。
 
