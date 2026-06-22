@@ -827,7 +827,42 @@ if let Some(rule) = engine.library.rules.get(target, elem) {
 
 ## 十一、show par 与 set block 的 spacing 迁移边界
 
-### 11.1 架构变更背景：Par 不再是 Block
+### 11.1 核心事实：ParElem 没有内置 Show Rule
+
+这是最关键的代码事实，必须作为分析起点。
+
+在布局规则注册表 [crates/typst-layout/src/rules.rs#L39-L112](crates/typst-layout/src/rules.rs#L39-L112) 中，`register` 函数注册了所有内置 show rule：
+```rust
+pub fn register(rules: &mut NativeRuleMap) {
+    use Target::Paged;
+    // Model.
+    rules.register(Paged, STRONG_RULE);
+    rules.register(Paged, EMPH_RULE);
+    rules.register(Paged, LIST_RULE);
+    rules.register(Paged, ENUM_RULE);
+    rules.register(Paged, TERMS_RULE);
+    rules.register(Paged, HEADING_RULE);
+    rules.register(Paged, FIGURE_RULE);
+    rules.register(Paged, TABLE_RULE);
+    // ...还有很多（共约40+规则）
+    // 但是——没有 ParElem！
+}
+```
+
+**ParElem 不在注册列表中**。它既不是 Strong/Emph 那种简单的 Content 转换，也不是 Heading/Figure/Block 那种需要复杂布局的元素。
+
+**ParElem 的真实布局链路**（完全绕过 show rule 系统）：
+
+1. **Realization 阶段**：PAR 分组规则收集行内元素，`finish_par` 构造 `ParElem::new(body)`（[crates/typst-realize/src/lib.rs#L1203](crates/typst-realize/src/lib.rs#L1203)）
+2. `visit` → `prepare` → `verdict`：如果有 `show par` 规则，verdict 会匹配，但...
+3. **verdict 查找 builtin rule**：`engine.library.rules.get(target, ParElem::ELEM)` → 返回 `None`（因为没注册）
+4. `visit_show_rules`：发现 `step.is_none()`，直接返回 content（不进入 show rule 应用循环）
+5. **Flow Layout 阶段**：流式收集器直接识别 ParElem，调用 `layout_par`（[crates/typst-layout/src/flow/collect.rs#L83-L84](crates/typst-layout/src/flow/collect.rs#L83-L84)）
+6. 调用 `crate::inline::layout_par` → 行内布局 → 生成行 frames → 推送到 flow 的 Child 列表
+
+**重要结论**：ParElem 不经过 Builtin Show Rule 这一层。它直接进入流式布局，由 `layout_par` 和 `layout_inline` 函数处理。
+
+### 11.2 架构变更背景：Par 不再是 Block
 
 迁移提示的核心代码在 [crates/typst-eval/src/rules.rs#L79-L95](crates/typst-eval/src/rules.rs#L79-L95)：
 
@@ -857,38 +892,19 @@ fn check_show_par_set_block(vm: &mut Vm, recipe: &Recipe) {
 - **旧版本**：Paragraph 被当作 Block 的一种，通过 BlockElem 的 `above` / `below` 属性控制段间距
 - **新版本**：Paragraph 是独立的元素类型，拥有自己的 `spacing` 属性，不再读取 BlockElem 的 `above`/`below`
 
-### 11.2 ParElem 的 spacing vs BlockElem 的 above/below
+### 11.3 ParElem 的 spacing vs BlockElem 的 above/below
 
 两种间距属性定义在不同元素上，用途完全不同：
 
 **ParElem.spacing**（[crates/typst-library/src/model/par.rs#L213-L225](crates/typst-library/src/model/par.rs#L213-L225)）：
 ```rust
 /// The spacing between paragraphs.
-///
-/// Just like leading, this defines the spacing between the bottom edge of a
-/// paragraph's last line and the top edge of the next paragraph's first
-/// line. Spacing acts both above and below, collapsing to the greater of
-/// the amounts defined by adjacent paragraphs.
-///
-/// When a paragraph is adjacent to a @block, that block's
-/// @block.above[`above`] or @block.below[`below`] property takes precedence
-/// over the paragraph spacing.
 #[default(Em::new(1.2).into())]
 pub spacing: Length,
 ```
 
 **BlockElem.above / BlockElem.below**（[crates/typst-library/src/layout/container.rs#L318-L354](crates/typst-library/src/layout/container.rs#L318-L354)）：
 ```rust
-/// The spacing around the block. When `{auto}`, inherits the paragraph
-/// @par.spacing[`spacing`].
-///
-/// For two adjacent blocks, the larger of the first block's `below` and the
-/// second block's `above` spacing wins. Moreover, block spacing takes
-/// precedence over paragraph @par.spacing[`spacing`].
-#[external]
-#[default(Smart::Custom(Em::new(1.2).into()))]
-pub spacing: Smart<Spacing>,
-
 /// The spacing between this block and its predecessor.
 pub above: Smart<Spacing>,
 
@@ -900,75 +916,114 @@ pub below: Smart<Spacing>,
 - 相邻 Par ↔ Par：使用 `par.spacing`（两边值取大=折叠）
 - 相邻 Par ↔ Block：**Block 的 above/below 优先**（Par 文档中明确写了）
 - 相邻 Block ↔ Block：`block.below` 和 `block.above` 取大
-- BlockElem.spacing = auto 时，**继承 par.spacing 的默认值**
 
-### 11.3 show par: set block(above/below) 为什么失效了
+### 11.4 代码事实：show par: set block(...) 的所有 Block 属性都无效
 
-当用户写：
-```typst
-#show par: set block(above: 2em, below: 2em)
+这是与之前分析最大的不同点。现在有明确的代码证据：
+
+**Block 属性的消费位置**：BlockElem 的所有属性（width、fill、stroke、inset、above、below、radius、clip 等）只在 `layout_single_block` 和 `layout_multi_block` 中被读取。
+
+证据：[crates/typst-layout/src/flow/block.rs#L27-L28](crates/typst-layout/src/flow/block.rs#L27-L28)
+```rust
+// 只在 BlockElem 布局时读取：
+let width = elem.width.get(styles);     // BlockElem.width
+let height = elem.height.get(styles);   // BlockElem.height
+let inset = elem.inset.resolve(styles); // BlockElem.inset
+// ... fill、stroke、outset、radius、clip 等也是如此
 ```
 
-执行流程：
-1. Show 规则求值：`check_show_par_set_block()` **立即触发迁移 warning**（因为检测到 Transformation::Style 中有 BlockElem::above 或 below）
-2. Realization 阶段，PAR 分组构造出 ParElem
-3. verdict 中 show par 选择器匹配 → show-set 规则注入 `Styles([Property(BlockElem, above), Property(BlockElem, below)])` 到 Verdict.map
-4. ParElem 走 Builtin Show Rule（内置段落布局）
-5. **关键**：Builtin ParElem show 规则在计算段间距时，**读取的是 ParElem.spacing**，**不是 BlockElem.above/below**
-6. 注入的 BlockElem 属性对 ParElem 的内置布局完全没有影响 → **静默无效**
+**ParElem 的布局不读取任何 BlockElem 属性**：
 
-> 这就是为什么要加迁移 warning：代码执行没有报错，但用户期待的段间距调整完全没有效果，需要明确提示用户改用正确 API。
-
-### 11.4 show par 搭配 set block 的有效 vs 无效属性
-
-`show par: set block(...)` 中不同属性的效果：
-
-| Block 属性 | 在 show par 中是否生效 | 原因 | 替代写法 |
-|------------|----------------------|------|----------|
-| `spacing`（设置 above+below）| ❌ **无效**，迁移告警 | Par 不再读 Block 的 above/below | `set par(spacing: 2em)` |
-| `above` / `below` | ❌ **无效**，迁移告警 | 同上 | `set par(spacing: 2em)` |
-| `width` | ✅ 仍有效 | width 影响段落所在行的可用宽度 | `show par: set block(width: 80%)` |
-| `fill` / `stroke` / `radius` / `inset` / `outset` | ⚠️ **间接无效** | 这些属性需要 ParElem 被真正包装成 BlockElem 才能生效，但 Par 的内置 show rule 不会自动套 Block | 改用 `show par: it => block(fill: red, it)` |
-| `sticky` / `breakable` | ⚠️ 间接无效 | 同上 | 同上，显式包 Block |
-| `clip` | ⚠️ 间接无效 | 同上 | 同上 |
-
-### 11.5 Par 分组规则与元素构造
-
-Par 分组规则（[crates/typst-realize/src/lib.rs#L1045-L1073](crates/typst-realize/src/lib.rs#L1045-L1073)）触发的结果是通过 `finish_par`（[crates/typst-realize/src/lib.rs#L1190-L1205](crates/typst-realize/src/lib.rs#L1190-L1205)）构造出纯粹的 ParElem：
-
+在 [crates/typst-layout/src/flow/collect.rs#L159-L186](crates/typst-layout/src/flow/collect.rs#L159-L186) 的 `par()` 方法中：
 ```rust
-fn finish_par(mut grouped: Grouped) -> SourceResult<()> {
-    let (sink, start) = grouped.get_mut();
-    collapse_spaces(sink, start);
-    let elems = grouped.get();
-    let span = select_span(elems);
-    let (body, trunk) = repack(elems);
-    let s = grouped.end();
-    // ★ 构造纯粹的 ParElem，不自动包裹 BlockElem
-    let elem = ParElem::new(body).pack().spanned(span);
-    visit(s, s.store(elem), trunk)
+fn par(&mut self, elem: &'a Packed<ParElem>, styles: StyleChain<'a>) -> SourceResult<()> {
+    let lines = crate::inline::layout_par(
+        elem,
+        self.engine,
+        self.locator.next(&elem.span()),
+        styles,
+        self.base,      // ← region Size 是 flow 的基宽度（列宽），不是 BlockElem.width
+        self.expand,
+        self.par_situation,
+    )?;
+    // ...
 }
 ```
 
-**核心要点**：`ParElem::new(body)` 构造出的元素**没有被包装成 BlockElem**。所以即使 StyleChain 中有 BlockElem 的属性（如 above/below/fill/stroke 等），ParElem 自己的 Builtin Show Rule 在布局时也不会去读取这些 BlockElem 属性——因为它不是 Block。
+传入的 region 是 `self.base`，即 flow 的列宽度，**完全不读取 BlockElem.width**。
 
-如果你需要给段落加背景色或边框，应该用 transform show rule 显式包裹，而不是 show-set：
+在行内布局链路 [crates/typst-layout/src/inline/mod.rs](crates/typst-layout/src/inline/mod.rs) 中：
+- `configuration` 函数读取 `ParElem::justify`、`ParElem::linebreaks`、`ParElem::first_line_indent`、`ParElem::hanging_indent`、`TextElem::size`、`TextElem::dir`、`AlignElem::alignment` 等
+- **没有任何地方读取 `BlockElem::*`**
 
+**结论**：`show par: set block(...)` 中注入的 Block 属性全部无效，因为 ParElem 的布局代码不读取它们。这些属性只在 BlockElem 自身布局时才会被消费。
+
+### 11.5 show par 搭配 set block 的属性有效性完整表
+
+基于代码事实的完整分析：
+
+| Block 属性 | 在 show par: set block(...) 中是否生效 | 原因 | 正确写法 |
+|------------|--------------------------------------|------|----------|
+| `above` / `below` / `spacing` | ❌ **无效**，有迁移告警 | Par 不再是 Block，不读 BlockElem.above/below | `set par(spacing: 2em)` |
+| `width` | ❌ **无效**，无告警 | ParElem 布局用 flow 列宽，不读 BlockElem.width | `show par: it => block(width: 80%, it)` |
+| `height` | ❌ **无效**，无告警 | 同上 | 同上，显式包 Block |
+| `fill` / `stroke` / `radius` | ❌ **无效**，无告警 | 需要 BlockElem 包装器来消费这些属性 | 同上，显式包 Block |
+| `inset` / `outset` | ❌ **无效**，无告警 | 同上 | 同上，显式包 Block |
+| `clip` / `breakable` / `sticky` | ❌ **无效**，无告警 | 同上 | 同上，显式包 Block |
+| `align`（BlockElem.align） | ❌ **无效**，无告警 | Par 布局读 AlignElem.alignment，不读 BlockElem.align | `set align(center)` 或 `#show par: set align(center)` |
+
+**唯一能让 Block 属性生效的方式**：通过 transform show rule 显式把 ParElem 包装进 BlockElem：
 ```typst
-// ❌ 不会生效：show-set 只是把 Block 属性注入样式链
-#show par: set block(fill: red)
+// ✅ 正确：显式包 Block，Block 属性由 BlockElem 布局消费
+#show par: it => block(
+    width: 80%,
+    fill: red,
+    stroke: 1pt,
+    inset: 1em,
+    above: 1em,
+    below: 1em,
+    it
+)
 
-// ✅ 生效：显式把 ParElem 包进 BlockElem
-#show par: it => block(fill: red, stroke: 1pt, it)
+// ❌ 错误：show-set 注入的 Block 属性无人消费
+#show par: set block(width: 80%, fill: red)
 ```
 
-### 11.6 show par: set block(width) 为什么还能生效
+### 11.6 为什么 show par: set block(width) 看起来"好像"有效
 
-需要区分两类 Block 属性：
-- **段落布局前读取的属性**（如 width、align、leading、justify 等）→ 在 ParElem Builtin Show Rule 内部通过 StyleChain 查找，因为这些属性通过 `styles.get(BlockElem::width)` 影响行布局计算
-- **Block 包装属性**（如 fill、stroke、inset、above/below 等）→ 需要真正有一个 BlockElem 在外层包裹才生效，而 ParElem 不会自动套 Block
+在某些情况下用户可能误以为 `show par: set block(width: 80%)` 有效，实际上是其他机制在起作用：
 
-`width` 之所以生效，是因为 ParElem 的布局在计算行宽时会检查 BlockElem::width 样式，但 above/below/fill 等需要 BlockElem 作为包装器才会被布局引擎消费。
+1. **AlignedElem 或外层 Block 的 width**：如果外层有 `#set block(width: 80%)`，那是外层 Block 的 width，不是 show par 注入的
+2. **Align 属性被误读**：`AlignElem::alignment` 是独立属性，通过 `styles.get(AlignElem::alignment)` 读取，容易和 BlockElem.align 混淆
+3. **show rule 的 transform 形式**：如果用户实际写的是 `#show par: it => block(width: 80%, it)`（transform 形式），那是显式包装，当然有效
+
+### 11.7 Par 分组与流式收集的完整链路
+
+为了完整理解，Par 从文本到布局的完整链路：
+
+```
+文本输入（"Hello" + "World" + 空行）
+    ↓ （PAR 分组规则）
+[crates/typst-realize/src/lib.rs#L1045-L1073]
+    ↓
+finish_par 构造 ParElem::new(body)
+[crates/typst-realize/src/lib.rs#L1203]
+    ↓
+visit(ParElem) → prepare → verdict
+    ↓ （没有 builtin rule，step = None）
+layout_flow → collect → run_block()
+    ↓ （匹配 ParElem）
+self.par(elem, styles)
+[crates/typst-layout/src/flow/collect.rs#L83-L84]
+    ↓
+layout_par → layout_inline_impl → 行布局 → 生成 frames
+    ↓
+Child::Line 被推入 flow 的 output
+    ↓
+compose → distribute → 页面排版
+```
+
+在整个链路中，**没有任何环节会读取 BlockElem 的属性**。
 
 ---
 
@@ -1153,8 +1208,8 @@ impl Eval for ast::ModuleInclude<'_> {
 | `#show page: ...`（任何导出目标） | ⚠️ 告警 A，规则永久无效 | check_show_page_rule() 在 Eval 阶段就告警 |
 | `#set document(...)` 在 block() 内部 | ❌ 编译错误：not allowed inside of containers | RealizationKind != Document/Bundle |
 | `#show par: set block(above: 2em)` | ❌ 迁移告警 + 实际无效 | Par 不再是 Block，不读 BlockElem.above/below |
-| `#show par: set block(width: 80%)` + 外层 `#set block(width: 60%)` | ✅ show-set 80% 覆盖外层 60% | width 属性被 Par 布局通过 StyleChain 读取 |
-| `#show par: set block(fill: red)` | ❌ 间接无效（无警告）| ParElem 不自动包 BlockElem，fill 无包装器消费 |
+| `#show par: set block(width: 80%)` + 外层 `#set block(width: 60%)` | ❌ 两者都无效，无告警 | ParElem 布局用 flow 列宽，不读 BlockElem.width |
+| `#show par: set block(fill: red)` | ❌ 无效（无警告）| ParElem 不经过 BlockElem 布局，fill 等属性无人消费 |
 | `#show heading` + import 中定义的规则在容器内 heading | ✅ 规则生效，但只有匹配 heading 时注入 | 容器内 StyleChain 仍包含外层 Recipe |
 | `#show` 正则匹配后，递归内容中同样正则 | ✅ 通过 Revocation 机制跳过已应用规则 | Style::Revocation(index) 注入 StyleChain |
 | `#show heading: box` 后，heading 产出 box 内 heading | ❌ 不会重复应用（guard 阻止） | Content.guards 打了该 RecipeIndex 的 guard |
@@ -1177,8 +1232,11 @@ impl Eval for ast::ModuleInclude<'_> {
 | 告警 A：show page 求值告警 | [crates/typst-eval/src/rules.rs](crates/typst-eval/src/rules.rs) | L59, L66-L77 |
 | 告警 B：HTML 下 set page 告警 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L642-L646 |
 | spacing 迁移提示（show par + set block）| [crates/typst-eval/src/rules.rs](crates/typst-eval/src/rules.rs) | L60, L79-L95 |
+| ParElem 无内置 show rule（register 无注册） | [crates/typst-layout/src/rules.rs](crates/typst-layout/src/rules.rs) | L39-L112 |
 | ParElem.spacing 属性定义 | [crates/typst-library/src/model/par.rs](crates/typst-library/src/model/par.rs) | L98-L99, L213-L225 |
-| BlockElem.above/below 定义 | [crates/typst-library/src/layout/container.rs](crates/typst-library/src/layout/container.rs) | L250-L251, L318-L354 |
+| BlockElem 属性消费（layout_single_block） | [crates/typst-layout/src/flow/block.rs](crates/typst-layout/src/flow/block.rs) | L27-L28, L76-L95 |
+| Flow 中 ParElem 直接调用 layout_par | [crates/typst-layout/src/flow/collect.rs](crates/typst-layout/src/flow/collect.rs) | L83-L84, L159-L186 |
+| ParElem 行内布局不读 Block 属性 | [crates/typst-layout/src/inline/mod.rs](crates/typst-layout/src/inline/mod.rs) | L180-L242 |
 | PAR 分组规则定义 | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L1045-L1073 |
 | finish_par 构造 ParElem | [crates/typst-realize/src/lib.rs](crates/typst-realize/src/lib.rs) | L1190-L1205 |
 | RecipeIndex 定义 | [crates/typst-library/src/foundations/styles.rs](crates/typst-library/src/foundations/styles.rs) | L526-L528 |
