@@ -115,7 +115,7 @@ pub struct SystemWorld {
 
 注意：
 - `library` 从未被 reset，它在整个 watch 生命周期内全局恒定
-- `fonts` 是 `LazyLock<FontStore>`，在首次访问后**全程复用、永不重置**
+- `fonts` 是 `LazyLock<FontStore>`，初始化后全程复用。不重置的原因有两层：外层 `LazyLock` 无清空方法（类型限制），内层 `FontStore`/`FontSlot` 未实现 reset（设计选择，详见 2.5.3 节）
 - **只有 `files` 和 `now` 会在每次编译前被 reset**
 
 ### 2.3 文件缓存重置：`FileStore::reset`
@@ -320,12 +320,21 @@ pub struct FontBook {
 
 #### 2.5.3 为什么不参与 reset
 
-**技术层面**：
-- `LazyLock<FontStore>` 一旦初始化就没有 reset 接口（Rust 标准库设计）
-- `FontSlot.font` 是 `OnceLock<Option<Font>>`，一旦 set 就无法清空
-- `LazyHash<FontBook>` 的哈希值一旦计算就缓存，不会重新计算
+**两层原因：外层类型限制 + 内层设计选择**
 
-**设计层面**（`crates/typst-library/src/lib.rs:51-54` 的注释明确说明）：
+字体缓存不重置的原因需要分两层看，不能一概而论说"OnceLock 无法清空"——日期缓存中的 `OnceLock` 恰恰就被清空了：
+
+**外层：`LazyLock<FontStore>` 无法重置（类型限制）**
+
+`SystemWorld.fonts` 的类型是 `LazyLock<FontStore, ...>`。`LazyLock` 只实现了 `Deref`（提供 `&FontStore` 访问），没有实现 `DerefMut`，也没有 `take()`、`clear()` 等方法。即使 `FontStore` 自身有 `reset(&mut self)` 方法，也无法通过 `LazyLock` 调用它。这是 Rust 标准库的类型限制，不是设计选择。
+
+对比日期缓存：`TimeInner::System(OnceLock<DateTime<Utc>>)` 的 `OnceLock` **有** `take(&mut self)` 方法，`Time::reset` 正是通过 `time_lock.take()` 清空了它（`crates/typst-kit/src/datetime.rs:126`）。所以 `OnceLock` 本身**可以被清空**，前提是你持有 `&mut` 引用。
+
+**内层：`FontSlot` 和 `FontStore` 未实现 reset（设计选择）**
+
+即使绕过 `LazyLock` 的限制，`FontStore` 和 `FontSlot` 也没有提供任何 reset 方法（搜索 `crates/typst-kit/src/fonts.rs` 全文，无 `reset`/`clear`/`invalidate` 方法）。而对比文件缓存，`FileSlot` 有明确的 `reset(&mut self)` 方法（`crates/typst-kit/src/files.rs:168`），`FileStore` 也有 `reset(&mut self)`（`crates/typst-kit/src/files.rs:111`）。所以内层也是一个设计选择：字体不需要重置，因此没写这个路径。
+
+**设计意图**（`crates/typst-library/src/lib.rs:51-54` 的注释明确说明）：
 
 > The compiler doesn't do the caching itself because the world has much more
 > information on when something can change. For example, fonts typically don't
@@ -334,12 +343,12 @@ pub struct FontBook {
 
 翻译：字体**通常不会变化**，因此可以跨多次编译缓存。
 
-**性能层面**：
+**性能考量**：
 - 系统字体扫描可能涉及上千个字体文件，是昂贵的 I/O + 解析操作
 - 每次编译前重新扫描会完全抵消增量编译的性能收益
 - watch 模式也不监听字体目录的变化（只监听源文件依赖）
 
-**语义层面**：
+**语义前提**：
 `World::font()` 方法的注释（`crates/typst-library/src/lib.rs:84-88`）暗示字体索引跨轮次稳定：
 
 > Note that the index is not guaranteed to be in bounds of the font book
@@ -348,6 +357,14 @@ pub struct FontBook {
 > font book during incremental compilation validation.
 
 这说明 comemo 在缓存验证回放时，可能用"上一轮记录的字体索引"调用 `world.font(index)`，因此**字体索引在整个 watch 生命周期内必须保持稳定**。
+
+**三类缓存中 OnceLock 的对比**：
+
+| 缓存 | OnceLock 位置 | 是否被 take() 清空 | 原因 |
+|------|-------------|-------------------|------|
+| 日期缓存 | `TimeInner::System(OnceLock<DateTime<Utc>>)` | ✅ 是，`Time::reset` 调用 `time_lock.take()` | 日期可能跨天变化，需要刷新 |
+| 文件缓存 | 无 OnceLock（`FileSlot` 用 enum 状态机） | 不适用 | 用 `mem::take` 做状态转换，不需要 OnceLock |
+| 字体缓存 | `FontSlot.font: OnceLock<Option<Font>>` | ❌ 否，无 reset 路径 | 设计选择：字体不需要重置；外层 `LazyLock` 也不允许重置 |
 
 #### 2.5.4 参与缓存验证的方式
 
@@ -566,8 +583,9 @@ world.reset()
   │      （如果是 TimeInner::Fixed 则什么都不做）
   │
   └─ fonts：不参与 reset，全程复用
-      └─ LazyLock<FontStore> 已初始化 → LazyHash<FontBook> 哈希不变
-         FontSlot.OnceLock 已加载的字体永远不变
+      ├─ 外层 LazyLock<FontStore>：无 take()/clear() 方法，类型限制不可重置
+      └─ 内层 FontSlot.OnceLock<Option<Font>>：OnceLock 类型本身可 take()，
+         但 FontSlot/FontStore 未实现 reset 路径（设计选择）
     │
     ▼ 编译过程中首次访问 world.source(A_id)
     └─ crates/typst-kit/src/files.rs:190 source()
@@ -712,13 +730,23 @@ comemo::evict(10)
 
 ### 7.2 三重缓存策略
 
-Watch 模式下的缓存分为三个独立维度，根据变化频率采用不同的重置策略：
+Watch 模式下的缓存分为三个独立维度，根据变化频率和数据特点采用不同的重置策略：
 
-| 缓存类型 | 重置策略 | 核心机制 | 设计考量 |
-|---------|---------|---------|---------|
-| **文件缓存** | 每次编译前 reset | `FileStore::reset` → `FileSlot` 转为 `Empty(stale)`，保留陈旧 Source 用于增量解析 | 源文件可能随时变化，必须重新从磁盘确认，但尽量保持语法树稳定以利于缓存命中 |
-| **日期缓存** | 每次编译前条件 reset | `Time::reset` 仅清空 `System(OnceLock)`，`Fixed` 变体无视 | 日期可能跨天变化，但单轮编译内必须一致；固定时间戳模式下永远不变用于可重现构建 |
-| **字体元数据缓存** | 永不 reset | `LazyLock<FontStore>` + `LazyHash<FontBook>` + `OnceLock<Font>` | 字体通常不会变化，扫描成本高昂，且跨轮次稳定的字体索引是增量缓存验证的语义前提 |
+| 缓存类型 | 重置策略 | 重置机制 | 不重置 / 不完全重置的原因 |
+|---------|---------|---------|------------------------|
+| **文件缓存** | 每次编译前 reset | `FileStore::reset` → `FileSlot` 用 `mem::take` 转为 `Empty(stale)`，保留陈旧 Source 用于增量解析 | — |
+| **日期缓存** | 每次编译前条件 reset | `Time::reset` 通过 `OnceLock::take()` 清空 `System` 变体；`Fixed` 变体无视 | `Fixed` 变体用于可重现构建，不需要刷新；`System` 变体用 `OnceLock` 而非 `LazyLock`，正是因为 `OnceLock` 支持 `take()` 而 `LazyLock` 不支持 |
+| **字体元数据缓存** | 永不 reset | 无 reset 路径 | 外层 `LazyLock<FontStore>` 无清空方法（类型限制）；内层 `FontSlot`/`FontStore` 未实现 reset（设计选择：字体通常不变、扫描成本高、索引稳定性是缓存验证的语义前提） |
+
+三类缓存使用了三种不同的"一次性初始化"原语，它们的可重置性截然不同：
+
+| 原语 | 用于 | 可否清空 | 证据 |
+|------|------|---------|------|
+| `OnceLock<T>` | 日期缓存（`TimeInner::System`）、字体对象（`FontSlot.font`） | ✅ 可以，`take(&mut self) -> Option<T>` | `crates/typst-kit/src/datetime.rs:126` 调用了 `time_lock.take()` |
+| `LazyLock<T>` | 字体存储（`SystemWorld.fonts`） | ❌ 不可以，无 `take()`/`clear()`/`get_mut()` 方法 | Rust 标准库 API |
+| enum 状态机 | 文件槽位（`FileSlot`） | ✅ 可以，`mem::take` + 手动状态转换 | `crates/typst-kit/src/files.rs:168-174` |
+
+**关键区分**：日期缓存和字体缓存都用了 `OnceLock`，但只有日期缓存的 `OnceLock` 被 `take()` 清空。这说明**能否清空不是由 `OnceLock` 类型决定的，而是由是否有 `&mut` 访问权限和是否实现了 reset 路径决定的**。字体缓存的 `FontSlot` 没有实现 reset，同时外层 `LazyLock` 又阻止了通过 `&mut FontStore` 访问，两层因素叠加导致字体缓存完全不可重置。
 
 ### 7.3 稳定性设计：让 Hash 尽可能不变
 
