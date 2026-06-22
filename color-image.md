@@ -307,7 +307,7 @@ enum FrameItem {
 | 光栅 PNG | `typst-render` | 全部转 sRGB → `tiny_skia::Color` | 按像素放大到视口尺寸（memoized） |
 | PDF | `typst-pdf` | 保留原生空间：Luma/CMYK/RGB/Spot | JPEG 直接嵌入，其他转 `CustomImage` |
 | SVG | `typst-svg` | 转 CSS 颜色函数（oklab/hsl 等） | 转 base64 data: URL，PDF 转 SVG |
-| HTML | `typst-html` | 同上 | 同上 |
+| HTML | `typst-html` | **两条路径**：①CSS color 属性 → ToCss（同 SVG）；②内联 SVG → 同上 | **两条路径**：①`<img>` base64（与 SVG 共享缓存）；②内联 `<svg>`（typst-svg 渲染器） |
 
 ### 5.1 光栅渲染（typst-render）
 
@@ -390,6 +390,51 @@ let filter = match image.scaling() {
 ```
 
 因为 `scaling` 是 `Image` 的一部分（hash 包含在内），所以 scaling 改变 → Image hash 改变 → build_texture 缓存失效 → 重新生成纹理。
+
+#### 5.1.4 PNG 缓存 key 与图像身份的 Hash 级联
+
+`build_texture(&image, w, h)` 虽然只有 3 个参数，但 `image: &Image` 自身是一个**三层级联的 Hash 对象**。梳理如下（全部对照代码）：
+
+```
+第一层：Image 包装
+Image(Arc<LazyHash<ImageInner>>)  ← `crates/typst-library/src/visualize/image/mod.rs#L389-L390`
+  └─ #[derive(Hash)] 因为 LazyHash::hash 委托内部
+       │
+       ▼
+第二层：ImageInner
+ImageInner                             ← `mod.rs#L393-L399`
+  ├─ kind: ImageKind                   ← 枚举，#[derive(Hash)]，`mod.rs#L501-L507`
+  │    │
+  │    ├─ Raster(RasterImage)
+  │    │    └─ Arc<RasterImageInner>
+  │    │         └─ impl Hash:        ← `crates/typst-library/src/visualize/image/raster.rs#L200-L207`
+  │    │              ├─ data: Bytes     ◄── 原始文件字节（核心身份）
+  │    │              ├─ format          ◄── RasterFormat（Jpg/Png/...）
+  │    │              └─ icc: Option<Bytes>  ◄── ICC 字节（重要！见下）
+  │    ├─ Svg(SvgImage)  ──► hash: SvgImageInner（data + fonts/images 状态）
+  │    └─ Pdf(PdfImage)  ──► hash: document(Arc) + page_index
+  ├─ alt: Option<EcoString>          ← 无障碍描述（通常 None）
+  └─ scaling: Smart<ImageScaling>    ← Smooth / Pixelated
+```
+
+**逐项分析 PNG 缓存复用性：**
+
+| 输入变化 | Image hash 是否变化 | build_texture 缓存是否失效 | 备注 |
+|---------|-------------------|--------------------------|-----|
+| 源文件字节不同 | ✅ 变化（data 参与） | ✅ 失效 | 正常行为 |
+| 探测到的 format 不同 | ✅ 变化 | ✅ 失效 | JPEG 和 PNG 解码路径完全不同 |
+| ICC profile 字节不同 | ✅ 变化（icc 参与） | ✅ 失效 | **缓存失效但视觉无变化**：PNG 渲染不读取 ICC，只使用解码后的像素。虽然会重新走一遍 `resize_exact + premultiply`，但输出像素与之前相同。这个设计是防御性的——保证 identity 语义完整。 |
+| 用户从 Auto ICC 切换到 Custom ICC（字节相同） | ❌ 不变 | ❌ 命中 | 因为 `Smart<Bytes>` 仅在**解码缓存层**是 key，在 RasterImageInner 中已经被展开为纯 `Option<Bytes>`，所以 Auto/Custom 只要提取出的字节一致，PNG 缓存就共享。 |
+| EXIF orientation 不同 | ✅ 变化（因为源文件 data 不同） | ✅ 失效 | orientation 是 data 的子集，正常 |
+| DPI 元数据不同 | ✅ 变化（data 变） | ✅ 失效 | 同上，DPI 在文件字节内 |
+| alt 文本不同 | ✅ 变化 | ✅ 失效 | 极小概率事件，alt 不会随意改 |
+| ImageScaling 变了 | ✅ 变化 | ✅ 失效 | scaling 不同 → filter 不同 → 缩放结果不同 |
+| 布局尺寸 / 旋转角度变了 | 不变 | ✅ 失效 | w, h 变了，单独的参数 |
+| pixel_per_pt 渲染精度变了 | 不变 | ✅ 失效 | 同上 |
+
+**重要洞察**：ICC profile 虽然会触发 PNG 缓存重建，但重建后的像素完全相同（tiny_skia 不做色彩管理）。这意味着对于 PNG 导出场景，改变 ICC profile 是一个「空转的缓存失效」——耗时但无结果变化。如果要优化性能，可以在 PNG 路径上把 ICC 从 build_texture 的等效 key 中剥离，但需要额外的类型拆分。
+
+---
 
 ### 5.2 PDF 导出（typst-pdf）
 
@@ -509,6 +554,190 @@ Pdf               ──► hayro_svg::convert(page) → SVG 字符串
 
 ---
 
+### 5.4 HTML 导出（typst-html）
+
+核心文件：
+- `crates/typst-html/src/css/encode.rs` — CSS 颜色编码（ToCss trait）
+- `crates/typst-html/src/rules.rs` — `IMAGE_RULE`（普通图片）
+- `crates/typst-html/src/convert.rs` — `FrameElem` 转换（frame 嵌入）
+- `crates/typst-html/src/encode.rs` — `write_frame` / `write_element`
+- `crates/typst-svg/src/lib.rs` — `svg_in_html`（frame 嵌入 SVG 渲染）
+
+HTML 是最特殊的后端，有**两条完全独立的图像嵌入路径**：
+1. 普通 `#image(...)` → 原生 `<img>` 标签（WebImage + base64）
+2. `#html.frame(...)` 或 `#figure` 等复杂布局 → 内联 `<svg>`（完整 SVG 渲染）
+
+颜色路径则是**复用 ToCss trait 实现**，与 SVG 非常类似但简化了若干选择。
+
+#### 5.4.1 颜色编码策略
+
+所有颜色最终通过 `ToCss for Color`（`crates/typst-html/src/css/encode.rs#L396-L479`）编码：
+
+```
+Color.to_process()  ← Spot 先用 fallback
+   │
+   ▼
+├─ Rgb / Cmyk / Luma  ──►  to_rgb()
+   │                        ├─ 8-bit 精度足够 → #rrggbb[aa]
+   │                        └─ 否则 → rgb(r g b / a)
+   │
+   ├─ Oklab            ──►  oklab(L a b / a)    (CSS Color Level 4)
+   ├─ Oklch            ──►  oklch(L c h / a)  (CSS Color Level 4)
+   ├─ LinearRgb        ──►  color(srgb-linear r g b / a)
+   └─ Hsl / Hsv         ──►  to_hsl() → hsl(h s l / a)
+```
+
+Paint 的支持度：见 `crates/typst-html/src/css/encode.rs#L386-L393`：
+
+```rust
+impl ToCss for Paint {
+    fn emit(&self, w: &mut CssWriter) {
+        match self {
+            Self::Solid(color) => w.emit(color),
+            Self::Gradient(_) => w.fail("gradient"),  // ← ❌ 不支持，需要其他方式
+            Self::Tiling(_) => w.fail("tiling"),  // ← ❌ 同理
+        }
+    }
+}
+```
+
+**结论**：HTML 的 Paint 只支持 Solid 纯色，渐变和平铺需要通过其他方式（如 SVG/CSS 内联方式另行实现）。
+
+#### 5.4.2 路径 A：普通图片 → `<img>` 标签
+
+入口：`IMAGE_RULE`（`crates/typst-html/src/rules.rs#L774-L819`）：
+
+```
+#image("photo.jpg", width: 5cm)
+   │
+   ▼
+1. elem.decode(engine, styles)    ← 复用 library 层解码缓存（同所有后端）
+   │
+   ▼
+2. typst_svg::WebImage::new(&image)    ← 【共享缓存！与 SVG 后端复用】
+   │                                    （key: image 对象身份）
+   ▼
+3. .to_base64_url()                  ← 【共享缓存！与 SVG 后端复用】
+   │                                    （key: WebImage.format + data）
+   ▼
+4. 构造 attrs + css：
+   ├─ src = data:image/jpeg;base64,xxxx
+   ├─ width / height（像素整数，占位用）
+   ├─ alt（可选）
+   └─ style = "width: 5cm; image-rendering: auto"
+        ↪ image-rendering 由 ImageScaling 翻译（smooth→auto, pixelated→pixelated）
+   │
+   ▼
+输出 <img src="data:..." width="..." height="..." alt="..." style="...">
+```
+
+**缓存共享的关键**：`typst_svg::WebImage` 和 `to_base64_url` 是 `typst-svg` crate 的函数，不是 `typst-html` 自己实现的。因此：
+- SVG 和 HTML 对同一张图**完全共享同一套缓存条目**
+- 如果同一份文档同时导出 SVG + HTML，不会重复编码 base64
+
+#### 5.4.3 路径 B：html.frame / 复杂布局 → 内联 `<svg>`
+
+HTML 中如果需要表达复杂的排版（数学公式、文字环绕、裁剪遮罩等），Typst 用的思路是：**先在 Paged 模式下完整 layout 成 Frame，然后把整个 Frame 打包成 HtmlFrame，最后用 typst-svg 渲染器输出内联 SVG**。
+
+处理流程分三步：
+
+**第一步：FrameElem → HtmlFrame（convert 阶段）**
+
+见 `crates/typst-html/src/convert.rs#L140-L154`：
+
+```rust
+// 在 convert::convert_children() 中遇到 FrameElem
+   │
+   ▼
+1. 强制 Target::Paged（按分页模式排版）
+2. 在无限大 Region 上 layout_frame(body)
+   └─ 产出：完整的 Frame（含所有子帧：Image/Text/Shape 等）
+   │
+   ▼
+3. HtmlFrame::new(frame, styles, span)   ← crates/typst-html/src/dom.rs#L523-L530
+   │
+   │  struct HtmlFrame {
+   │      inner: Frame,           // 完整布局结果
+   │      text_size: Abs,      // 供 em 单位换算
+   │      css: Properties,    // width/height 等样式
+   │      anchors: EcoVec<(Point, EcoString)>,  // 可链接锚点
+   │      id: Option<EcoString>,
+   │      span: Span,
+   │  }
+   │
+   ▼
+   HtmlNode::Frame(HtmlFrame)
+```
+
+**第二步：encode 阶段 → 内联 SVG**
+
+见 `crates/typst-html/src/encode.rs#L391-L401`：
+
+```rust
+fn write_frame(w, frame) {
+    let svg = typst_svg::svg_in_html(
+        &frame.inner,          // Frame
+        frame.text_size,       // Abs
+        w.pretty,             // 是否美化
+        frame.id.as_deref(),   // id
+        &inline_css,           // 内联样式（转 style 属性）
+        &frame.anchors,       // 锚点坐标
+        w.link_resolver,        // 链接解析器
+    );
+    w.buf.push_str(&svg);     // 直接把 SVG 字符串塞进 HTML
+}
+```
+
+**第三步：svg_in_html 内部**（`crates/typst-svg/src/lib.rs#L82-L110`）：
+
+```
+svg_in_html(frame, text_size, pretty, id, styles, anchors, link_resolver)
+   │
+   ▼
+1. SVGRenderer::with_options(Some(link_resolver))
+   └─ 与标准 SVG 导出共享渲染器
+   │
+   ▼
+2. renderer.render_frame(&mut writer)
+   │
+   ├─ 所有颜色：ToCss for Color（同 5.4.1 路径）
+   ├─ 所有 FrameItem::Image
+   │   └─ WebImage::new(&image).to_base64_url()
+   │       └─ 【与路径 A 完全共享缓存！】
+   │
+   ├─ 所有 FrameItem::Text → <text> 元素
+   └─ 所有 FrameItem::Shape → SVG path/fill/stroke
+   │
+   ▼
+输出：<svg xmlns="..." style="width: ..; height: ..">...嵌套 SVG 元素...</svg>
+   └─ 直接嵌入 HTML 流中，不是 <img src=，而是作为 DOM 节点
+```
+
+#### 5.4.4 两条路径的对比与缓存共享
+
+| 维度 | 路径 A：#image() → `<img>` | 路径 B：#html.frame(...) → 内联 `<svg>` |
+|-----|-----------------------------|---------------------------------------|
+| 代码入口 | `IMAGE_RULE` rules.rs#L774 | `convert.rs#L140` |
+| 图像嵌入方式 | 外部资源（base64 data: URL） | SVG DOM 节点内嵌图（仍是 base64，但嵌在 SVG 内部） |
+| 文字渲染 | 交给浏览器 img 解码 | typst-svg <text> 元素 |
+| 颜色保真度 | 不涉及（整图） | 通过 SVG ToCss（完整 CSS Color 4 支持） |
+| 缩放 / 裁剪 | CSS width/height | SVG viewBox + CSS |
+| 与 SVG 后端的缓存共享 | ✅ WebImage::new ✅ to_base64_url | ✅ 完全共享渲染器 + 上述两个缓存 |
+| 适用场景 | 简单图像独立图片 | 复杂排版、文字、公式等需要完整 Typst 布局的内容 |
+
+#### 5.4.5 HTML 图像缓存失效条件
+
+| 变化因素 | 路径 A `<img>` 是否重编码 | 路径 B 内联 SVG 是否重渲染 | 原因 |
+|---------|------------------------|-------------------------|-----|
+| 源文件字节变了 | ✅ 是 | ✅ 是 | Image hash 变化 → 重新 WebImage::new |
+| ICC profile 变了 | ✅ 是（Exchange 格式原字节保留） | ✅ 是（同左） | RasterImageInner.icc 参与 hash |
+| ImageScaling 变了 | ✅ 是 | ✅ 是 | Image 含 scaling → hash 变化 |
+| 图像显示尺寸变了 | ❌ 否（CSS width/height 由浏览器重绘） | ❌ 否（SVG viewBox 自适应） |
+| 文字内容变了 | 不涉及（不是路径 A） | ✅ 是（Frame items 内容变了重新 render_frame） |
+| 旋转变换变了 | ❌ 否（CSS transform 浏览器重绘） | ✅ 是（transform 写入 SVG 元素属性） |
+
+---
+
 ## 6. 三级缓存全景图
 
 综合以上分析，整个系统有 **三个层级的缓存**，从粗到细依次是：
@@ -526,26 +755,26 @@ Pdf               ──► hayro_svg::convert(page) → SVG 字符串
 └─────────────────────┬───────────────────────────────┘
                       │
                       ▼
-┌─────────────────────────────────────────────────────┐
-│  第二层：渲染缓存（各后端独立）                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  │
-│  │ build_texture│  │convert_raster│  │WebImage::new│
-│  │  (PNG)       │  │  (PDF)       │  │  (SVG)    │  │
-│  └──────┬───────┘  └──────┬───────┘  └─────┬─────┘  │
-│     image + w,h     raster + interpolate    image   │
-└──────────┬──────────────────┬───────────────┬───────┘
-           │                  │               │
-           ▼                  ▼               ▼
-     缩放后的像素       PDF 图像对象      Web 可用格式
-           │                  │               │
-           ▼                  ▼               ▼
-┌─────────────────────────────────────────────────────┐
-│  第三层：衍生缓存（格式转换 / 编码）                   │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  │
-│  │ cached 渐变  │  │convert_pdf   │  │to_base64  │  │
-│  │  pixmap      │  │  (PDF)       │  │  _url     │  │
-│  └──────────────┘  └──────────────┘  └───────────┘  │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  第二层：渲染缓存（各后端独立 / 部分共享）                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │ build_texture│  │convert_raster│  │WebImage::new  │ │
+│  │  (PNG)       │  │  (PDF)       │  │ (SVG / HTML  │ │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘ │
+│     image + w,h     raster + interpolate    image（共享！）    │
+└──────────┬──────────────────┬──────────────────┬────────────┘
+           │                  │                  │
+           ▼                  ▼                  ▼
+     缩放后的像素       PDF 图像对象      Web 可用格式（SVG + HTML 共享）
+           │                  │                  │
+           ▼                  ▼                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  第三层：衍生缓存（格式转换 / 编码）                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │ cached 渐变  │  │convert_pdf   │  │to_base64_url │ │
+│  │  pixmap      │  │  (PDF)       │  │(SVG/HTML共享）│ │
+│  └──────────────┘  └──────────────┘  └──────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### 6.1 缓存依赖关系
@@ -578,14 +807,15 @@ Arc<sk::Pixmap>           krilla::image::Image       WebImage { format, data }
 
 ### 6.2 各后端的缓存粒度对比
 
-| 维度 | PNG (typst-render) | PDF (typst-pdf) | SVG (typst-svg) |
-|-----|-------------------|----------------|----------------|
-| 缓存函数 | `build_texture` | `convert_raster`, `convert_pdf` | `WebImage::new`, `to_base64_url` |
-| 缓存 key 含尺寸 | ✅ 是（w, h） | ❌ 否 | ❌ 否 |
-| ICC 参与缓存 key | ❌ 否（PNG 不用 ICC） | ✅ 是（嵌入 PDF） | ✅ 是（嵌入 PNG/JPEG） |
-| scaling 参与缓存 key | ✅ 是（影响 filter） | ✅ 是（interpolate） | ✅ 是（Image 包含 scaling） |
-| 缓存是否与显示尺寸相关 | ✅ 强相关 | ❌ 不相关 | ❌ 不相关 |
-| 旋转是否影响缓存 | ✅ 是（w, h 增大） | ❌ 否（PDF 矩阵变换） | ❌ 否（SVG transform） |
+| 维度 | PNG (typst-render) | PDF (typst-pdf) | SVG (typst-svg) | HTML (typst-html) |
+|-----|-------------------|----------------|----------------|------------------|
+| 缓存函数 | `build_texture` | `convert_raster`, `convert_pdf` | `WebImage::new`, `to_base64_url` | （与 SVG 共享上述两个缓存） |
+| 缓存 key 含尺寸 | ✅ 是（w, h） | ❌ 否 | ❌ 否 | ❌ 否 |
+| ICC 参与缓存 key | ❌ 否（PNG 不用 ICC） | ✅ 是（嵌入 PDF） | ✅ 是（嵌入 PNG/JPEG） | ✅ 是（同 SVG） |
+| scaling 参与缓存 key | ✅ 是（影响 filter） | ✅ 是（interpolate） | ✅ 是（Image 包含 scaling） | ✅ 是（同 SVG） |
+| 缓存是否与显示尺寸相关 | ✅ 强相关 | ❌ 不相关 | ❌ 不相关 | ❌ 不相关 |
+| 旋转是否影响缓存 | ✅ 是（w, h 增大） | ❌ 否（PDF 矩阵变换） | ❌ 否（SVG transform） | 路径 A：❌；路径 B：✅ |
+| 文字是否影响缓存 | 不涉及（纯图） | 不涉及（纯图） | 不涉及（纯图） | 路径 B：✅（Frame 内 <text> 重渲染） |
 
 ---
 
@@ -668,6 +898,13 @@ Arc<sk::Pixmap>           krilla::image::Image       WebImage { format, data }
 | PNG 渲染缓存粒度 | 按图像 + 目标像素尺寸缓存，scaling 隐含在 Image hash 中 | `crates/typst-render/src/image.rs#L68-L69` |
 | PDF 图像缓存粒度 | 按光栅图 + interpolate 缓存，与显示尺寸无关 | `crates/typst-pdf/src/image.rs#L190-L193` |
 | ICC 在 PNG 中的作用 | 不参与颜色转换，仅作为元数据存储（PNG 渲染不做色彩管理） | `crates/typst-render/src/image.rs#L76-L95` |
+| PNG 缓存的身份级联 | Image → ImageInner → ImageKind → RasterImageInner (data + format + icc) | `crates/typst-library/src/visualize/image/raster.rs#L200-L207` |
+| ICC → PNG 缓存的关联 | ICC 参与 Image hash → 改变 ICC 会触发 build_texture 重建，但 tiny_skia 不读 ICC，像素无变化 | 同上 |
+| HTML 颜色策略 | 分两条路径：ToCss trait 实现（CSS color）+ svg_in_html（SVG 颜色） | `crates/typst-html/src/css/encode.rs#L396-L479` |
+| HTML Paint 支持度 | 只支持 Solid 纯色，Gradient/Tiling 通过 w.fail() 拒绝 | `crates/typst-html/src/css/encode.rs#L386-L393` |
+| HTML 图像嵌入双路径 | 普通 image() → `<img>`；html.frame/figure → 内联 `<svg>` | `crates/typst-html/src/rules.rs#L774-L819`, `crates/typst-html/src/convert.rs#L140-L154` |
+| SVG/HTML 缓存共享 | WebImage::new 和 to_base64_url 在 typst-svg 中实现，两者共用同一 comemo 表 | `crates/typst-svg/src/image.rs#L100-L142` |
+| HtmlFrame 渲染路径 | Frame → HtmlFrame → svg_in_html → typst-svg::render_frame → 内联 SVG 字符串 | `crates/typst-svg/src/lib.rs#L82-L110` |
 
 ---
 
@@ -690,3 +927,9 @@ Arc<sk::Pixmap>           krilla::image::Image       WebImage { format, data }
 | PDF 图像 | `crates/typst-pdf/src/image.rs` | JPEG 直通 + CustomImage 适配层 |
 | SVG 颜色 | `crates/typst-svg/src/paint.rs` | CSS 颜色函数序列化 |
 | SVG 图像 | `crates/typst-svg/src/image.rs` | WebImage → base64 DataURL |
+| SVG frame 导出 HTML | `crates/typst-svg/src/lib.rs` | `svg_in_html()`：HtmlFrame → 内联 SVG 字符串 |
+| HTML 颜色编码 | `crates/typst-html/src/css/encode.rs` | ToCss trait（Color/Paint → CSS 字符串） |
+| HTML Show 规则 | `crates/typst-html/src/rules.rs` | IMAGE_RULE：image() → `<img>` |
+| HTML DOM / HtmlFrame | `crates/typst-html/src/dom.rs` | HtmlFrame 结构：包装 Frame + CSS + anchors |
+| HTML Convert 阶段 | `crates/typst-html/src/convert.rs` | FrameElem → HtmlFrame（强制 Paged 模式 layout） |
+| HTML Encode 阶段 | `crates/typst-html/src/encode.rs` | write_frame / write_element，调用 svg_in_html |
