@@ -209,16 +209,29 @@ HTML 后端内置 `SmartQuoter` 状态机（`convert.rs` 第 72-74 行构造）�
 
 ### 3.2 HTML 后端：语义元素 + 显式 FrameElem 触发内联 SVG
 
-**核心文件**：`crates/typst-html/src/rules.rs`（show rule 映射）+ `crates/typst-html/src/dom.rs`（`HtmlFrame` 定义）
+**核心文件**：`crates/typst-html/src/rules.rs`（show rule 映射）+ `crates/typst-html/src/dom.rs`（`HtmlFrame` 定义）+ `crates/typst-html/src/css/encode.rs`（样式序列化）
 
-核心策略：**双路径无自动回退**——有 show rule 的转 HTML 标签；无 show rule 的发出警告后跳过；只有用户显式用 `#html.frame(...)` 包裹内容时才嵌入内联 SVG。
+核心策略：**两条独立失败路径，无自动回退**——有 show rule 的元素转 HTML 标签（样式不支持时属性被丢弃，伴随样式级警告）；无 show rule 的元素整个被跳过；只有用户显式用 `#html.frame(...)` 包裹内容时才嵌入内联 SVG。
 
-> **关键区分**：`handle()`（`convert.rs` 第 93-163 行）是一个 if-else if-else 链：
-> 1. `TagElem` / `HtmlElem` / `SpaceElem` / `TextElem` / `LinebreakElem` 等基础语义元素 → 直接生成 DOM 节点
-> 2. `FrameElem`（即用户写 `#html.frame(...)`）→ 走 Paged 布局 → 嵌入内联 SVG（第 140-154 行）
-> 3. **所有其他元素** → else 分支，发出警告 `"{} was ignored during HTML export"` 并跳过（第 155-161 行）
+> **关键区分：元素级跳过 vs 样式级丢弃**
 >
-> 因此：**HTML 后端没有任何机制会自动把不支持的元素转成 SVG**。`LineElem` 被忽略、含渐变内容被静默丢弃，都不会自动回退到 `html.frame`。
+> HTML 后端有两条完全独立的失败路径，不可混淆：
+>
+> **路径 A：元素未注册 → 整个元素被跳过**
+> - 触发点：`handle()` 的 else 分支（`convert.rs` 第 155-161 行）
+> - 条件：元素没有 show rule 且不是 `HtmlElem`/`TextElem`/`BoxElem`/`BlockElem`/`FrameElem` 等内置类型
+> - 影响：整个元素从 DOM 中消失，不留下任何痕迹
+> - 警告级别：元素级，如 `"line was ignored during HTML export"`
+> - 典型例子：`LineElem`、`RectElem` 等几何元素
+>
+> **路径 B：样式编码失败 → 单个属性被丢弃**
+> - 触发点：`PropertiesBuilder::push()` 中 `w.fail()` 后 `if !writer.error` 判断（`css/encode.rs` 第 94-100 行）
+> - 条件：某个 CSS 属性值（如渐变 `Paint`、图案 `Tiling`）无法被 `ToCss` 序列化
+> - 影响：**元素本身正常输出**，只是该 CSS 属性不写入 style
+> - 警告级别：样式级，如 `"gradient was ignored during HTML export"`
+> - 典型例子：带渐变颜色的文字（文字还在，只是颜色变回默认）、带图案填充的元素
+>
+> 因此：**HTML 后端没有任何机制会自动把不支持的元素/样式转成 SVG**。几何元素走路径 A（整个消失），渐变样式走路径 B（元素保留，属性丢失）。两者都不会自动回退到 `html.frame`。
 
 #### 1. 语义化图形元素（Show Rule 映射）
 
@@ -278,12 +291,13 @@ converter.push(node);
 | 布局控制 | 完全由 Typst 控制 | 浏览器盒模型 + 文档流 | SVG: 消费 `Frame` 绝对坐标 `lib.rs` 第 314-315 行 `pre_translate`；HTML: 文档流语义标签 |
 | 可访问性 | 弱（纯图形） | 强（语义标签 + ARIA） | SVG: 仅 `data-typst-label` `lib.rs` 第 350-352 行；HTML: `HEADING_RULE` 用 `<h2>`/ARIA `rules.rs` 第 235-260 行 |
 
-**差异核心**：SVG 后端是**统一抽象**——一切皆路径；HTML 后端是**两条明确路径**，没有自动回退：
-- **路径 1（语义转换）**：注册了 show rule 的元素（`DividerElem`→`<hr>`、`TableElem`→`<table>`、`ImageElem`→`<img>` 等约 40 个）直接转成 HTML 标签，由浏览器布局
+**差异核心**：SVG 后端是**统一抽象**——一切皆路径；HTML 后端有**三条独立路径**，没有自动回退：
+- **路径 1（语义转换）**：注册了 show rule 的元素（`DividerElem`→`<hr>`、`TableElem`→`<table>`、`ImageElem`→`<img>` 等约 40 个）直接转成 HTML 标签，由浏览器布局。若样式不支持（如渐变填充），走样式级丢弃，元素本身仍保留
 - **路径 2（用户主动回退）**：用户在 Typst 代码中显式写 `#html.frame(content)` 时（`lib.rs` 第 126-141 行 `FrameElem` 定义），`convert.rs` 第 140-154 行走 Paged 布局 → 调 `typst_svg::svg_in_html()` 嵌入内联 SVG
-- **路径 3（被忽略）**：未注册 show rule 且未被显式 `html.frame()` 包裹的元素（如 `LineElem`、`RectElem`、含渐变的文字等）走 `convert.rs` 第 155-161 行 else 分支，发出警告 `"X was ignored during HTML export"` 后直接跳过，不会自动嵌入 SVG
+- **路径 3（元素级忽略）**：未注册 show rule 且未被显式 `html.frame()` 包裹的元素（如 `LineElem`、`RectElem` 等几何元素）走 `convert.rs` 第 155-161 行 else 分支，发出元素级警告 `"X was ignored during HTML export"` 后整个元素被跳过
+- **路径 4（样式级丢弃）**：已成功转换的元素如果包含无法 CSS 序列化的样式值（如渐变 `Paint`、图案 `Tiling`），则在 `PropertiesBuilder::push()`（`css/encode.rs` 第 94-100 行）中 `w.fail()` 后该属性被丢弃，发出样式级警告，元素本身正常输出
 
-这也解释了为什么 HTML 文件更小、更可访问，但对无 show rule 的几何元素会静默丢失。
+这也解释了为什么 HTML 文件更小、更可访问，但对无 show rule 的几何元素会完全消失，对渐变等复杂样式则是元素保留但样式丢失。
 
 ---
 
@@ -402,17 +416,22 @@ SVG 1.1 无原生锥形渐变，`write_gradients()` 的 `Gradient::Conic` 分支
 | 特性 | SVG 后端 | HTML 后端 | 差异根源代码 |
 |------|---------|----------|------------|
 | 样式载体 | SVG 元素属性（fill/stroke 等） | CSS 属性（内联 style） | SVG: `write_fill/write_stroke` `paint.rs` 32-57 行 / `shape.rs` 128-173 行；HTML: `resolve_inline_styles()` `css/resolve.rs` 11-37 行 |
-| 填充 | `fill` 属性 | 不支持渐变/图案填充；纯色仅有限支持 | SVG: Paint→fill 三路全支持 `paint.rs` 40-52 行；HTML: `ToCss for Paint` 仅 `Solid` 支持，`Gradient`/`Tiling` 调用 `w.fail()` 丢弃 `css/encode.rs` 第 386-394 行 |
-| 描边 | `stroke-*` 系列 7 个属性 | **不支持**，默认被忽略；需用户显式 `html.frame()` 包裹后由 SVG 后端渲染 | SVG: `shape.rs` 135-172 行 完整描边族；HTML: 无描边 show rule，含描边的几何元素走 else 分支被忽略 |
-| 渐变 | `<linearGradient>/<radialGradient>/<pattern>` + url() | **不支持**，CSS 编码直接 fail 并丢弃 | SVG: `push_gradient()` 两级去重 `paint.rs` 66-85 行；HTML: `Paint::Gradient(_) => w.fail("gradient")` `css/encode.rs` 第 390 行，属性被静默忽略 |
-| 锥形渐变 | 360 段扇形模拟 | **不支持**（同渐变，CSS 编码 fail） | SVG: `paint.rs` 160-236 行 Conic 分支；HTML: `Paint::Gradient` 统一 fail，不区分锥形/线性/径向 |
+| 填充 (fill) | `fill` 属性，全类型支持 | **样式级丢弃**：纯色支持，渐变/图案 `w.fail()` 后属性被丢弃，元素本身仍在 | SVG: Paint→fill 三路全支持 `paint.rs` 40-52 行；HTML: `ToCss for Paint` 中 `Solid` 正常输出，`Gradient`/`Tiling` 调用 `w.fail()` `css/encode.rs` 第 386-394 行 → `PropertiesBuilder::push()` 中 `if !writer.error` 判断跳过该属性 `css/encode.rs` 第 98-100 行 |
+| 描边 (stroke) | `stroke-*` 系列 7 个属性 | 分两种情况：① 几何元素上的描边 → **元素级跳过**（几何元素本身被忽略）；② 文字描边 → **样式级丢弃**（文字保留，描边属性被丢） | SVG: `shape.rs` 135-172 行 完整描边族；HTML: 几何元素无 show rule 走 `handle()` else 分支 `convert.rs` 第 155-161 行；文字描边走 `PropertiesBuilder::push()` 的 `w.fail()` 路径 `css/encode.rs` 第 98-100 行 |
+| 渐变 | `<linearGradient>/<radialGradient>/<pattern>` + url() | **样式级丢弃**，CSS 编码 `w.fail("gradient")` 后属性被丢弃，元素本身正常输出 | SVG: `push_gradient()` 两级去重 `paint.rs` 66-85 行；HTML: `Paint::Gradient(_) => w.fail("gradient")` `css/encode.rs` 第 390 行，`PropertiesBuilder::push()` 判断 error 后不加入属性 `css/encode.rs` 第 98-100 行 |
+| 锥形渐变 | 360 段扇形模拟 | **样式级丢弃**（同渐变，走 `Paint::Gradient` 统一 fail 路径） | SVG: `paint.rs` 160-236 行 Conic 分支；HTML: `Paint::Gradient` 统一 fail，不区分锥形/线性/径向 `css/encode.rs` 第 390 行 |
 | 变换 | `transform` 属性（智能选择 matrix/scale/translate） | CSS `transform` 属性 | SVG: `SvgTransform` `write.rs` 206-241 行 智能格式选择；HTML: 通过 `display` 和文档流自然布局 |
 | 颜色空间 | Oklab/Oklch/LinearRGB/HSL/CMYK 全部 | RGB 十六进制 + oklab/oklch/linear-rgb/hsl CSS 函数 | SVG: `SvgDisplay for Color` 7 种格式 `paint.rs` 444-505 行；HTML: `ToCss for Color` 统一转为 `ProcessColor` 再输出，RGB 用 `#hex` 或 `rgb()`、Oklab 用 `oklab()`、Oklch 用 `oklch()`、LinearRgb 用 `color(srgb-linear)`、HSL 用 `hsl()` `css/encode.rs` 第 396-409 行 |
 | 去重优化 | 渐变/图案两级去重 | 无内建去重 | SVG: `gradients` + `gradient_refs` 双 Deduplicator；HTML: inline style 每处一份 |
 | 字体样式 | 字形层面处理（路径已固化大小、粗细、形状） | **大部分未支持**，仅 `font-variant-caps` 和 `text-decoration` | SVG: 字形路径已固化大小 `text.rs` 67 行预缩放；HTML: `TextElem::fill`（文字颜色）尚未支持 `rules.rs` 第 759 行注释 "temporary workaround until `TextElem::fill` is supported"；`TextElem::size` 仅用于 `HtmlFrame.text_size` 缩放 SVG（`dom.rs` 第 528 行），不输出 CSS `font-size`；唯一输出的字体 CSS 为 `font-variant-caps`（`SMALLCAPS_RULE` `rules.rs` 第 718-724 行）和 `text-decoration`（`UNDERLINE_RULE`/`OVERLINE_RULE`） |
 | 可覆盖性 | 难（属性写死在 SVG） | 易（用户 CSS 可覆盖） | SVG: 属性值硬编码；HTML: class 标记 + CSS 级联优先级 |
 
-**差异核心**：SVG 后端的样式目标是**精确还原**——属性写死、两级去重优化文件体积、锥形渐变手动模拟。HTML 后端的样式能力**远比 SVG 有限**：渐变和图案填充在 CSS 编码层直接 fail 丢弃（`css/encode.rs` 第 390-391 行）；描边无对应 show rule；字体颜色/大小/粗细/族系均未输出 CSS 属性（`TextElem::fill` 尚未支持，`rules.rs` 第 759 行有明确注释）。HTML 后端目前只支持纯色填充、`font-variant-caps`、`text-decoration` 等有限样式。**含渐变、描边、几何图形的内容不会被 HTML 后端自动降级为 SVG**——必须用户显式使用 `#html.frame(...)` 包裹（`convert.rs` 第 140-154 行），否则会走 else 分支被静默忽略并发出警告。
+**差异核心**：SVG 后端的样式目标是**精确还原**——属性写死、两级去重优化文件体积、锥形渐变手动模拟。HTML 后端的样式能力**远比 SVG 有限**，且失败时表现分两种完全不同的路径：
+
+- **样式级丢弃（路径 B）**：渐变和图案填充在 CSS 编码层 `ToCss for Paint` 中调用 `w.fail()`（`css/encode.rs` 第 390-391 行），`PropertiesBuilder::push()` 检测到 error 后跳过该属性（第 98-100 行）——**元素本身仍正常输出**，只是缺少该样式。如带渐变颜色的文字：文字还在，颜色变回默认黑色。
+- **元素级跳过（路径 A）**：几何元素（`LineElem`、`RectElem` 等）没有 show rule，在 `handle()` 的 else 分支被整个跳过（`convert.rs` 第 155-161 行）——**元素完全消失**。
+
+字体颜色/大小/粗细/族系均未输出 CSS 属性（`TextElem::fill` 尚未支持，`rules.rs` 第 759 行有明确注释）。HTML 后端目前只支持纯色填充、`font-variant-caps`、`text-decoration` 等有限样式。**HTML 后端不会自动把不支持的元素或样式降级为 SVG**——必须用户显式使用 `#html.frame(...)` 包裹（`convert.rs` 第 140-154 行）才会触发 SVG 嵌入。
 
 ---
 
@@ -544,7 +563,7 @@ HTML 后端内置大量 DPUB-ARIA 角色和语义标签：
 |---------|--------------|------------|--------------|------------|
 | **文本处理** | 字形转路径/图像，嵌入文档，保证一致性 | `crates/typst-svg/src/text.rs` 第 29-161 行 (`render_text`+`render_glyph`)；`RenderedGlyph` 第 16-23 行 | 直接输出文本节点，依赖浏览器字体，额外处理空白折叠 | `crates/typst-html/src/convert.rs` 第 252-334 行 (`handle_text`)；第 591-683 行 (`protect_spaces`+`pre_wrap`) |
 | **图形处理** | 一切几何统一为 `<path>`，绝对坐标精确绘制 | `crates/typst-svg/src/shape.rs` 第 13-48 行 (`render_shape`)；第 178-201 行 (`convert_geometry_to_path`) | 三条独立路径无自动回退：show rule 转语义标签 / 用户显式 `#html.frame()` 嵌入内联 SVG / 其余元素被忽略 | `crates/typst-html/src/rules.rs` 第 573-820 行 (TABLE/IMAGE/DIVIDER rules)；`crates/typst-html/src/convert.rs` 第 140-154 行 (`FrameElem` 分支，需用户显式调用)；第 155-161 行 (未注册元素→警告跳过) |
-| **样式处理** | 属性式样式 + 两级渐变去重 + 锥形手动模拟，追求精确和体积 | `crates/typst-svg/src/paint.rs` 第 32-331 行 (`write_fill`+`push_gradient`+`write_gradients`)；`crates/typst-svg/src/shape.rs` 第 128-173 行 (`write_stroke`) | 样式能力有限：渐变/图案 fail 丢弃，字体样式大部分未支持，仅 `font-variant-caps`/`text-decoration` | `crates/typst-html/src/css/encode.rs` 第 386-394 行 (`Paint::Gradient/Tiling → w.fail()`)；`crates/typst-html/src/rules.rs` 第 759 行 (`TextElem::fill` 尚未支持注释)；`crates/typst-html/src/css/resolve.rs` 第 11-37 行 (`resolve_inline_styles`) |
+| **样式处理** | 属性式样式 + 两级渐变去重 + 锥形手动模拟，追求精确和体积 | `crates/typst-svg/src/paint.rs` 第 32-331 行 (`write_fill`+`push_gradient`+`write_gradients`)；`crates/typst-svg/src/shape.rs` 第 128-173 行 (`write_stroke`) | 分两条失败路径：① 样式级丢弃——渐变/图案等无法 CSS 序列化的属性被 `w.fail()` 丢弃但元素保留；② 元素级跳过——几何元素无 show rule 整个消失。字体样式大部分未支持，仅 `font-variant-caps`/`text-decoration` | `crates/typst-html/src/css/encode.rs` 第 94-100 行 (`PropertiesBuilder::push` 的 error 判断) + 第 386-394 行 (`Paint::Gradient/Tiling → w.fail()`)；`crates/typst-html/src/convert.rs` 第 155-161 行 (未注册元素→警告跳过)；`crates/typst-html/src/rules.rs` 第 759 行 (`TextElem::fill` 尚未支持注释) |
 
 ### 适用场景
 
