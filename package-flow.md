@@ -319,14 +319,16 @@ obtain(spec)
 
 #### 8.2.1 包下载失败
 
-在 [`UniversePackages::package()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L351-L380) 中，失败场景和对应的错误类型：
+[`UniversePackages::package()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L351-L380) 仅在 `spec.namespace == "preview"` 时被调用（见 `obtain()` 第 108 行的 if 条件）。非 preview 命名空间根本不会进入下载分支。
 
-| 失败场景 | 错误类型 | 对 `obtain()` 的影响 | 对版本选择的影响 |
-|---------|---------|---------------------|----------------|
-| 命名空间不是 `preview` | `NotFound` | 下载分支直接返回错误，`obtain()` 透传 | — |
-| HTTP 404 包不存在 | `NotFound`（在确认无该包时构造） | 沿 `?` 透传 | 已触发 `latest_version()` 查询，尝试确认版本 |
+下载阶段可能的失败场景：
+
+| 失败场景 | 错误类型 | 传播路径 | 对版本选择的影响 |
+|---------|---------|---------|----------------|
+| HTTP 404 包不存在 | `NotFound`（由 404 分支构造） | 沿 `?` 透传 | 已触发 `latest_version()` 查询确认包不存在 |
 | HTTP 404 版本不存在（但包存在） | `VersionNotFound(spec, latest)` | 沿 `?` 透传，错误消息包含最新版本号 | 同一调用内已完成查询 |
 | 网络错误（超时、连接拒绝、DNS 失败等） | `NetworkFailed(inner)` | 沿 `?` **直接透传**，不会变成 `NotFound` | 不影响 `OnceCell` 索引缓存状态 |
+| 归档解压失败 | `MalformedArchive` | 沿 `?` 透传 | 不影响 |
 
 **关键细节**：当返回 404 时，代码会额外调用 `self.latest_version()` 来判断是包不存在还是版本不存在：
 - 如果能找到该包的其他版本 → `PackageError::VersionNotFound(spec, latest_version)`
@@ -335,6 +337,8 @@ obtain(spec)
 这意味着下载失败（404）时会**额外触发一次索引查询**，但索引查询的结果仅用于生成更友好的错误消息，不会改变错误本身。
 
 网络错误（非 404）不会触发额外查询，直接返回 `NetworkFailed`。
+
+> 注意：`UniversePackages::package()` 第 355-356 行有一个防御性检查（`if spec.namespace != Self::NAMESPACE` 返回 NotFound），但在正常调用路径下，`obtain()` 第 108 行已过滤了非 preview 命名空间，因此该分支不会被触发。
 
 #### 8.2.2 包索引下载失败
 
@@ -441,38 +445,56 @@ impl Drop for Tempdir {
 - **占用磁盘空间**：残留的临时目录会一直占用空间，直到用户手动清理
 - **不影响版本选择**：`latest_version()` 解析目录名为版本号，`.tmp-*` 目录解析失败会被过滤掉
 
-### 8.5 错误传播路径
+### 8.5 错误传播路径与 `NotFound` 的双重语义
 
-在 [`SystemPackages::obtain()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L95-L124) 中，`self.universe.package(spec)?` 通过 `?` 运算符**直接传播**来自 `UniversePackages::package()` 的错误，不做转换：
+在 [`SystemPackages::obtain()`](file:///d:/fz/0601-2/solo-dogfeeding/code/128-typst/crates/typst-kit/src/packages.rs#L95-L124) 中，`PackageError::NotFound` 有**两个独立来源**，语义完全不同：
 
-```rust
-// Line 109: ? 直接透传错误，不做映射
-let mut archive = self.universe.package(spec)?;
+```
+obtain(spec)
+  │
+  ├─ 检查 data 目录 → 找到 → 返回
+  │
+  ├─ 检查 cache 目录 → 找到 → 返回
+  │
+  └─ if cache.is_some() && spec.namespace == "preview"
+        │
+        ├─ universe.package(spec)?
+        │     │
+        │     ├─ 成功 → 存入 cache → 返回
+        │     ├─ HTTP 404 包不存在 → 返回 NotFound **【来源 B】** ← 通过 ? 透传
+        │     ├─ HTTP 404 版本不存在 → 返回 VersionNotFound ← 通过 ? 透传
+        │     ├─ 网络错误 → 返回 NetworkFailed ← 通过 ? 透传
+        │     └─ 解压错误 → 返回 MalformedArchive ← 通过 ? 透传
+        │
+        └─ if store 成功后再次 obtain → 找到 → 返回
+  │
+  └─ 所有路径都未提前返回 → Err(NotFound(spec)) **【来源 A】**
 ```
 
-只有当代码完全跳过下载逻辑（如 cache 为 None、或命名空间不是 preview）并走到函数末尾时，才会构造返回：
+**来源 A（第 123 行）**："没有可用来源能找到这个包"
+- 触发条件：本地（data+cache）未找到，且下载分支被跳过或未成功返回
+- 场景包括：cache 为 None、非 preview 命名空间、下载成功但 store 后再次 obtain 失败
 
-```rust
-// Line 123: 仅在所有来源都跳过/不存在时触发
-Err(PackageError::NotFound(spec.clone()))
-```
+**来源 B（`universe.package()` 内部）**："远程确认这个包不存在"
+- 触发条件：HTTP 404 且 `latest_version()` 也查不到该包
+- 通过 `?` 运算符直接透传，不会走到第 123 行
 
-因此，`NotFound` 只代表"没有可用的来源去找这个包"，而 `NetworkFailed`/`VersionNotFound` 等则来自实际下载尝试。
+非 preview 命名空间**不会进入下载分支**，它的 `NotFound` 始终是来源 A，不会走透传路径。
 
 ### 8.6 对版本选择的综合影响
 
-| 异常情况 | 对 `latest_version()` 的影响 | 对 `obtain()` 的影响 |
-|---------|----------------------------|---------------------|
-| data 目录未配置 | 非 preview 命名空间返回错误 | 正常降级，仅跳过 data 检查 |
-| cache 目录未配置 | 不影响（不查 cache） | **无法下载**，走到函数末尾返回 `NotFound` |
-| 命名空间不是 preview + 本地未找到 | — | 跳过下载分支，返回 `NotFound` |
-| 网络不可用（连接超时等） | preview 命名空间返回字符串错误（包装底层 io 错误） | `NetworkFailed` 沿 `?` 透传返回 |
-| HTTP 404 包不存在 | preview 命名空间：包不存在则返回错误 | `NotFound`（由 404 分支构造） |
-| HTTP 404 版本不存在 | preview 命名空间：可查到最新版本号 | `VersionNotFound(spec, latest)` |
-| 索引下载失败 | 返回错误，**下次重试**（OnceCell 不填） | 不影响（指定明确版本时不走 `latest_version`） |
-| 归档解压失败 | 不影响 | `MalformedArchive` 沿 `?` 透传返回 |
-| 缓存目录损坏 | 不影响（不查 cache） | 返回 FsRoot，但后续加载文件时报错 |
-| 临时目录残留 | 无影响（解析失败被过滤） | 无影响 |
+| 异常情况 | 对 `latest_version()` 的影响 | 对 `obtain()` 的影响 | `NotFound` 来源 |
+|---------|----------------------------|---------------------|----------------|
+| data 目录未配置 | 非 preview 命名空间返回错误 | 正常降级，仅跳过 data 检查 | — |
+| cache 目录未配置 | 不影响（不查 cache） | **无法下载**，走到函数末尾返回 `NotFound` | 来源 A |
+| 命名空间不是 preview + 本地未找到 | — | 跳过下载分支，返回 `NotFound` | 来源 A |
+| 网络不可用（连接超时等） | preview 命名空间返回字符串错误（包装底层 io 错误） | `NetworkFailed` 沿 `?` 透传返回 | — |
+| HTTP 404 包不存在 | preview 命名空间：包不存在则返回错误 | `NotFound` 沿 `?` 透传返回 | 来源 B |
+| HTTP 404 版本不存在 | preview 命名空间：可查到最新版本号 | `VersionNotFound(spec, latest)` 沿 `?` 透传 | — |
+| 索引下载失败 | 返回错误，**下次重试**（OnceCell 不填） | 不影响（指定明确版本时不走 `latest_version`） | — |
+| 归档解压失败 | 不影响 | `MalformedArchive` 沿 `?` 透传返回 | — |
+| 缓存目录损坏 | 不影响（不查 cache） | 返回 FsRoot，但后续加载文件时报错 | — |
+| 临时目录残留 | 无影响（解析失败被过滤） | 无影响 | — |
 
 ## 九、关键设计要点
 
@@ -502,11 +524,14 @@ Err(PackageError::NotFound(spec.clone()))
 ### 9.5 失败处理原则
 
 - **缓存目录是下载的前提**：没有 cache 就不下载，避免"下载了但没地方存"的问题
-- **错误分层，沿 `?` 透传**：`SystemPackages::obtain()` 中 `universe.package()` 的错误通过 `?` 直接向上传播，不会被吞掉或改写成 `NotFound`
+- **非 preview 不进入下载分支**：`obtain()` 第 108 行 `if spec.namespace == "preview"` 守卫确保非 preview 命名空间直接跳过远程下载，不会调用 `universe.package()`
+- **错误分层，沿 `?` 透传**：下载分支内 `universe.package()` 的错误通过 `?` 直接向上传播，不会被吞掉或改写
   - 网络不可用/超时 → `NetworkFailed`
   - 404 版本不存在 → `VersionNotFound`（带最新版本号提示）
-  - 404 包不存在 → `NotFound`
-- **`NotFound` 仅用于"没有来源可找"**：函数末尾的 `PackageError::NotFound` 仅在本地未找到 + 完全跳过了下载分支（cache 为 None 或 namespace 不是 preview）时触发
+  - 404 包不存在 → `NotFound`（来源 B）
+- **`NotFound` 的双重语义**：
+  - **来源 A**（第 123 行函数末尾）："没有可用来源能找到这个包"——本地未找到 + 下载分支被跳过或未返回
+  - **来源 B**（`universe.package()` 内部）："远程确认这个包不存在"——通过 `?` 透传
 - **目录存在 ≠ 包有效**：`obtain()` 只做存在性检查，完整性校验延迟到文件加载阶段
 - **错误静默降级**：`dirs::cache_dir()` 等系统调用失败时，静默降级为 None，不导致整体崩溃
 - **临时目录自清理**：正常 panic 和错误路径下 Tempdir 都能自动清理，仅极端情况（强杀进程）可能残留
