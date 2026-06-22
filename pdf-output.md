@@ -4,7 +4,7 @@
 
 Typst 的 PDF 输出功能由 `typst-pdf` crate 实现，位于 `crates/typst-pdf/` 目录。该模块负责将排版后的 `PagedDocument` 转换为符合 PDF 规范的字节流。核心依赖是 **krilla 0.8.2** 库，一个专门用于 PDF 生成的高级 Rust 库，构建在 **pdf-writer 0.15.0** 底层库之上。
 
-krilla 源码已下载到 `krilla-src/krilla-0.8.2/` 目录，pdf-writer 源码已下载到 `pdf-writer-0.15.0/` 目录供参考。
+krilla 源码托管于 [LaurenzV/krilla](https://github.com/LaurenzV/krilla)（v0.8.2），pdf-writer 源码托管于 [typst/pdf-writer](https://github.com/typst/pdf-writer)（v0.15.0），所有源码引用均可在 GitHub 上直接复核。
 
 ## 核心架构
 
@@ -23,7 +23,7 @@ typst-pdf
 
 ### 入口点
 
-导出入口在 [lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/lib.rs#L36-L38)：
+导出入口在 [lib.rs](crates/typst-pdf/src/lib.rs#L36-L38)：
 
 ```rust
 pub fn pdf(document: &PagedDocument, options: &PdfOptions) -> SourceResult<Vec<u8>> {
@@ -37,7 +37,7 @@ pub fn pdf(document: &PagedDocument, options: &PdfOptions) -> SourceResult<Vec<u
 
 ### 1.1 全局上下文 (GlobalContext)
 
-在 [convert.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs#L278-L301) 中定义，贯穿整个转换过程：
+在 [convert.rs](crates/typst-pdf/src/convert.rs#L278-L301) 中定义，贯穿整个转换过程：
 
 ```rust
 pub(crate) struct GlobalContext<'a> {
@@ -63,7 +63,7 @@ pub(crate) struct GlobalContext<'a> {
 
 ### 1.2 帧上下文 (FrameContext)
 
-在 [convert.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs#L220-L275) 中定义，用于单个 Frame 的转换：
+在 [convert.rs](crates/typst-pdf/src/convert.rs#L220-L275) 中定义，用于单个 Frame 的转换：
 
 ```rust
 pub(crate) struct FrameContext {
@@ -75,7 +75,7 @@ pub(crate) struct FrameContext {
 
 ### 1.3 变换状态 (State)
 
-在 [convert.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs#L178-L217) 中维护坐标变换栈：
+在 [convert.rs](crates/typst-pdf/src/convert.rs#L178-L217) 中维护坐标变换栈：
 
 ```rust
 pub(crate) struct State {
@@ -95,7 +95,7 @@ Typst 不直接操作 PDF 语法，而是通过 krilla 提供的高级抽象。
 
 ### 2.1 资源字典结构定义
 
-在 krilla [resource.rs#L13-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L13-L19) 中定义了 `Resource` trait，所有资源类型必须实现：
+在 krilla [resource.rs#L13-L19](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L13-L19) 中定义了 `Resource` trait，所有资源类型必须实现：
 
 ```rust
 pub(crate) trait Resource {
@@ -109,22 +109,22 @@ pub(crate) trait Resource {
 
 ### 2.2 资源类型与命名规则
 
-在 krilla [resource.rs#L25-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L25-L173) 中定义了六种资源类型及其命名前缀：
+在 krilla [resource.rs#L25-L173](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L25-L173) 中定义了六种资源类型及其命名前缀：
 
 | 资源类型 | 前缀 | PDF 字典键 | 实现位置 |
 |---------|------|-----------|---------|
-| `Font` | `"f"` | `/Font` | [resource.rs#L150-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L150-L173) |
-| `XObject` | `"x"` | `/XObject` | [resource.rs#L100-L123](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L100-L123) |
-| `Pattern` | `"p"` | `/Pattern` | [resource.rs#L125-L148](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L125-L148) |
-| `Shading` | `"s"` | `/Shading` | [resource.rs#L75-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L75-L98) |
-| `ColorSpace` | `"c"` | `/ColorSpace` | [resource.rs#L50-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L50-L73) |
-| `ExtGState` | `"g"` | `/ExtGState` | [resource.rs#L25-L48](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L25-L48) |
+| `Font` | `"f"` | `/Font` | [resource.rs#L150-L173](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L150-L173) |
+| `XObject` | `"x"` | `/XObject` | [resource.rs#L100-L123](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L100-L123) |
+| `Pattern` | `"p"` | `/Pattern` | [resource.rs#L125-L148](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L125-L148) |
+| `Shading` | `"s"` | `/Shading` | [resource.rs#L75-L98](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L75-L98) |
+| `ColorSpace` | `"c"` | `/ColorSpace` | [resource.rs#L50-L73](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L50-L73) |
+| `ExtGState` | `"g"` | `/ExtGState` | [resource.rs#L25-L48](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L25-L48) |
 
 资源名称格式：`{prefix}{number}`，例如 `/F0`, `/F1`, `/Im0`, `/Im1`。
 
 ### 2.3 资源映射器 (ResourceMapper)
 
-在 krilla [resource.rs#L337-L381](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L337-L381) 中实现了双向映射机制：
+在 krilla [resource.rs#L337-L381](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L337-L381) 中实现了双向映射机制：
 
 ```rust
 pub(crate) struct ResourceMapper<T: ?Sized> {
@@ -158,7 +158,7 @@ impl<T> ResourceMapper<T> where T: Resource {
 
 ### 2.4 资源字典构建器 (ResourceDictionaryBuilder)
 
-在 krilla [resource.rs#L175-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L175-L214) 中：
+在 krilla [resource.rs#L175-L214](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L175-L214) 中：
 
 ```rust
 pub(crate) struct ResourceDictionaryBuilder {
@@ -193,7 +193,7 @@ impl ResourceDictionaryBuilder {
 
 ### 2.5 资源字典序列化
 
-在 krilla [resource.rs#L241-L287](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L241-L287) 中，`to_pdf_resources()` 方法将资源字典写入 PDF：
+在 krilla [resource.rs#L241-L287](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L241-L287) 中，`to_pdf_resources()` 方法将资源字典写入 PDF：
 
 ```rust
 pub fn to_pdf_resources<T>(
@@ -244,7 +244,7 @@ pub fn to_pdf_resources<T>(
 
 ### 2.6 资源注册时机
 
-资源注册发生在内容流构建过程中，例如在 krilla [content.rs#L542-L544](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/content.rs#L542-L544) 中：
+资源注册发生在内容流构建过程中，例如在 krilla [content.rs#L542-L544](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/content.rs#L542-L544) 中：
 
 ```rust
 let font_name = self
@@ -264,7 +264,7 @@ self.content.set_font(font_name.to_pdf_name(), size);
 
 ### 3.1 引用计数器初始化
 
-在 krilla [serialize.rs#L279-L310](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L279-L310) 中，`SerializeContext::new()` 初始化引用计数器：
+在 krilla [serialize.rs#L279-L310](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L279-L310) 中，`SerializeContext::new()` 初始化引用计数器：
 
 ```rust
 impl SerializeContext {
@@ -295,7 +295,7 @@ impl SerializeContext {
 
 ### 3.2 动态编号分配
 
-在 krilla [serialize.rs#L368-L370](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L368-L370) 中定义了核心分配方法：
+在 krilla [serialize.rs#L368-L370](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L368-L370) 中定义了核心分配方法：
 
 ```rust
 pub(crate) fn new_ref(&mut self) -> Ref {
@@ -311,14 +311,14 @@ pub(crate) fn new_ref(&mut self) -> Ref {
 
 | 操作 | 代码位置 | 说明 |
 |-----|---------|------|
-| 注册字体 | [serialize.rs#L640-L649](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L640-L649) | `register_font_identifier()` |
-| 注册颜色空间 | [serialize.rs#L651-L681](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L651-L681) | `register_colorspace()` |
-| 注册图像 | [serialize.rs#L614-L622](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L614-L622) | `register_image()` |
-| 注册页面 | [serialize.rs#L561-L571](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L561-L571) | `register_page()` |
-| 序列化字体 | [text/cid.rs#L196-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L196-L199) | 字体对象、描述符、CMap、CIDSet、字体数据 |
-| 资源字典 | [resource.rs#L267](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L267) | `to_pdf_resources()` 中 |
+| 注册字体 | [serialize.rs#L640-L649](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L640-L649) | `register_font_identifier()` |
+| 注册颜色空间 | [serialize.rs#L651-L681](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L651-L681) | `register_colorspace()` |
+| 注册图像 | [serialize.rs#L614-L622](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L614-L622) | `register_image()` |
+| 注册页面 | [serialize.rs#L561-L571](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L561-L571) | `register_page()` |
+| 序列化字体 | [text/cid.rs#L196-L199](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L196-L199) | 字体对象、描述符、CMap、CIDSet、字体数据 |
+| 资源字典 | [resource.rs#L267](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs#L267) | `to_pdf_resources()` 中 |
 
-**字体序列化时的编号分配示例** [text/cid.rs#L196-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L196-L199)：
+**字体序列化时的编号分配示例** [text/cid.rs#L196-L199](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L196-L199)：
 ```rust
 let cid_ref = sc.new_ref();        // CIDFont 对象
 let descriptor_ref = sc.new_ref(); // FontDescriptor 对象
@@ -329,7 +329,7 @@ let data_ref = sc.new_ref();       // FontFile 流对象
 
 ### 3.4 二次编号重映射
 
-在最终序列化阶段，krilla 会进行二次编号重排。在 krilla [chunk_container.rs#L100-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/chunk_container.rs#L100-L120) 中：
+在最终序列化阶段，krilla 会进行二次编号重排。在 krilla [chunk_container.rs#L100-L120](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/chunk_container.rs#L100-L120) 中：
 
 ```rust
 pub(crate) fn finish(self, sc: &mut SerializeContext) -> KrillaResult<Pdf> {
@@ -354,7 +354,7 @@ pub(crate) fn finish(self, sc: &mut SerializeContext) -> KrillaResult<Pdf> {
 }
 ```
 
-**`Chunk::renumber_into()` 实际调用流程** [pdf-writer chunk.rs#L181-L187](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L181-L187)：
+**`Chunk::renumber_into()` 实际调用流程** [pdf-writer chunk.rs#L181-L187](https://github.com/typst/pdf-writer/blob/v0.15.0/src/chunk.rs#L181-L187)：
 
 ```rust
 pub fn renumber_into<F>(&self, target: &mut Chunk, mut mapping: F)
@@ -374,7 +374,7 @@ where
 
 ### 3.5 对象数量限制
 
-在 krilla [serialize.rs#L944-L947](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L944-L947) 中定义了对象数量限制：
+在 krilla [serialize.rs#L944-L947](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L944-L947) 中定义了对象数量限制：
 
 ```rust
 fn check_validator_limits(&mut self) {
@@ -392,7 +392,7 @@ fn check_validator_limits(&mut self) {
 
 ### 4.1 对象偏移记录机制
 
-**Chunk 内部结构** [pdf-writer chunk.rs#L34-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L34-L38)：
+**Chunk 内部结构** [pdf-writer chunk.rs#L34-L38](https://github.com/typst/pdf-writer/blob/v0.15.0/src/chunk.rs#L34-L38)：
 
 ```rust
 pub struct Chunk {
@@ -402,7 +402,7 @@ pub struct Chunk {
 }
 ```
 
-**对象偏移记录发生在 `indirect()` 调用时** [pdf-writer chunk.rs#L193-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L193-L196)：
+**对象偏移记录发生在 `indirect()` 调用时** [pdf-writer chunk.rs#L193-L196](https://github.com/typst/pdf-writer/blob/v0.15.0/src/chunk.rs#L193-L196)：
 
 ```rust
 pub fn indirect(&mut self, id: Ref) -> Obj<'_> {
@@ -416,7 +416,7 @@ pub fn indirect(&mut self, id: Ref) -> Obj<'_> {
 - 偏移量是对象在 `buf` 中的起始字节位置
 - 每次调用 `indirect()` 或 `stream()` 都会触发偏移记录
 
-**间接对象写入格式** [pdf-writer object.rs#L666-L676](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/object.rs#L666-L676)：
+**间接对象写入格式** [pdf-writer object.rs#L666-L676](https://github.com/typst/pdf-writer/blob/v0.15.0/src/object.rs#L666-L676)：
 
 ```rust
 pub(crate) fn indirect(buf: &'a mut Buf, id: Ref, settings: Settings) -> Self {
@@ -434,7 +434,7 @@ pub(crate) fn indirect(buf: &'a mut Buf, id: Ref, settings: Settings) -> Self {
 
 ### 4.2 Pdf::finish() —— XRef 表生成入口
 
-在 [pdf-writer lib.rs#L307-L322](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L307-L322) 中：
+在 [pdf-writer lib.rs#L307-L322](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L307-L322) 中：
 
 ```rust
 pub fn finish(self) -> Vec<u8> {
@@ -467,7 +467,7 @@ pub fn finish(self) -> Vec<u8> {
 
 ### 4.3 write_offsets() —— 核心偏移处理函数
 
-在 [pdf-writer lib.rs#L437-L478](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L437-L478) 中：
+在 [pdf-writer lib.rs#L437-L478](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L437-L478) 中：
 
 ```rust
 fn write_offsets(mut offsets: Vec<(Ref, usize)>, writer: &mut impl XRefWriter) -> i32 {
@@ -525,7 +525,7 @@ fn write_offsets(mut offsets: Vec<(Ref, usize)>, writer: &mut impl XRefWriter) -
 
 ### 4.4 PlainXRefWriter —— 传统 XRef 表格式
 
-在 [pdf-writer lib.rs#L570-L594](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L570-L594) 中：
+在 [pdf-writer lib.rs#L570-L594](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L570-L594) 中：
 
 ```rust
 struct PlainXRefWriter<'a> {
@@ -566,7 +566,7 @@ xref
 
 ### 4.5 XRefStreamWriter —— 压缩 XRef 流（PDF 1.5+）
 
-在 [pdf-writer lib.rs#L533-L568](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L533-L568) 中：
+在 [pdf-writer lib.rs#L533-L568](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L533-L568) 中：
 
 ```rust
 struct XRefStreamWriter {
@@ -613,7 +613,7 @@ impl XRefWriter for XRefStreamWriter {
 
 ### 4.6 XRef 流写入流程（PDF 1.5+）
 
-在 [pdf-writer lib.rs#L365-L415](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L365-L415) 中：
+在 [pdf-writer lib.rs#L365-L415](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L365-L415) 中：
 
 ```rust
 fn finish_with_xref_stream_inner(
@@ -669,7 +669,7 @@ fn finish_with_xref_stream_inner(
 
 ### 4.7 Trailer 生成
 
-**TrailerData 结构** [pdf-writer lib.rs#L500-L525](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L500-L525)：
+**TrailerData 结构** [pdf-writer lib.rs#L500-L525](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L500-L525)：
 
 ```rust
 #[derive(Default)]
@@ -719,7 +719,7 @@ trailer
 
 ### 4.8 startxref 与 %%EOF 生成
 
-**finish_trailer() 函数** [pdf-writer lib.rs#L426-L435](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L426-L435)：
+**finish_trailer() 函数** [pdf-writer lib.rs#L426-L435](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L426-L435)：
 
 ```rust
 fn finish_trailer(mut buf: Buf, xref_offset: usize, pad: &[u8]) -> Vec<u8> {
@@ -748,7 +748,7 @@ startxref
 
 ### 4.9 Chunk::extend() —— 偏移调整
 
-当合并多个 Chunk 时，偏移量需要调整 [pdf-writer chunk.rs#L88-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L88-L93)：
+当合并多个 Chunk 时，偏移量需要调整 [pdf-writer chunk.rs#L88-L93](https://github.com/typst/pdf-writer/blob/v0.15.0/src/chunk.rs#L88-L93)：
 
 ```rust
 pub fn extend(&mut self, other: &Chunk) {
@@ -808,7 +808,7 @@ krilla chunk_container.finish()
 
 字形收集在内容流构建时进行，而非在 `finish()` 阶段。
 
-**FontContainer 结构** [text/mod.rs#L54-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/mod.rs#L54-L72)：
+**FontContainer 结构** [text/mod.rs#L54-L72](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/mod.rs#L54-L72)：
 
 ```rust
 pub(crate) struct FontContainer {
@@ -836,7 +836,7 @@ impl FontContainer {
 }
 ```
 
-**CIDFont::add_glyph()** [text/cid.rs#L154-L170](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L154-L170)：
+**CIDFont::add_glyph()** [text/cid.rs#L154-L170](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L154-L170)：
 
 ```rust
 /// Add a new glyph (if it has not already been added) and return its CID.
@@ -859,12 +859,12 @@ pub(crate) fn add_glyph(&mut self, glyph_id: GlyphId) -> Cid {
 
 **关键点：**
 - 使用 `subsetter::GlyphRemapper` 维护原字形 ID → 子集 CID 的映射
-- `.notdef` 字形（GID 0）始终被包含 [text/cid.rs#L122-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L122-L124)
+- `.notdef` 字形（GID 0）始终被包含 [text/cid.rs#L122-L124](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L122-L124)
 - 同时收集字形宽度数组
 
 ### 5.2 字形绘制时的收集触发
 
-在 krilla [content.rs#L530-L580](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/content.rs#L530-L580) 的 `encode_consecutive_glyph_run()` 中：
+在 krilla [content.rs#L530-L580](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/content.rs#L530-L580) 的 `encode_consecutive_glyph_run()` 中：
 
 ```rust
 fn encode_consecutive_glyph_run(
@@ -903,7 +903,7 @@ fn encode_consecutive_glyph_run(
 
 ### 5.3 字体子集化执行
 
-在 krilla [text/cid.rs#L237-L239](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L237-L239) 的 `serialize()` 方法中：
+在 krilla [text/cid.rs#L237-L239](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L237-L239) 的 `serialize()` 方法中：
 
 ```rust
 let (subsetted, global_bbox) = subset_font(self.font.clone(), glyph_remapper)?;
@@ -911,7 +911,7 @@ let num_glyphs = subsetted.num_glyphs();
 let subsetted_data = subsetted.font_data().0;
 ```
 
-**subset_font() 函数** [text/cid.rs#L436-L458](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L436-L458)：
+**subset_font() 函数** [text/cid.rs#L436-L458](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L436-L458)：
 
 ```rust
 #[cfg_attr(feature = "comemo", comemo::memoize)]
@@ -945,7 +945,7 @@ fn subset_font(font: Font, glyph_remapper: &GlyphRemapper) -> KrillaResult<(Font
 
 ### 5.4 子集化后的数据处理
 
-在 krilla [text/cid.rs#L241-L254](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L241-L254) 中：
+在 krilla [text/cid.rs#L241-L254](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L241-L254) 中：
 
 ```rust
 let font_stream = {
@@ -971,7 +971,7 @@ let font_stream = {
 
 ### 5.5 字体对象体系构建
 
-在 krilla [text/cid.rs#L263-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L263-L398) 中构建完整的字体对象体系：
+在 krilla [text/cid.rs#L263-L398](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L263-L398) 中构建完整的字体对象体系：
 
 ```
 Type0 Font (根字体对象)
@@ -999,7 +999,7 @@ FontDescriptor 对象
 └── /CIDSet: CIDSet 流引用 (PDF < 1.7)
 ```
 
-**字体子集标签生成** [text/cid.rs#L413-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L413-L434)：
+**字体子集标签生成** [text/cid.rs#L413-L434](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L413-L434)：
 
 ```rust
 pub(crate) fn subset_tag<T: Hash>(data: &T) -> String {
@@ -1035,7 +1035,7 @@ fn base_font_name(font: &Font, data: impl Hash) -> String {
 
 码位映射在字形编码时收集，通过 `Glyph::text_range()` 方法获取。
 
-在 krilla [content.rs#L566-L569](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/content.rs#L566-L569) 的 `encode_single_glyph()` 中（推断）：
+在 krilla [content.rs#L566-L569](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/content.rs#L566-L569) 的 `encode_single_glyph()` 中（推断）：
 
 ```rust
 fn encode_single_glyph(
@@ -1058,7 +1058,7 @@ fn encode_single_glyph(
 }
 ```
 
-**CIDFont 中的码位存储** [text/cid.rs#L112-L180](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L112-L180)：
+**CIDFont 中的码位存储** [text/cid.rs#L112-L180](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L112-L180)：
 
 ```rust
 pub(crate) struct CIDFont {
@@ -1078,7 +1078,7 @@ impl CIDFont {
 
 ### 6.2 ToUnicode CMap 写入
 
-在 krilla [text/cid.rs#L378-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L378-L398) 中：
+在 krilla [text/cid.rs#L378-L398](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L378-L398) 中：
 
 ```rust
 let cmap = {
@@ -1109,7 +1109,7 @@ cmap.finish();
 
 ### 6.3 write_cmap_entry() 函数详解
 
-在 krilla [text/cid.rs#L40-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L40-L98) 中实现了完整的码位映射和验证逻辑：
+在 krilla [text/cid.rs#L40-L98](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L40-L98) 中实现了完整的码位映射和验证逻辑：
 
 ```rust
 pub(crate) fn write_cmap_entry<G>(
@@ -1216,7 +1216,7 @@ end
 
 ### 7.1 阶段 1：初始化与准备
 
-**SerializeContext 创建** [serialize.rs#L279-L310](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L279-L310)：
+**SerializeContext 创建** [serialize.rs#L279-L310](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L279-L310)：
 
 ```
 Document::new_with(settings)
@@ -1280,7 +1280,7 @@ surface.finish()
 
 ### 7.4 阶段 4：document.finish() —— 最终序列化
 
-在 krilla [serialize.rs#L449-L498](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L449-L498) 中：
+在 krilla [serialize.rs#L449-L498](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L449-L498) 中：
 
 ```
 SerializeContext::finish(chunk_container)
@@ -1341,23 +1341,23 @@ SerializeContext::finish(chunk_container)
 
 ### 7.5 阶段 5：PDF 字节生成
 
-当 `Pdf` 对象调用 `finish()` 时，`pdf-writer` 库自动执行以下步骤 [pdf-writer lib.rs#L307-L322](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L307-L322)：
+当 `Pdf` 对象调用 `finish()` 时，`pdf-writer` 库自动执行以下步骤 [pdf-writer lib.rs#L307-L322](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L307-L322)：
 
 1. **写入头部**：`%PDF-1.7\n%\xe2\xe3\xcf\xd3\n`
 2. **从 Chunk 提取数据**：`buf`, `offsets`, `settings`
 3. **记录 xref 起始偏移**：`xref_offset = buf.len()`
 4. **构建 xref 表**：
-   - 调用 `write_offsets(offsets, &mut writer)` [pdf-writer lib.rs#L437-L478](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L437-L478)
+   - 调用 `write_offsets(offsets, &mut writer)` [pdf-writer lib.rs#L437-L478](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L437-L478)
    - 排序 offsets，按编号顺序处理
    - 填充空闲对象链表
    - 写入每个对象的字节偏移位置（10 位十进制）
    - 写入每个对象的生成号（5 位十进制，通常为 0）
-5. **写入 trailer** [pdf-writer lib.rs#L508-L525](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L508-L525)：
+5. **写入 trailer** [pdf-writer lib.rs#L508-L525](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L508-L525)：
    - `/Size`：对象总数（包含对象 0）
    - `/Root`：Catalog 引用
    - `/Info`：DocumentInfo 引用（可选）
    - `/ID`：文件 ID 数组（可选）
-6. **写入 startxref** [pdf-writer lib.rs#L426-L435](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L426-L435)：
+6. **写入 startxref** [pdf-writer lib.rs#L426-L435](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L426-L435)：
    - `startxref\n` + xref 表的起始偏移（十进制）
 7. **写入 `%%EOF`**：文件结束标记
 
@@ -1416,7 +1416,7 @@ SerializeContext::finish()  [serialize.rs#L449]
 
 ### 8.1 对象去重缓存
 
-在 krilla [serialize.rs#L573-L587](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L573-L587) 中：
+在 krilla [serialize.rs#L573-L587](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L573-L587) 中：
 
 ```rust
 fn register_cached<T: SipHashable>(
@@ -1457,7 +1457,7 @@ krilla 支持使用 `comemo` 库缓存纯函数结果：
 
 ### 9.1 字体相关验证点
 
-在 krilla [configure/validate.rs] 和 [text/cid.rs#L40-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L40-L98) 中实现：
+在 krilla [configure/validate.rs] 和 [text/cid.rs#L40-L98](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L40-L98) 中实现：
 
 | 验证项 | 错误类型 | 触发条件 |
 |-------|---------|---------|
@@ -1469,7 +1469,7 @@ krilla 支持使用 `comemo` 库缓存纯函数结果：
 
 ### 9.2 许可证检查逻辑
 
-在 krilla [text/cid.rs#L228-L235](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L228-L235) 中：
+在 krilla [text/cid.rs#L228-L235](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L228-L235) 中：
 
 ```rust
 // 检查 OS/2 表的 fsType 字段
@@ -1490,18 +1490,18 @@ if self.font.font_ref().os2()
 
 | 功能 | krilla 源码位置 | pdf-writer 源码位置 |
 |-----|----------------|-------------------|
-| 资源字典构建 | [resource.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs) | - |
-| 引用编号分配 | [serialize.rs#L368-L370](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L368-L370) | - |
-| 二次编号重映射 | [chunk_container.rs#L100-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/chunk_container.rs#L100-L120) | [chunk.rs#L181-L187](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L181-L187) |
-| 对象偏移记录 | - | [chunk.rs#L34-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L34-L38), [chunk.rs#L193-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/chunk.rs#L193-L196) |
-| XRef 表生成 | - | [lib.rs#L307-L322](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L307-L322), [lib.rs#L437-L478](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L437-L478) |
-| XRef 流生成 | - | [lib.rs#L365-L415](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L365-L415) |
-| Trailer 生成 | - | [lib.rs#L500-L525](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L500-L525) |
-| startxref 生成 | - | [lib.rs#L426-L435](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/pdf-writer-0.15.0/src/lib.rs#L426-L435) |
-| 字形收集 | [text/cid.rs#L154-L170](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L154-L170) | - |
-| 字体子集化 | [text/cid.rs#L436-L458](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L436-L458) | - |
-| ToUnicode 生成 | [text/cid.rs#L378-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L378-L398) | - |
-| 码位验证 | [text/cid.rs#L40-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L40-L98) | - |
+| 资源字典构建 | [resource.rs](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/resource.rs) | - |
+| 引用编号分配 | [serialize.rs#L368-L370](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/serialize.rs#L368-L370) | - |
+| 二次编号重映射 | [chunk_container.rs#L100-L120](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/chunk_container.rs#L100-L120) | [chunk.rs#L181-L187](https://github.com/typst/pdf-writer/blob/v0.15.0/src/chunk.rs#L181-L187) |
+| 对象偏移记录 | - | [chunk.rs#L34-L38](https://github.com/typst/pdf-writer/blob/v0.15.0/src/chunk.rs#L34-L38), [chunk.rs#L193-L196](https://github.com/typst/pdf-writer/blob/v0.15.0/src/chunk.rs#L193-L196) |
+| XRef 表生成 | - | [lib.rs#L307-L322](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L307-L322), [lib.rs#L437-L478](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L437-L478) |
+| XRef 流生成 | - | [lib.rs#L365-L415](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L365-L415) |
+| Trailer 生成 | - | [lib.rs#L500-L525](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L500-L525) |
+| startxref 生成 | - | [lib.rs#L426-L435](https://github.com/typst/pdf-writer/blob/v0.15.0/src/lib.rs#L426-L435) |
+| 字形收集 | [text/cid.rs#L154-L170](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L154-L170) | - |
+| 字体子集化 | [text/cid.rs#L436-L458](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L436-L458) | - |
+| ToUnicode 生成 | [text/cid.rs#L378-L398](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L378-L398) | - |
+| 码位验证 | [text/cid.rs#L40-L98](https://github.com/LaurenzV/krilla/blob/v0.8.2/src/text/cid.rs#L40-L98) | - |
 
 ---
 
