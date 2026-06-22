@@ -413,7 +413,7 @@ fn compile_impl<T: Output>(...) -> SourceResult<T> {
 
         // ---- 阶段 B-1：依赖约束验证（快速路径）----
         if constraint.validate(document.introspector()) {
-            break;  // comemo 验证通过 → 所有缓存输入一致 → 收敛
+            break;  // comemo 验证通过 → 约束跟踪的所有方法调用在新旧 introspector 上结果相同 → 收敛
         }
 
         // ---- 阶段 B-2：迭代上限后的历史诊断（慢路径）----
@@ -447,18 +447,23 @@ fn compile_impl<T: Output>(...) -> SourceResult<T> {
 
 ### 5.1 阶段 B-1：comemo 依赖约束验证
 
-**做什么**：检查"如果用新的 Introspector 重新计算，所有缓存的 comemo 调用是否返回相同结果"。
+**做什么**：检查"用新的 Introspector 替换本轮的 Introspector 之后，约束**实际跟踪到的那些**方法调用是否都返回相同结果"。
+
+**⚠️ 不是整个 Introspector 一致**：`constraint.validate(new_introspector)` 不做"新旧两个 Introspector 对象是否完全等价"的逐字段比较，也不检查所有可能的方法调用。它只验证**本迭代编译过程中，通过 `track_with(&constraint)` 绑定后，确实调用过、并被 comemo 缓存记录下来的那些 `Introspector` trait 方法**——在使用 `new_introspector` 调用时，返回值与本轮完全相同。没有被访问到的数据即便变了，也不会导致验证失败。
 
 **原理**：
 1. 每次迭代创建 `comemo::Constraint`
-2. `introspector.track_with(&constraint)` 将内省器与约束绑定
-3. 编译过程中，所有通过 `engine.introspect()` 对 Introspector 的调用都被 comemo 跟踪记录（因为 Introspector 是 `#[comemo::track]` 的）
-4. `constraint.validate(new_introspector)` 检查：如果用 `new_introspector` 替换本轮用的 `introspector`，comemo 缓存的所有函数调用是否仍有效
-5. 有效 → 说明本轮读到的所有 introspector 数据与上轮完全一致 → 收敛
+2. `introspector.track_with(&constraint)` 将内省器与约束绑定——从此之后，对这个 `introspector` 的 trait 方法调用会被约束"观察到"，并记录其签名、输入以及来自 comemo 缓存的返回值
+3. 编译过程中，所有通过 `engine.introspect()` 间接触发的 `Introspector` 调用（如 `query_label`、`page`、`query` 等），都会进入约束的观察范围（因为 Introspector trait 带 `#[comemo::track]`）
+4. `constraint.validate(new_introspector)` 的验证过程：**对约束中记录的每一条观察到的方法调用，以相同参数、`new_introspector` 作为 self，重新调用一次**；如果所有调用的返回值都与本轮缓存的值相同 → 验证通过；**任一条返回值不同 → 验证失败**
 
-**语义**：验证的是**依赖输入的稳定性**，即"我读了哪些数据，这些数据在新的 introspector 下是否完全一致"。这是结构级/输入级的等价检查。
+**语义**：验证的是**被访问依赖输入的稳定性**，即"本轮我读到了哪些 introspector 数据，这些数据在新 introspector 下返回值是否完全一致"。这是**结构级/输入级**的等价检查，但只覆盖**被实际访问过**的子集。
 
-**通过条件**：comemo 所有受跟踪的缓存在新旧 introspector 之间完全一致。
+**通过条件**：约束中记录的所有 trait 方法调用，在新旧 introspector 之间返回值完全一致。
+
+**关键推论**：
+- 若新旧 introspector 之间某些字段不同，但这些字段对应的方法**本轮没被调用过** → 验证仍可能通过
+- 因此，comemo 通过的条件弱于"整个 Introspector 内容一致"，但强于"语义输出一致"（见 5.4 节）
 
 **局限**：comemo 看到的是原始输入。如果某个 Introspection 对原始输入做了过滤/归约，那么 comemo 看到变化不代表过滤后的输出也变化了。
 
@@ -531,21 +536,25 @@ where T: Hash,
 | | comemo 依赖约束验证 | History 历史输出诊断 |
 |---|---|---|
 | **触发时机** | 每次迭代后 | 仅 comemo 失败 + 迭代上限后 |
-| **检查对象** | comemo 跟踪的所有缓存函数调用 | 编译期间显式记录的 `Introspection` |
-| **检查粒度** | 原始输入级（Introspector 的方法参数与返回值） | 输出级（Introspect::Output 的 hash） |
-| **等价语义** | "所有读到的 introspector 数据与上轮一致" | "每个查询最后两轮给出的结果一致" |
+| **检查对象** | 本轮编译中**实际调用过**的 Introspector trait 方法 | 编译期间显式记录的 `Introspection` 类型 |
+| **检查粒度** | 被访问的原始输入级（具体方法的参数与返回值逐次比较） | 输出级（Introspect::Output 的 hash） |
+| **等价语义** | "本轮我调用过的每一条 introspector 方法，在新 introspector 上返回值与本轮完全相同" | "每个 Introspection 在最后两轮给出的 Output 值相同" |
 | **用途** | 判断是否继续迭代 | 生成面向用户的诊断信息 |
-| **开销** | 轻（只检查 comemo 缓存有效性） | 重（对每个 Introspection 用 6 个 introspector 重算） |
+| **开销** | 轻（只重放约束记录的方法调用） | 重（对每个 Introspection 用 6 个 introspector 重算） |
 
 ### 5.4 两者可能不一致的情况
 
 [convergence.rs 注释](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/introspection/convergence.rs#L37-L55) 明确描述了这种情况：
 
 **情况 1：comemo 通过 → 文档一定收敛**
-comemo 观察到的数据和 Introspection 观察到的数据相同，验证通过意味着所有输入都稳定了。
+约束跟踪的所有方法调用在新旧 introspector 上返回值都相同 → 下一轮迭代读到的所有数据都和本轮一致 → 编译结果不会再变化 → 确定收敛。
 
 **情况 2：comemo 失败 + History 通过 → 文档实际已收敛，不发出警告**
-如果自定义的 Introspection 对原始查询做了过滤/归约（如将查询结果简化为布尔值），comemo 可能看到原始输入变了，但过滤后的输出没有变。此时 `analyze()` 中每个 Introspection 的 `diagnose()` 都返回 `None`（因为 `history.converged()` 为 true），`diags` 为空，不会发出"document did not converge"的汇总警告。
+如果自定义的 Introspection 对原始查询做了过滤/归约（如将查询结果简化为布尔值），那么：
+- comemo 可能看到某些**被调用过的**方法返回值变化了（例如 `query(selector)` 返回的列表长度或元素字段变了）→ 验证失败
+- 但归约后的 Output（例如 `list.is_empty()`）没变 → History 认为已收敛
+
+此时 `analyze()` 中每个 Introspection 的 `diagnose()` 都返回 `None`（因为 `history.converged()` 为 true），`diags` 为空，不会发出"document did not converge"的汇总警告。
 
 ```rust
 // analyze() 中的关键判断：
@@ -556,6 +565,8 @@ if !diags.is_empty() {
 ```
 
 **情况 3：comemo 失败 + History 失败 → 真正未收敛，发出警告**
+
+另一种 comemo 失败但不影响结果的情况：**被访问方法返回值变了，但变化的方法与任何 Introspection 无关**（例如其他 comemo 追踪的非 introspection 数据变化）。由于 History 只关心记录下来的 Introspection，这类变化也不会被诊断出来，因此不发警告。
 
 ### 5.5 迭代 N+1 观察迭代 N 的结果
 
@@ -570,7 +581,7 @@ if !diags.is_empty() {
 或 达到 5 次上限 → 进入 History 诊断
 ```
 
-注意：comemo 验证的是"本轮读到的 introspector 数据与即将产生的 introspector 数据是否一致"，这等价于"连续两次迭代看到的 Introspector 是否相同"。但不等同于"连续两次 Introspection Output 的值相同"——后者是 History 诊断的检查方式。
+注意：comemo 验证的是"本轮**实际调用过的** introspector 方法，用新 introspector 重放时结果相同"——这**不是**"连续两次迭代的 Introspector 对象内容相同"，而是"迭代 N+1 看到的、与 N+1 自己实际访问相关的那部分数据，与迭代 N 产生的 introspector 上对应方法返回值相同"。History 诊断检查的则是另一件事："连续两次 Introspection Output 的 hash 值相同"。
 
 ---
 
@@ -613,32 +624,134 @@ impl Synthesize for Packed<RefElem> {
 
 ### 6.2 Realize 阶段
 
-在 [reference.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/reference.rs#L228-L325)：
+在 [reference.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/reference.rs#L228-L325)。
+
+`RefElem::realize` 按 form 和目标元素类型，分为 5 条分支：**页码引用**、**Bibliography 引用**、**Footnote 引用**、**普通 Refable 引用**、以及**出错分支**（重复标签 / 无可引用接口）。
 
 ```rust
 impl Packed<RefElem> {
     pub fn realize(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
         let span = self.span();
         let elem = engine.introspect(QueryLabelIntrospection(self.target, span));
-        let elem = elem.at(span)?;
 
         let form = self.form.get(styles);
+```
+
+**分支 A：RefForm::Page —— 页码引用**（[reference.rs:L237-L260](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/reference.rs#L237-L260)）
+
+```rust
         if form == RefForm::Page {
+            let elem = elem.at(span)?;
+            let elem = elem.clone();
+
             let loc = elem.location().unwrap();
-            let numbering = engine.introspect(PageNumberingIntrospection(loc, span))?;
+            // 查询目标位置的页码 Numbering
+            let numbering = engine
+                .introspect(PageNumberingIntrospection(loc, span))
+                .ok_or_else(|| eco_format!("cannot reference without page numbering"))
+                .hint(eco_format!(
+                    "you can enable page numbering with `#set page(numbering: \"1\")`"
+                ))
+                .at(span)?;
+            // 查询目标位置的页码 supplement
             let supplement = engine.introspect(PageSupplementIntrospection(loc, span));
-            return realize_reference(self, engine, styles,
-                Counter::new(CounterKey::Page), numbering, supplement, elem);
+
+            return realize_reference(
+                self, engine, styles,
+                Counter::new(CounterKey::Page),  // 用页码计数器
+                numbering,
+                supplement,
+                elem,
+            );
         }
+```
 
-        let refable = elem.with::<dyn Refable>().ok_or_else(...)?;
-        let numbering = refable.numbering().ok_or_else(...)?;
+**分支 B：BibliographyElem::has(target) —— 文献引用**（[reference.rs:L263-L276](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/reference.rs#L263-L276)）
 
-        realize_reference(self, engine, styles,
-            refable.counter(), numbering.clone(), refable.supplement(), elem)
+```rust
+        // RefForm::Normal 的后续分支：
+        if BibliographyElem::has(engine, self.target, span) {
+            // 如果在 Bibliography 条目中存在此 label
+            if let Ok(elem) = elem {
+                // 冲突：文档中存在同名可内省元素
+                bail!(
+                    span,
+                    "label `{}` occurs both in the document and a bibliography",
+                    self.target.repr();
+                    hint: "change either the {}'s label or the \
+                           bibliography key to resolve the ambiguity",
+                    elem.func().name();
+                );
+            }
+            // 只在 Bibliography 中存在 → 转成 Citation
+            return Ok(to_citation(self, engine, styles)?.pack().spanned(span));
+        }
+```
+
+**分支 C：目标是 FootnoteElem —— 脚注引用**（[reference.rs:L280-L282](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/reference.rs#L280-L282)）
+
+```rust
+        let elem = elem.at(span)?;  // 确保 elem 存在，否则前面已经出错
+
+        if let Some(footnote) = elem.to_packed::<FootnoteElem>() {
+            // 转为脚注引用（把 @myfootnote 渲染为脚注上标编号的链接）
+            return Ok(footnote.into_ref(self.target).pack().spanned(span));
+        }
+```
+
+**分支 D：目标实现了 Refable —— 普通元素引用**（[reference.rs:L284-L323](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/reference.rs#L284-L323)）
+
+```rust
+        let elem = elem.clone();
+        let refable = elem
+            .with::<dyn Refable>()
+            .ok_or_else(|| {
+                if elem.can::<dyn Figurable>() {
+                    eco_format!(
+                        "cannot reference {} directly, try putting it into a figure",
+                        elem.func().name()
+                    )
+                } else {
+                    eco_format!("cannot reference {}", elem.func().name())
+                }
+            })
+            .at(span)?;
+
+        let numbering = refable
+            .numbering()
+            .ok_or_else(|| {
+                eco_format!("cannot reference {} without numbering", elem.func().name())
+            })
+            .hint(eco_format!(
+                "you can enable {} numbering with `#set {}(numbering: \"1.\")`",
+                elem.func().name(),
+                if elem.func() == EquationElem::ELEM {
+                    "math.equation"
+                } else {
+                    elem.func().name()
+                }
+            ))
+            .at(span)?;
+
+        realize_reference(
+            self, engine, styles,
+            refable.counter(),          // 元素自身的计数器（heading counter, figure counter 等）
+            numbering.clone(),
+            refable.supplement(),       // 元素的默认补充文本（如 "Section"、"Figure"）
+            elem,
+        )
     }
 }
 ```
+
+**各分支的关键差异：**
+
+| 分支 | 触发条件 | 使用的 Counter | 使用的 Numbering | 最终形态 |
+|---|---|---|---|---|
+| A 页码引用 | `form: page` | `Counter::Page` | `PageNumberingIntrospection` 查询 | 直接链接到目标位置的页码文本 |
+| B 文献引用 | `BibliographyElem::has(target)` + 文档中无同名标签 | ——（由 `to_citation` 处理） | —— | `CiteElem` |
+| C 脚注引用 | 目标是 `FootnoteElem` | ——（由 `footnote.into_ref` 处理） | —— | 脚注编号链接 |
+| D 普通引用 | 目标实现了 `Refable` | `refable.counter()` | `refable.numbering()` | 补充文本 + 不换行空格 + 计数器编号 |
 
 **realize_reference 生成最终内容：**
 
@@ -766,7 +879,7 @@ See @methods for details.
 - `outline()` 生成空目录
 - 实际内容排版，生成所有 heading 和它们的 location
 - 产生 Introspector 1，包含所有标签和元素的位置
-- comemo 验证：EmptyIntrospector ≠ Introspector 1 → 不收敛
+- comemo 验证：对 EmptyIntrospector 调用过的方法（如 `query_label(<intro>)` → 失败、`query(heading)` → 空），用 Introspector 1 重放时结果**不同** → 验证失败
 
 **迭代 2（使用 Introspector 1）：**
 - `@intro` 查询到 `<intro>` 元素，生成 "Section 1"
@@ -774,27 +887,29 @@ See @methods for details.
 - `outline()` 查询到 2 个 heading，生成目录条目
 - 目录占据一定空间，导致后续内容页码可能变化
 - 产生 Introspector 2
-- comemo 验证：Introspector 1 ≠ Introspector 2 → 不收敛
+- comemo 验证：对 Introspector 1 调用过的方法（如 `query_label(<intro>)` → 返回第 1 版 heading、`page(loc_of_intro)` → 第 1 版页码），用 Introspector 2 重放时若有任何一条返回值不同 → 验证失败
 
 **迭代 3（使用 Introspector 2）：**
 - 如果目录空间导致页码变化，目录中的页码需要更新
 - 如果使用自动缩进，PrefixInfo 可能需要调整
 - 产生 Introspector 3
-- comemo 验证：Introspector 2 ≠ Introspector 3 → 继续或收敛
+- comemo 验证：逐条重放本轮调用过的 Introspector 方法，全相同 → 通过（收敛）；有一条不同 → 继续迭代
 
 **迭代 4+（如果需要）：**
 - comemo 验证通过 → 收敛，退出循环
 - 若 5 轮后 comemo 仍失败 → 进入 History 诊断
 
-### 8.2 comemo 验证通过 ≠ History 诊断通过 ≠ "文档不变"
+### 8.2 comemo 验证通过 ≠ History 诊断通过 ≠ "整个 Introspector 相同"
 
-三者的语义层次不同：
+四者的语义层次不同（从强到弱）：
 
-1. **comemo 验证通过**：本轮所有对 introspector 的调用，在新 introspector 下仍返回相同结果。这是最强的收敛信号——意味着下一次迭代不会再有任何变化。→ 文档**确定**收敛。
+1. **整个 Introspector 对象相同**（最强）：逐字段、逐索引完全等价。comemo 验证**不要求**达到这一点——没被访问过的数据即便是不同的，也不影响验证结果。
 
-2. **History 诊断通过**：每个 Introspection 在最后两轮给出的 Output hash 相同。这只说明特定查询的**归约后输出**稳定了，但 comemo 看到的原始输入可能还在变化（只是变化被过滤掉了）。→ 文档**可能**已收敛（从用户可观察的语义上说），但 comemo 层面仍不稳定。
+2. **comemo 验证通过**：本轮编译中**实际调用过的每一条** Introspector trait 方法，在用新 introspector 作为 self、相同参数重放时，返回值与本轮完全相同。→ 文档**确定**收敛，因为下一轮迭代读到的数据（调用结果）和本轮完全一致。
 
-3. **两者都失败**：真正未收敛。
+3. **History 诊断通过**：每个 `Introspection` 在最后两轮给出的 `Output` hash 相同。这只说明特定查询的**归约后输出**稳定了，但 comemo 跟踪到的原始输入可能还在变化（只是变化被 Introspection 的过滤逻辑丢掉了）。→ 文档**可能**已收敛（从用户可观察的语义上说），但 comemo 层面仍不稳定。
+
+4. **两者都失败**：真正未收敛。
 
 ### 8.3 不收敛的情况
 
@@ -847,15 +962,29 @@ See @methods for details.
 解析 @target → RefElem { target: Label }
     ↓
 Synthesize 阶段
-    ↓ engine.introspect(QueryLabelIntrospection(target))
-    ↓ 存储到 element 字段
+    ↓   BibliographyElem::has(target) ? 是 → to_citation
+    ↓   否 → engine.introspect(QueryLabelIntrospection(target)) → 存 element 字段
     ↓
 Realize 阶段
-    ↓ engine.introspect(QueryLabelIntrospection(target)) （再次查询）
-    ↓ engine.introspect(PageNumberingIntrospection(loc)) （页码引用时）
-    ↓ counter.display_at(engine, loc, ...) （显示编号）
+    ↓ engine.introspect(QueryLabelIntrospection(target))
     ↓
-生成 DirectLinkElem { location, content }
+    ├── 分支 A：form == Page
+    │       ↓   engine.introspect(PageNumberingIntrospection(loc))
+    │       ↓   engine.introspect(PageSupplementIntrospection(loc))
+    │       ↓   Counter::Page.display_at(loc)
+    │       ↓   realize_reference → 页码链接
+    │
+    ├── 分支 B：BibliographyElem::has(target)
+    │       ↓   elem 存在？→ 报错（文档和文献库都有）
+    │       ↓   elem 不存在 → to_citation → CiteElem
+    │
+    ├── 分支 C：目标是 FootnoteElem
+    │       ↓   footnote.into_ref(target) → 脚注编号链接
+    │
+    └── 分支 D：目标实现 Refable
+            ↓   refable.counter() / refable.numbering() / refable.supplement()
+            ↓   counter.display_at(loc)
+            ↓   realize_reference → 补充文本 + 编号的链接
 ```
 
 ### 9.3 Outline 的完整路径
@@ -886,22 +1015,36 @@ eval() → content
 loop {
     选择 introspector（上一轮的结果或空）
         ↓
-    创建 comemo::Constraint，绑定 introspector
+    创建 comemo::Constraint，调用 introspector.track_with(&constraint)
+        ↓   此后对该 introspector 的所有 trait 方法调用都被约束观察
         ↓
     T::create(engine, content, styles)
         → realize()
             → prepare()：label → TagFlags → Tag → TagElem
-            → Synthesize：engine.introspect() 查询并记录
-            → RefElem::realize() → engine.introspect() 查询并记录
-            → OutlineElem::realize_flat() → engine.introspect() 查询并记录
+            → Synthesize：engine.introspect()  查询并记录 Introspection
+            → RefElem::realize()
+                → QueryLabelIntrospection
+                → Page / Bibliography / Footnote / Refable 分支
+                → 进一步的 PageNumberingIntrospection 等
+            → OutlineElem::realize_flat()
+                → QueryIntrospection(heading)
+                → PrefixInfo 查询/生成
         → layout()
             → TagElem → FrameItem::Tag
             → PagedIntrospector::new() → discover_tag → labels 索引
+            → 生成新 Introspector（带所有元素的最新位置/页码）
         ↓
-    comemo 约束验证
-        → 通过 → break（确定收敛）
-        → 失败 + 未达上限 → push document, 继续
-        → 失败 + 已达上限 → History 诊断 → 发出警告 → break
+    constraint.validate(new_introspector)
+        → 逐条重放约束中记录的每一次 Introspector trait 方法调用，
+          以相同参数、new_introspector 作为 self
+        → 所有调用返回值与本轮完全相同 → 通过 → break（确定收敛）
+        → 有任何一条不同 → 失败
+            → 未达迭代上限 → push document，继续下一轮
+            → 已达 5 次上限 → History 诊断
+                → 对每个记录的 Introspection，用 6 个 introspector 重算
+                → 最后两轮 Output hash 相同？→ 认为已收敛，不警告
+                → Output hash 仍不同？→ 发出具体警告 + 汇总警告
+                → break
 }
 ```
 
@@ -912,25 +1055,35 @@ loop {
 ### 10.1 comemo Constraint 作为快速收敛路径
 
 **优势：**
-- 不需要手动记录所有依赖
-- 只验证实际访问过的数据，效率高
-- 与增量计算系统无缝集成
-- 验证通过即可确定收敛，无需额外开销
+- 不需要手动记录所有依赖——所有 Introspector trait 方法调用自动被约束观察
+- 只验证**实际访问过**的方法，没调用过的 Introspector 数据即便不同也不影响结果
+- 与增量计算系统无缝集成——验证过程就是重放缓存过的方法调用
+- 验证通过即可**确定**收敛：因为下一轮用到的所有 introspector 数据（调用返回值）和本轮完全一致
+
+**⚠️ 关键澄清：它不是"比较整个 Introspector"**
+
+`constraint.validate(new_introspector)` 做的事情是：
+1. 遍历本轮约束中记录的**每一条**观察到的 Introspector 方法调用（如 `query_label(<intro>)`、`page(loc1)`、`query(heading)` 等）
+2. 对每一条：用相同参数、`new_introspector` 作为 self 调用一次
+3. 比较返回值是否与本轮缓存的值相同
+4. **所有都相同 → 通过；任一条不同 → 失败**
+
+这不是对两个 Introspector 对象做 `==` 比较。如果新旧 Introspector 之间有差异，但差异对应的方法本轮**没被调用过**，验证仍然通过。因此，它的通过条件**弱于**"整个 Introspector 内容一致"。
 
 **局限：**
-- comemo 看到的是原始输入，不是归约后的输出
-- 因此可能"假阴性"：comemo 说没收敛，但实际语义已稳定
+- comemo 看到的是原始输入（方法返回值本身），不是归约后的 Introspection Output
+- 因此可能"假阴性"：comemo 说没收敛（某个 query 返回的列表元素字段变了），但实际语义已稳定（如 Introspection 只关心 `list.is_empty()`）
 
 ### 10.2 History 诊断作为慢速但更精确的后备
 
 **优势：**
-- 检查的是用户可观察的 Introspection 输出，语义更精确
+- 检查的是用户可观察的 Introspection Output，语义更精确
 - 能区分"comemo 看到变化但输出已稳定"的情况（不发出警告）
-- 为每个未收敛的 Introspection 生成精确的诊断信息
+- 为每个未收敛的 Introspection 生成精确的诊断信息（告诉用户是哪个查询还在抖）
 
 **代价：**
 - 需要对每个 Introspection 用 6 个 introspector 重算，开销大
-- 仅在达到迭代上限后才触发
+- 仅在达到迭代上限后才触发，不能用来提前终止迭代
 
 ### 10.3 Introspection Output 的粒度选择
 
@@ -953,14 +1106,16 @@ loop {
 - comemo 验证失败时，如果 History 诊断也失败，会发出警告
 - 但存在"边界情况"：若 Introspection Output 在第 4 轮与第 5 轮恰好相同（History 通过），但第 5 轮与第 6 轮（如果存在）又会不同，则警告被抑制——这可能隐藏真正的非收敛。不过注释中提到，理论上可以"额外编译一次确认"来消除这种情况，目前未实现。
 
-### 10.5 Synthesize 与 Realize 分离
+### 10.5 Synthesize 与 Realize 分离（含 Bibliography / Footnote 分支）
 
 **Synthesize（早期）**：
 - 提供元素信息给 show rule
 - 可以容忍查询失败（element 可能为 None）
+- Bibliography 类的标签在这一步已经转为 CiteElem 的引用
 
 **Realize（晚期）**：
 - 生成最终排版内容
+- 包含 4 条分支：页码引用、Bibliography 引用（冲突检测 + CiteElem 生成）、Footnote 引用（`footnote.into_ref`）、普通 Refable 引用
 - 查询失败会产生错误
 
 这种分离允许用户在 show rule 中优雅处理尚未发现的元素：
@@ -981,7 +1136,9 @@ loop {
 | [label.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/foundations/label.rs) | Label 类型定义 |
 | [content/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/foundations/content/mod.rs) | Content::labelled / set_label |
 | [markup.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-eval/src/markup.rs) | 求值阶段 Label 回溯附着 |
-| [reference.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/reference.rs) | RefElem 定义与实现 |
+| [reference.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/reference.rs) | RefElem 定义与四分支 realize |
+| [footnote.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/footnote.rs) | FootnoteElem 与 into_ref |
+| [bibliography.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/bibliography.rs) | BibliographyElem::has / to_citation |
 | [outline.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/model/outline.rs) | OutlineElem 与 OutlineEntry |
 | [tag.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/introspection/tag.rs) | Tag、TagFlags、TagElem 定义 |
 | [realize/lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-realize/src/lib.rs) | prepare() 中 Label → TagFlags → Tag 的转换 |
@@ -990,4 +1147,4 @@ loop {
 | [introspector.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/introspection/introspector.rs) | Introspector trait 与 ElementIntrospector |
 | [introspect.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-layout/src/introspect.rs) | PagedIntrospector、discover_frame |
 | [engine.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst-library/src/engine.rs) | engine.introspect() 与 Sink 记录 |
-| [lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst/src/lib.rs) | 编译主循环与两阶段收敛逻辑 |
+| [lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/126-typst/crates/typst/src/lib.rs) | 编译主循环（comemo 约束 + History 诊断） |
