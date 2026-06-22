@@ -221,7 +221,9 @@ HTML 后端内置 `SmartQuoter` 状态机（`convert.rs` 第 72-74 行构造）�
 |-----------|----------|----------|---------|
 | `image` | `<img>` | `IMAGE_RULE` | `rules.rs` 第 773-820 行 |
 | `table` | `<table>/<thead>/<tbody>/<tr>/<td>/<th>` | `TABLE_RULE` | `rules.rs` 第 573-687 行 |
-| `divider` / `line` | `<hr>` | `DIVIDER_RULE` | `rules.rs` 第 210-212 行 |
+| `divider` | `<hr>` | `DIVIDER_RULE` | `rules.rs` 第 210-212 行 |
+
+> **注意**：`divider`（`DividerElem`，语义分割线，如 Markdown 的 `---`）映射到 `<hr>`，但 `line`（`LineElem`，几何直线，如 `#line(length: 100%)`）**没有 show rule**。HTML 后端对未注册的元素一律走 `handle()` 的 else 分支（`convert.rs` 第 155-161 行），输出警告 `"line was ignored during HTML export"` 并跳过。SVG 后端则通过布局引擎先将 `LineElem` 转为 `FrameItem::Shape`（`Geometry::Line`），再由 `render_shape()` 绘制为 `<path>`。
 
 **图片内联**：`IMAGE_RULE`（第 774-779 行）使用 `typst_svg::WebImage::to_base64_url()` 将图片编码为 Data URL 嵌入 `<img src="data:...">`，确保单文件可分发。
 
@@ -261,6 +263,7 @@ converter.push(node);
 | 表格 | 用路径绘制线条和文字 | 原生 `<table>`，语义化 | SVG: 无特殊处理，走 Frame→path；HTML: `TABLE_RULE` 拆成 `<thead>`/`<tbody>` `rules.rs` 第 573-687 行 |
 | 图片 | `<image>` 嵌入 | `<img>` Data URL | SVG: `image.rs` 模块；HTML: `IMAGE_RULE` 第 778-779 行 `to_base64_url()` |
 | 矩形/圆形 | 统一转为 `<path>` | 需通过 FrameElem 嵌入 SVG | SVG: `Geometry::Rect → SvgPathBuilder::rect()` `path.rs` 第 67-73 行；HTML: 无对应原生标签 |
+| 几何直线 | `Geometry::Line` → `<path>` | 无 show rule，导出时被忽略 | SVG: `shape.rs` 第 181 行；HTML: `convert.rs` 第 155-161 行 else 分支（发出警告并跳过） |
 | 裁剪遮罩 | 原生 `clip-path` 支持 | 依赖 CSS clip-path 或 SVG 嵌入 | SVG: `clip_paths` Deduplicator `lib.rs` 第 354-359 行；HTML: 无专门代码 |
 | 布局控制 | 完全由 Typst 控制 | 浏览器盒模型 + 文档流 | SVG: 消费 `Frame` 绝对坐标 `lib.rs` 第 314-315 行 `pre_translate`；HTML: 文档流语义标签 |
 | 可访问性 | 弱（纯图形） | 强（语义标签 + ARIA） | SVG: 仅 `data-typst-label` `lib.rs` 第 350-352 行；HTML: `HEADING_RULE` 用 `<h2>`/ARIA `rules.rs` 第 235-260 行 |
@@ -384,17 +387,17 @@ SVG 1.1 无原生锥形渐变，`write_gradients()` 的 `Gradient::Conic` 分支
 | 特性 | SVG 后端 | HTML 后端 | 差异根源代码 |
 |------|---------|----------|------------|
 | 样式载体 | SVG 元素属性（fill/stroke 等） | CSS 属性（内联 style） | SVG: `write_fill/write_stroke` `paint.rs` 32-57 行 / `shape.rs` 128-173 行；HTML: `resolve_inline_styles()` `css/resolve.rs` 11-37 行 |
-| 填充 | `fill` 属性 | `background-color` / `background-image` | SVG: Paint→fill 映射 `paint.rs` 40-52 行；HTML: 目前较少直接样式，多通过 show rule 语义化 |
-| 描边 | `stroke-*` 系列 7 个属性 | `border-*` / `outline-*` | SVG: `shape.rs` 135-172 行；HTML: 少用，表格用 `<table>` + CSS border（由 `FrameElem` 回退） |
-| 渐变 | `<linearGradient>/<radialGradient>/<pattern>` + url() | CSS `linear-gradient()` 等（通过 FrameElem 内嵌 SVG） | SVG: `push_gradient()` 两级去重 `paint.rs` 66-85 行；HTML: 无原生渐变 show rule，需 FrameElem |
-| 锥形渐变 | 360 段扇形模拟 | CSS `conic-gradient()`（同上需嵌入） | SVG: `paint.rs` 160-236 行 Conic 分支；HTML: 无对应 show rule |
+| 填充 | `fill` 属性 | 不支持渐变/图案填充；纯色仅有限支持 | SVG: Paint→fill 三路全支持 `paint.rs` 40-52 行；HTML: `ToCss for Paint` 仅 `Solid` 支持，`Gradient`/`Tiling` 调用 `w.fail()` 丢弃 `css/encode.rs` 第 386-394 行 |
+| 描边 | `stroke-*` 系列 7 个属性 | 不支持；需通过 FrameElem 回退 SVG | SVG: `shape.rs` 135-172 行 完整描边族；HTML: 无描边 show rule |
+| 渐变 | `<linearGradient>/<radialGradient>/<pattern>` + url() | **不支持**，CSS 编码直接 fail 并丢弃 | SVG: `push_gradient()` 两级去重 `paint.rs` 66-85 行；HTML: `Paint::Gradient(_) => w.fail("gradient")` `css/encode.rs` 第 390 行，属性被静默忽略 |
+| 锥形渐变 | 360 段扇形模拟 | **不支持**（同渐变，CSS 编码 fail） | SVG: `paint.rs` 160-236 行 Conic 分支；HTML: `Paint::Gradient` 统一 fail，不区分锥形/线性/径向 |
 | 变换 | `transform` 属性（智能选择 matrix/scale/translate） | CSS `transform` 属性 | SVG: `SvgTransform` `write.rs` 206-241 行 智能格式选择；HTML: 通过 `display` 和文档流自然布局 |
-| 颜色空间 | Oklab/Oklch/LinearRGB/HSL/CMYK 全部 | 依赖浏览器 CSS 支持 | SVG: `SvgDisplay for Color` 7 种格式 `paint.rs` 444-505 行；HTML: 多为十六进制输出 |
+| 颜色空间 | Oklab/Oklch/LinearRGB/HSL/CMYK 全部 | RGB 十六进制 + oklab/oklch/linear-rgb/hsl CSS 函数 | SVG: `SvgDisplay for Color` 7 种格式 `paint.rs` 444-505 行；HTML: `ToCss for Color` 统一转为 `ProcessColor` 再输出，RGB 用 `#hex` 或 `rgb()`、Oklab 用 `oklab()`、Oklch 用 `oklch()`、LinearRgb 用 `color(srgb-linear)`、HSL 用 `hsl()` `css/encode.rs` 第 396-409 行 |
 | 去重优化 | 渐变/图案两级去重 | 无内建去重 | SVG: `gradients` + `gradient_refs` 双 Deduplicator；HTML: inline style 每处一份 |
-| 字体样式 | 字形层面处理（无 CSS 字体属性） | CSS `font-*` 属性 | SVG: 字形路径已固化大小 `text.rs` 67 行预缩放；HTML: `TextElem`→浏览器字体，大小通过 show rule 传递 |
+| 字体样式 | 字形层面处理（路径已固化大小、粗细、形状） | **大部分未支持**，仅 `font-variant-caps` 和 `text-decoration` | SVG: 字形路径已固化大小 `text.rs` 67 行预缩放；HTML: `TextElem::fill`（文字颜色）尚未支持 `rules.rs` 第 759 行注释 "temporary workaround until `TextElem::fill` is supported"；`TextElem::size` 仅用于 `HtmlFrame.text_size` 缩放 SVG（`dom.rs` 第 528 行），不输出 CSS `font-size`；唯一输出的字体 CSS 为 `font-variant-caps`（`SMALLCAPS_RULE` `rules.rs` 第 718-724 行）和 `text-decoration`（`UNDERLINE_RULE`/`OVERLINE_RULE`） |
 | 可覆盖性 | 难（属性写死在 SVG） | 易（用户 CSS 可覆盖） | SVG: 属性值硬编码；HTML: class 标记 + CSS 级联优先级 |
 
-**差异核心**：SVG 后端的样式目标是**精确还原**——属性写死、两级去重优化文件体积、锥形渐变手动模拟。HTML 后端的样式目标是**可定制化**——尽量用 class（非 inline style）、show rule 映射语义元素、留给用户 CSS 覆盖空间，复杂样式退回到 FrameElem 嵌入 SVG。
+**差异核心**：SVG 后端的样式目标是**精确还原**——属性写死、两级去重优化文件体积、锥形渐变手动模拟。HTML 后端的样式能力**远比 SVG 有限**：渐变和图案填充在 CSS 编码层直接 fail 丢弃（`css/encode.rs` 第 390-391 行）；描边无对应 show rule；字体颜色/大小/粗细/族系均未输出 CSS 属性（`TextElem::fill` 尚未支持，`rules.rs` 第 759 行有明确注释）。HTML 后端目前只支持纯色填充、`font-variant-caps`、`text-decoration` 等有限样式，其余需用户通过 FrameElem 手动回退到 SVG 后端渲染。
 
 ---
 
@@ -525,8 +528,8 @@ HTML 后端内置大量 DPUB-ARIA 角色和语义标签：
 | 差异维度 | SVG 后端的选择 | 对应关键代码 | HTML 后端的选择 | 对应关键代码 |
 |---------|--------------|------------|--------------|------------|
 | **文本处理** | 字形转路径/图像，嵌入文档，保证一致性 | `crates/typst-svg/src/text.rs` 第 29-161 行 (`render_text`+`render_glyph`)；`RenderedGlyph` 第 16-23 行 | 直接输出文本节点，依赖浏览器字体，额外处理空白折叠 | `crates/typst-html/src/convert.rs` 第 252-334 行 (`handle_text`)；第 591-683 行 (`protect_spaces`+`pre_wrap`) |
-| **图形处理** | 一切几何统一为 `<path>`，绝对坐标精确绘制 | `crates/typst-svg/src/shape.rs` 第 13-48 行 (`render_shape`)；第 178-201 行 (`convert_geometry_to_path`) | 混合策略：语义标签（`<table>/<img>/<hr>`）+ FrameElem 回退内联 SVG | `crates/typst-html/src/rules.rs` 第 573-820 行 (TABLE/IMAGE/DIVIDER rules)；`crates/typst-html/src/convert.rs` 第 140-154 行 (`FrameElem` 分支) |
-| **样式处理** | 属性式样式 + 两级渐变去重 + 锥形手动模拟，追求精确和体积 | `crates/typst-svg/src/paint.rs` 第 32-331 行 (`write_fill`+`push_gradient`+`write_gradients`)；`crates/typst-svg/src/shape.rs` 第 128-173 行 (`write_stroke`) | CSS 属性式样式 + class 标记可覆盖，复杂样式退回 SVG | `crates/typst-html/src/css/resolve.rs` 第 11-37 行 (`resolve_inline_styles`)；`crates/typst-html/src/convert.rs` 第 381-510 行 (display 控制)；`crates/typst-html/src/rules.rs` 第 548-549 行 (`.hanging-indent` class) |
+| **图形处理** | 一切几何统一为 `<path>`，绝对坐标精确绘制 | `crates/typst-svg/src/shape.rs` 第 13-48 行 (`render_shape`)；第 178-201 行 (`convert_geometry_to_path`) | 混合策略：语义标签（`<table>/<img>/<hr>`）+ FrameElem 回退内联 SVG；几何 `line` 等被忽略 | `crates/typst-html/src/rules.rs` 第 573-820 行 (TABLE/IMAGE/DIVIDER rules)；`crates/typst-html/src/convert.rs` 第 140-154 行 (`FrameElem` 分支)；第 155-161 行 (未注册元素→警告跳过) |
+| **样式处理** | 属性式样式 + 两级渐变去重 + 锥形手动模拟，追求精确和体积 | `crates/typst-svg/src/paint.rs` 第 32-331 行 (`write_fill`+`push_gradient`+`write_gradients`)；`crates/typst-svg/src/shape.rs` 第 128-173 行 (`write_stroke`) | 样式能力有限：渐变/图案 fail 丢弃，字体样式大部分未支持，仅 `font-variant-caps`/`text-decoration` | `crates/typst-html/src/css/encode.rs` 第 386-394 行 (`Paint::Gradient/Tiling → w.fail()`)；`crates/typst-html/src/rules.rs` 第 759 行 (`TextElem::fill` 尚未支持注释)；`crates/typst-html/src/css/resolve.rs` 第 11-37 行 (`resolve_inline_styles`) |
 
 ### 适用场景
 
