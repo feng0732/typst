@@ -8,7 +8,7 @@
 
 ### 1.1 进程入口
 
-**文件**: `crates/typst-cli/src/main.rs` [main.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/main.rs#L50-L66)
+**文件**: `crates/typst-cli/src/main.rs` (第 50-66 行)
 
 ```
 main()
@@ -18,7 +18,7 @@ main()
 
 ### 1.2 命令分发
 
-**文件**: `crates/typst-cli/src/main.rs` [main.rs#L69-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/main.rs#L69-L82)
+**文件**: `crates/typst-cli/src/main.rs` (第 69-82 行)
 
 ```rust
 fn dispatch() -> HintedStrResult<()> {
@@ -29,13 +29,13 @@ fn dispatch() -> HintedStrResult<()> {
 }
 ```
 
-命令定义在 `crates/typst-cli/src/args.rs` [args.rs#L122-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/args.rs#L122-L133)，`WatchCommand` 包含编译参数和可选的 HTTP 服务器参数。
+命令定义在 `crates/typst-cli/src/args.rs` [args.rs#L122-L133](crates/typst-cli/src/args.rs#L122-L133)，`WatchCommand` 包含编译参数和可选的 HTTP 服务器参数。
 
 ---
 
 ## 2. 监视模式初始化
 
-**文件**: `crates/typst-cli/src/watch.rs` [watch.rs#L18-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/watch.rs#L18-L84)
+**文件**: `crates/typst-cli/src/watch.rs` [watch.rs#L18-L84](crates/typst-cli/src/watch.rs#L18-L84)
 
 ### 2.1 步骤 1：创建编译配置
 
@@ -43,7 +43,7 @@ fn dispatch() -> HintedStrResult<()> {
 let mut config = CompileConfig::watching(command)?;
 ```
 
-调用 `crates/typst-cli/src/compile.rs` [compile.rs#L98-L100](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/compile.rs#L98-L100) 的 `CompileConfig::watching()`，内部通过 `new_impl(args, Some(command))` 构造配置：
+调用 `crates/typst-cli/src/compile.rs` [compile.rs#L98-L100](crates/typst-cli/src/compile.rs#L98-L100) 的 `CompileConfig::watching()`，内部通过 `new_impl(args, Some(command))` 构造配置：
 
 - 推断输出格式（PDF/PNG/SVG/HTML/Bundle）
 - 校验 watch 模式下不允许 stdout 输出
@@ -56,7 +56,7 @@ let mut config = CompileConfig::watching(command)?;
 let mut watcher = Watcher::new(Some(output.clone()))?;
 ```
 
-**文件**: `crates/typst-kit/src/watcher.rs` [watcher.rs#L47-L70](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/watcher.rs#L47-L70)
+**文件**: `crates/typst-kit/src/watcher.rs` [watcher.rs#L47-L70](crates/typst-kit/src/watcher.rs#L47-L70)
 
 `Watcher::new()` 内部：
 1. 创建 MPSC 通道 `(tx, rx)` 用于 notify-rs 事件传递
@@ -70,7 +70,7 @@ let mut watcher = Watcher::new(Some(output.clone()))?;
 
 ### 2.3 步骤 3：创建编译世界（错误恢复场景一）
 
-**文件**: `crates/typst-cli/src/watch.rs` [watch.rs#L31-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/watch.rs#L31-L49)
+**文件**: `crates/typst-cli/src/watch.rs` [watch.rs#L31-L49](crates/typst-cli/src/watch.rs#L31-L49)
 
 ```rust
 let mut world = loop {
@@ -107,7 +107,7 @@ if config.output_format.is_paged() {
 timer.record(&mut world, |world| compile_once(world, &mut config))??;
 ```
 
-`Timer::record` 见 `crates/typst-kit/src/timer.rs` [timer.rs#L57-L95](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/timer.rs#L57-L95)。
+`Timer::record` 见 `crates/typst-kit/src/timer.rs` [timer.rs#L57-L95](crates/typst-kit/src/timer.rs#L57-L95)。
 
 注意这里的 `??`：外层是 `timer.record` 的 `StrResult`，内层是 `compile_once` 的 `HintedStrResult`。**但编译错误（语法错误等）不会导致 `compile_once` 返回 Err**，详见第 6 章错误恢复分析。
 
@@ -115,7 +115,7 @@ timer.record(&mut world, |world| compile_once(world, &mut config))??;
 
 ## 3. 核心循环总览
 
-**文件**: `crates/typst-cli/src/watch.rs` [watch.rs#L68-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/watch.rs#L68-L83)
+**文件**: `crates/typst-cli/src/watch.rs` [watch.rs#L68-L83](crates/typst-cli/src/watch.rs#L68-L83)
 
 ```rust
 loop {
@@ -142,7 +142,7 @@ loop {
 
 ### 4.1 获取依赖列表
 
-**文件**: `crates/typst-cli/src/world.rs` [world.rs#L97-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/world.rs#L97-L101)
+**文件**: `crates/typst-cli/src/world.rs` [world.rs#L97-L101](crates/typst-cli/src/world.rs#L97-L101)
 
 ```rust
 pub fn dependencies(&mut self) -> impl Iterator<Item = PathBuf> + '_ {
@@ -153,7 +153,7 @@ pub fn dependencies(&mut self) -> impl Iterator<Item = PathBuf> + '_ {
 
 从 `FileStore` 中取出上次编译过程中实际访问过的所有 `FileId`，解析为文件系统路径。这意味着 **每次编译后都会动态刷新监听范围** —— 如果代码中 `#import` 了新文件，下一轮监听会自动包含它们。
 
-**依赖跟踪的实现原理**：见 `crates/typst-kit/src/files.rs` [files.rs#L91-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/files.rs#L91-L99)
+**依赖跟踪的实现原理**：见 `crates/typst-kit/src/files.rs` [files.rs#L91-L99](crates/typst-kit/src/files.rs#L91-L99)
 
 ```rust
 pub fn dependencies(&mut self) -> (&L, impl Iterator<Item = FileId> + '_) {
@@ -167,7 +167,7 @@ pub fn dependencies(&mut self) -> (&L, impl Iterator<Item = FileId> + '_) {
 }
 ```
 
-`accessed()` 的定义：[files.rs#L163-L165](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/files.rs#L163-L165)
+`accessed()` 的定义：[files.rs#L163-L165](crates/typst-kit/src/files.rs#L163-L165)
 
 ```rust
 fn accessed(&self) -> bool {
@@ -179,7 +179,7 @@ fn accessed(&self) -> bool {
 
 ### 4.2 更新监听器（Mark-and-Sweep 策略）
 
-**文件**: `crates/typst-kit/src/watcher.rs` [watcher.rs#L76-L118](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/watcher.rs#L76-L118)
+**文件**: `crates/typst-kit/src/watcher.rs` [watcher.rs#L76-L118](crates/typst-kit/src/watcher.rs#L76-L118)
 
 ```rust
 pub fn update(&mut self, iter: impl IntoIterator<Item = PathBuf>) -> StrResult<()> {
@@ -221,7 +221,7 @@ pub fn update(&mut self, iter: impl IntoIterator<Item = PathBuf>) -> StrResult<(
 
 ## 5. 等待与防抖机制
 
-**文件**: `crates/typst-kit/src/watcher.rs` [watcher.rs#L121-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/watcher.rs#L121-L192)
+**文件**: `crates/typst-kit/src/watcher.rs` [watcher.rs#L121-L192](crates/typst-kit/src/watcher.rs#L121-L192)
 
 ### 5.1 整体结构
 
@@ -280,7 +280,7 @@ pub fn wait(&mut self) -> StrResult<()> {
 
 ### 5.4 事件类型过滤
 
-**文件**: `crates/typst-kit/src/watcher.rs` [watcher.rs#L196-L211](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/watcher.rs#L196-L211)
+**文件**: `crates/typst-kit/src/watcher.rs` [watcher.rs#L196-L211](crates/typst-kit/src/watcher.rs#L196-L211)
 
 ```
 相关事件：Any / Create / Modify::Any / Modify::Data
@@ -321,7 +321,7 @@ T+130ms: BATCH_TIMEOUT=100ms 超时 → 迭代链终止
 
 **关键发现**：`compile_once` 即使编译失败（有语法/语义错误），返回值仍然是 `Ok(())`。
 
-**文件**: `crates/typst-cli/src/compile.rs` [compile.rs#L258-L314](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/compile.rs#L258-L314)
+**文件**: `crates/typst-cli/src/compile.rs` [compile.rs#L258-L314](crates/typst-cli/src/compile.rs#L258-L314)
 
 ```rust
 pub fn compile_once(
@@ -372,7 +372,7 @@ pub fn compile_once(
 
 ### 6.2 watch 循环中的错误传播
 
-回到 `crates/typst-cli/src/watch.rs` [watch.rs#L79](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/watch.rs#L79)：
+回到 `crates/typst-cli/src/watch.rs` [watch.rs#L79](crates/typst-cli/src/watch.rs#L79)：
 
 ```rust
 timer.record(&mut world, |world| compile_once(world, &mut config))??;
@@ -402,7 +402,7 @@ timer.record(&mut world, |world| compile_once(world, &mut config))??;
 **答案**：可以。原因：
 
 1. **`FileStore` 的依赖跟踪基于"是否被访问"**，而非"是否编译成功"
-2. `accessed()` 的判断条件只是 `!matches!(self, Self::Empty(_))` [files.rs#L163-L165](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/files.rs#L163-L165)
+2. `accessed()` 的判断条件只是 `!matches!(self, Self::Empty(_))` [files.rs#L163-L165](crates/typst-kit/src/files.rs#L163-L165)
 3. 即使编译在某个文件处失败，该文件以及之前访问过的所有文件，它们的 `FileSlot` 都已处于 `Loaded` 或 `Parsed` 状态，都会被计入依赖
 
 **示例**：`main.typ` 引用了 `a.typ`，`a.typ` 引用了 `b.typ`，但 `b.typ` 有语法错误。
@@ -420,7 +420,7 @@ dependencies() 返回：[main.typ, a.typ, b.typ] —— 三个都在 ✓
 
 ### 6.4 Reset 与下一轮的衔接
 
-`world.reset()` 的实现见 `crates/typst-cli/src/world.rs` [world.rs#L104-L107](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/world.rs#L104-L107)：
+`world.reset()` 的实现见 `crates/typst-cli/src/world.rs` [world.rs#L104-L107](crates/typst-cli/src/world.rs#L104-L107)：
 
 ```rust
 pub fn reset(&mut self) {
@@ -429,7 +429,7 @@ pub fn reset(&mut self) {
 }
 ```
 
-`FileStore::reset` 的实现：[files.rs#L111-L116](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/files.rs#L111-L116)
+`FileStore::reset` 的实现：[files.rs#L111-L116](crates/typst-kit/src/files.rs#L111-L116)
 
 ```rust
 pub fn reset(&mut self) {
@@ -439,7 +439,7 @@ pub fn reset(&mut self) {
 }
 ```
 
-`FileSlot::reset`：[files.rs#L168-L174](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-kit/src/files.rs#L168-L174)
+`FileSlot::reset`：[files.rs#L168-L174](crates/typst-kit/src/files.rs#L168-L174)
 
 ```rust
 fn reset(&mut self) {
@@ -518,7 +518,7 @@ fn reset(&mut self) {
 
 ### 7.1 compile_once 完整流程
 
-**文件**: `crates/typst-cli/src/compile.rs` [compile.rs#L258-L314](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/compile.rs#L258-L314)
+**文件**: `crates/typst-cli/src/compile.rs` [compile.rs#L258-L314](crates/typst-cli/src/compile.rs#L258-L314)
 
 ```
 compile_once(world, config)
@@ -555,7 +555,7 @@ compile_once(world, config)
 
 ### 7.2 图片导出缓存
 
-**文件**: `crates/typst-cli/src/compile.rs` [compile.rs#L640-L671](file:///d:/fz/0601-2/solo-dogfeeding/code/132-typst/crates/typst-cli/src/compile.rs#L640-L671)
+**文件**: `crates/typst-cli/src/compile.rs` [compile.rs#L640-L671](crates/typst-cli/src/compile.rs#L640-L671)
 
 ```rust
 if config.watching
