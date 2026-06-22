@@ -26,16 +26,16 @@
        │
     ▼  Show Rule 注册（按 Target 区分）
     │
-    │  Target::Paged  [typst-layout/rules.rs:L96-L103]:
+    │  Target::Paged  [typst-layout/rules.rs:L96-L103, typst-html/rules.rs:L88-L91]:
     │    LINE_RULE → layout_line
     │    RECT_RULE → layout_rect
     │    ...所有 7 种基础图形元素都有 Show Rule
-    │    FrameElem 无 Show Rule（仅用于 Html 目标）
+    │    FrameElem → no-op 展开（|elem| elem.body.clone()），避免嵌套 frame 破坏布局
     │
     │  Target::Html  [typst-html/rules.rs:L82-L83]:
     │    IMAGE_RULE （仅图片有 Show Rule）
     │    7 种基础图形元素 → 无 Show Rule → convert.rs 中被忽略并警告
-    │    FrameElem → 在 convert.rs 中被显式处理（桥接）
+    │    FrameElem → 无 Show Rule，在 convert.rs 中被显式匹配并桥接
     │
     │  Target::Bundle  [typst-bundle/lib.rs]:
     │    无图形 Show Rule（Bundle 不是布局目标，是编排目标）
@@ -123,8 +123,35 @@
 **关键归属区分**：
 - 基础图形 7 种位于 `typst-library/src/visualize/` → 是跨目标通用的「图形语义」
 - `FrameElem` 位于 `typst-html/src/lib.rs` → 是 HTML 目标专用的「桥接语义」，非图形元素
-- `FrameElem` 在 `Target::Paged` 下无 Show Rule，仅在 `Target::Html` 下由 `convert.rs` 显式匹配处理
 - 同理，`DocumentElem` / `AssetElem` 等位于 `typst-library/model/document.rs` → Bundle 目标专用「编排语义」
+
+#### FrameElem 双目标处理路径对比
+
+`FrameElem` 在 Paged 和 Html 两个目标下各有一条完全不同的处理路径：
+
+| 目标 | 处理方式 | 代码位置 | 效果 |
+|------|---------|---------|------|
+| `Target::Paged` | **Show Rule**：no-op 展开 | [typst-html/rules.rs:L88-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/rules.rs#L88-L91) | `|elem, _, _| Ok(elem.body.clone())` → 直接展开 body，仿佛 `html.frame` 不存在 |
+| `Target::Html` | **convert.rs 显式匹配**：桥接渲染 | [typst-html/convert.rs:L140-L154](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/convert.rs#L140-L154) | 切 Target::Paged 重新布局 → Frame → HtmlFrame → 内联 SVG |
+
+**Paged 目标 no-op 的设计原因**（源码注释）：
+> For the HTML target, `html.frame` is a primitive. In the laid-out target,
+> it should be a no-op so that nested frames don't break (things like `show
+> math.equation: html.frame` can result in nested ones).
+
+即：当用户写了类似 `#show math.equation: html.frame` 这样的规则时，在 Paged 目标下会产出嵌套的 `html.frame`，如果 Paged 目标没有 no-op 规则会报错。no-op 展开让 body 内容被 Paged 布局正常处理。
+
+**Html 目标桥接流程**：
+```
+convert.rs handle() 遍历 Content 子节点
+  ├─ child.to_packed::<FrameElem>() 匹配成功
+  ├─ style = TargetElem::target.set(Target::Paged).wrap()
+  ├─ layout_frame(engine, &elem.body, locator, styles.chain(&style), ...)
+  │   └─ 触发完整 Paged 目标布局流程（含所有 layout_line/layout_rect 等）
+  ├─ Frame 包装为 HtmlFrame { inner, text_size, css, span, id, anchors }
+  └─ HtmlFrame 转为 HtmlNode::Frame 插入 DOM 树
+      └─ encode.rs 编码时 → typst_svg::svg_in_html() → 内联 <svg>
+```
 
 ### 1.2 核心数据结构三件套
 
@@ -631,11 +658,11 @@ Shape
 
 ### 4.4 HTML 输出边界与内联 SVG 机制
 
-HTML 输出对图形元素的处理与 Paged 目标完全不同，分为两条路径：
+HTML 输出对图形元素的处理与 Paged 目标完全不同，分为三条路径：
 
-#### 4.4.1 普通图形元素：直接忽略
+#### 4.4.1 普通基础图形元素：直接忽略
 
-在 `Target::Html` 下，[typst-html/rules.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/rules.rs) 只为 `ImageElem` 注册了 Show Rule（L83），**没有为 RectElem/LineElem/CurveElem/PolygonElem 等图形元素注册 Show Rule**。
+在 `Target::Html` 下，[typst-html/rules.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/rules.rs) 只为 `ImageElem` 注册了 Show Rule（L83），**没有为 RectElem/LineElem/CurveElem/PolygonElem 等基础图形元素注册 Show Rule**。
 
 因此，在 [convert.rs:155-160](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/convert.rs#L155-L160) 的 `handle()` 函数中，这些元素会落入 else 分支，被忽略并警告：
 
@@ -648,6 +675,17 @@ HTML 输出对图形元素的处理与 Paged 目标完全不同，分为两条�
     ));
 }
 ```
+
+#### 4.4.1.1 FrameElem：双目标处理路径对比
+
+`FrameElem` 既不属于基础图形元素，也不在 Html 目标下注册 Show Rule。它的两条处理路径是**不对称**的：
+
+| 目标 | 处理方式 | 代码位置 | 效果 |
+|------|---------|---------|------|
+| **Paged** | **Show Rule**：no-op 展开 | [typst-html/rules.rs:L88-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/rules.rs#L88-L91) | `rules.register::<FrameElem>(Paged, \|elem, _, _\| Ok(elem.body.clone()))` |
+| **Html** | **convert.rs 显式匹配** | [convert.rs:L140-L154](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/convert.rs#L140-L154) | `child.to_packed::<FrameElem>()` → 切 Paged 布局 → HtmlFrame → 内联 SVG |
+
+**Paged 目标 no-op 的必要性**：如果没有这条规则，`#show math.equation: html.frame` 这样的用户规则会在 Paged 目标下产生嵌套的 `html.frame`，导致无法被任何 Show Rule 处理而报错。no-op 展开让 body 被 Paged 布局正常处理，仿佛 `html.frame` 不存在。
 
 #### 4.4.2 html.frame：通过内联 SVG 渲染
 
@@ -752,10 +790,10 @@ fn write_frame(w: &mut Writer, frame: &HtmlFrame) {
                                        │  Show Rule（按 Target 区分）
          ┌─────────────────────────────┼──────────────────────────────┐
          │ Target::Paged               │ Target::Html                 │ Target::Bundle
-         │ [typst-layout/rules.rs]    │ [typst-html/rules.rs]        │ （编排，不直接布局）
-         │ 7 种图形元素都有规则        │ ImageElem 有 Show Rule       │ 根层 document/asset/tag
-         │ FrameElem 无 Show Rule      │ 7 种基础图形 → 忽略+警告     │
-         │                            │ FrameElem → convert.rs 桥接  │
+         │ [typst-layout/rules.rs +    │ [typst-html/rules.rs]        │ （编排，不直接布局）
+         │  typst-html/rules.rs:L88]   │ ImageElem 有 Show Rule       │ 根层 document/asset/tag
+         │ 7 种图形元素都有规则        │ 7 种基础图形 → 忽略+警告     │
+         │ FrameElem → no-op 展开      │ FrameElem → convert.rs 桥接  │
          ▼                             ▼                              ▼
 ┌─────────────────────────┐  ┌──────────────────────────┐  ┌───────────────────────────────┐
 │ 布局层 (typst-layout/  │  │ convert.rs:L155-L160      │  │ typst-bundle/lib.rs           │
@@ -880,11 +918,21 @@ Bundle 构建阶段在 [compile_document](file:///d:/fz/0601-2/solo-dogfeeding/c
 
 所有圆角（矩形圆角、圆/椭圆）都通过 `bezier_arc_control` 函数（[L1372-L1386](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-layout/src/shapes.rs#L1372-L1386)）将圆弧转换为三次贝塞尔，基于 [StackOverflow 算法](https://stackoverflow.com/a/44829356)。
 
-### 6.6 Target 动态切换与 html.frame 桥接
+### 6.6 Target 动态切换与 FrameElem 双目标处理
 
-HTML 目标下普通图形元素会被忽略，但 `html.frame()` 提供了桥接机制：
+`FrameElem`（`html.frame`）是 Typst 中最独特的双目标处理元素，其两条处理路径是不对称的：
 
-**关键机制**（[convert.rs:140-154](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/convert.rs#L140-L154)）：
+| 目标 | 机制 | 代码位置 | 效果 |
+|------|------|---------|------|
+| **Paged** | **Show Rule**：no-op 展开 | [typst-html/rules.rs:L88-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/rules.rs#L88-L91) | `|elem, _, _| Ok(elem.body.clone())` —— body 被 Paged 布局正常处理 |
+| **Html** | **convert.rs 显式匹配** | [convert.rs:L140-L154](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/convert.rs#L140-L154) | 切 Paged 布局 → Frame → HtmlFrame → 内联 SVG |
+
+**Paged 目标 no-op 规则的设计原因（源码注释）：
+> For the HTML target, `html.frame` is a primitive. In the laid-out target,
+> it should be a no-op so that nested frames don't break (things like `show
+> math.equation: html.frame` can result in nested ones).
+
+**Html 目标下的桥接机制**（[convert.rs:140-154](file:///d:/fz/0601-2/solo-dogfeeding/code/125-typst/crates/typst-html/src/convert.rs#L140-L154)：
 
 ```rust
 // 1. 临时切换 Target
@@ -904,6 +952,7 @@ HtmlFrame::new(frame, styles, elem.span())
 - `html.frame` 内部触发的是完整的 Paged 布局流程，因此支持所有 Paged 目标的功能
 - `svg_in_html()` 与普通 SVG 导出共享 `render_shape` / `convert_geometry_to_path` 等核心转换逻辑
 - 实现了 "HTML 文档中嵌入精确排版图形" 的能力，同时保持 HTML 输出的语义化
+- Paged 目标下的 no-op 规则确保跨目标规则（如 `#show math.equation: html.frame`）不会破坏 Paged 导出
 
 ### 6.7 Frame 树作为统一中间表示
 
