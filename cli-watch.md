@@ -313,6 +313,139 @@ T+130ms: BATCH_TIMEOUT=100ms 超时 → 迭代链终止
          累计发现相关事件 → relevant=true → 返回触发编译
 ```
 
+### 5.6 输出自触发防护与边界分析
+
+#### 5.6.1 防护逻辑
+
+**代码位置**：`crates/typst-kit/src/watcher.rs` [watcher.rs#L172-L181](crates/typst-kit/src/watcher.rs#L172-L181)
+
+```rust
+// Don't recompile because the output file changed.
+// FIXME: This doesn't work properly for multifile image export.
+if let Some(output) = &self.output
+    && event
+        .paths
+        .iter()
+        .all(|path| is_same_file(path, output).unwrap_or(false))
+{
+    continue;
+}
+```
+
+**防护机制**：
+- `Watcher::new(output)` 时传入输出文件路径，存储在 `self.output` 中
+- 每个事件到达后，用 `is_same_file`（same_file crate）比较事件路径与输出路径
+- `is_same_file` 通过 inode/文件句柄判断两个路径是否指向同一个文件（能正确处理符号链接、相对/绝对路径差异）
+- 如果事件中的**所有**路径都是输出文件，则 `continue` 跳过，不标记 `relevant`
+- 配合防抖批处理机制，如果一个批处理窗口内只有输出文件事件，整轮等待不会触发重编译
+
+**`all()` 的语义**：只有事件中所有路径都是输出文件时才跳过。如果事件同时涉及输出文件和源文件，则不会跳过 —— 这是合理的，因为源文件变化确实需要重编译。
+
+#### 5.6.2 output 参数的来源
+
+**代码位置**：`crates/typst-cli/src/watch.rs` [watch.rs#L22-L27](crates/typst-cli/src/watch.rs#L22-L27)
+
+```rust
+let Output::Path(output) = &config.output else {
+    bail!("cannot write document to stdout in watch mode");
+};
+let mut watcher = Watcher::new(Some(output.clone()))?;
+```
+
+传入的 `output` 就是 `config.output`，即用户在命令行指定的原始输出路径。**注意：对于多页图片导出，这个路径可能包含模板占位符（如 `{p}`、`{0p}`），不是实际生成的文件路径。**
+
+#### 5.6.3 输出路径模板与实际生成文件
+
+多页 PNG/SVG 导出时，路径模板在 `crates/typst-cli/src/compile.rs` [compile.rs#L536-L563](crates/typst-cli/src/compile.rs#L536-L563) 的 `output_template` 模块中处理。
+
+支持的模板占位符：
+
+| 占位符 | 含义 | 示例（第3页/共10页） |
+|--------|------|---------------------|
+| `{p}` | 页码（无前导零） | `3` |
+| `{0p}` 或 `{n}` | 页码（有前导零，按总页数宽度对齐） | `03` |
+| `{t}` | 总页数 | `10` |
+
+**模板检测**：`has_indexable_template(output)` 检查路径中是否包含 `{p}`、`{0p}` 或 `{n}` 任意一个。
+
+**多页导出的条件**：
+- 如果文档有多页，且输出路径不含模板 → 报错：`cannot export multiple images without a page number template`
+- 如果文档有多页，且输出路径含模板 → 正常导出，生成 `page-1.png`、`page-2.png`、...
+
+#### 5.6.4 各导出格式的防护有效性
+
+| 导出格式 | 输出类型 | output 参数 | 实际生成 | 自触发防护 |
+|---------|---------|------------|---------|-----------|
+| PDF | 单文件 | 实际文件路径 | 1 个文件 | ✅ 有效 |
+| HTML | 单文件 | 实际文件路径 | 1 个文件 | ✅ 有效 |
+| PNG（单页文档） | 单文件 | 实际文件路径 | 1 个文件 | ✅ 有效 |
+| PNG（多页 + 模板） | 多文件 | 模板路径（含 `{p}`） | N 个文件 | ❌ 无效 |
+| SVG（单页文档） | 单文件 | 实际文件路径 | 1 个文件 | ✅ 有效 |
+| SVG（多页 + 模板） | 多文件 | 模板路径（含 `{p}`） | N 个文件 | ❌ 无效 |
+| Bundle | 目录 | 目录路径 | 目录下多文件 | ❌ 无效 |
+
+**为什么多文件导出防护失效**：
+
+以 `--format png -o page-{p}.png` 为例：
+
+```
+Watcher 中的 output: "page-{p}.png"   （模板路径，文件系统中不存在）
+实际生成的文件:
+  page-1.png  ← 写入时触发事件
+  page-2.png  ← 写入时触发事件
+  page-3.png  ← 写入时触发事件
+
+防护判断:
+  is_same_file("page-1.png", "page-{p}.png") → false（两个不同文件）
+  is_same_file("page-2.png", "page-{p}.png") → false（两个不同文件）
+  ...
+  all(...) → false
+  → 不跳过 → 标记为 relevant → 触发重编译 → 自触发！
+```
+
+`page-{p}.png` 作为模板路径，在文件系统中要么不存在（`is_same_file` 返回 `Err`，`.unwrap_or(false)` 得 `false`），要么是另一个不同的文件，所以所有生成文件的事件都不会被过滤。
+
+#### 5.6.5 Bundle 导出的情况
+
+Bundle 导出的输出是一个目录（见 `export_bundle` [compile.rs#L390-L415](crates/typst-cli/src/compile.rs#L390-L415)），目录下生成多个文件（HTML、CSS、JS、图片资源等）。
+
+```
+output: "output/"  （目录路径）
+生成的文件:
+  output/index.html
+  output/assets/style.css
+  output/assets/script.js
+  ...
+
+防护判断:
+  is_same_file("output/index.html", "output/") → false（文件 vs 目录）
+  → 不跳过 → 自触发！
+```
+
+`is_same_file` 比较文件和目录，返回 `false`，所以 bundle 导出的所有生成文件事件都不会被过滤。
+
+#### 5.6.6 自触发会导致什么问题
+
+如果输出文件/生成文件恰好在依赖监听范围内（例如：输出文件与某个被引用的图片资源同名，或输出目录在源文件目录内且被递归监听），则会形成**编译 → 写输出 → 触发事件 → 重编译 → 再写输出 → ...** 的死循环。
+
+在当前架构下，由于：
+1. watcher 只监听依赖文件（源文件、资源文件），不监听输出文件
+2. 输出文件通常不在依赖列表中
+
+所以自触发问题在大多数情况下不会实际发生。但以下边界场景可能触发：
+
+- **输出文件与资源文件同名**：例如项目里有 `diagram.png` 被 `#image` 引用，同时输出路径设为 `diagram.png`，每次编译覆盖资源文件，触发死循环
+- **模板展开后与资源文件同名**：多页导出时，某一页的输出文件名恰好和某个资源文件相同
+- **Bundle 输出目录在源目录内**：bundle 生成的文件如果刚好和源目录内的文件路径重合
+
+代码中的 `FIXME` 注释明确标记了这个已知问题，但尚未修复。
+
+#### 5.6.7 单文件场景为何正常工作
+
+单文件导出（PDF、HTML、单页图片）时，`output` 就是实际生成文件的路径。如果这个文件恰好在依赖监听范围内（虽然不常见），`is_same_file` 能正确识别为同一文件，过滤掉写入事件，防止死循环。
+
+**注意**：即使是单文件导出，如果输出文件不在依赖监听范围内，自触发防护也"用不上"——因为 watcher 根本不会收到输出文件的事件。防护是针对"输出文件恰好也在监听范围内"这种边界场景的保险。
+
 ---
 
 ## 6. 错误恢复机制（核心）
