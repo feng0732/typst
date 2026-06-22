@@ -689,7 +689,600 @@ pub struct Glyph {
 
 ---
 
-## 九、相关文件索引
+## 九、边界路径：关闭回退 (fallback: false)
+
+### 9.1 触发条件
+
+用户通过 `#set text(fallback: false)` 关闭回退。此时 [TextElem::fallback](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/text/mod.rs#L201-L203) 属性为 `false`。
+
+### 9.2 关闭回退后的字体列表缩减
+
+[families](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/text/mod.rs#L1083-L1099) 函数中：
+
+```rust
+let tail = if styles.get(TextElem::fallback) {
+    fallbacks.as_slice()   // 正常模式：追加内置回退字体
+} else {
+    &[]                     // 关闭回退：不追加任何回退字体
+};
+styles.get_ref(TextElem::font).into_iter().chain(tail.iter())
+```
+
+**效果**：字体列表仅包含用户显式指定的字体家族（如 `#set text(font: "Inria Serif")`），不再追加 `"libertinus serif"`、`"twitter color emoji"` 等内置回退。
+
+### 9.3 关闭回退后的 `get_font_and_covers()` 行为
+
+[get_font_and_covers](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L902-L953) 中：
+
+```rust
+// 阶段1: 遍历用户字体列表（不受 fallback 开关影响）
+for family in families.by_ref() {
+    selection = book.select(family.as_str(), ctx.variant())...;
+    if selection.is_some() { break; }
+}
+
+// 阶段2: 全局回退——此处受 fallback 开关控制
+if selection.is_none() && ctx.fallback() {   // ← fallback=false 时跳过
+    selection = book.select_fallback(first, ctx.variant(), text)...;
+}
+```
+
+**关键差异**：`fallback=false` 时：
+- 阶段1 正常执行（仍按用户字体列表顺序查找）
+- 阶段2 被完全跳过（`ctx.fallback()` 返回 `false`）
+- 直接进入阶段3：`shape_tofus()`
+
+### 9.4 关闭回退后的连字符处理
+
+[ShapedText::hyphen](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L583-L638) 中，连字符的回退也受控制：
+
+```rust
+let fallback_func = if fallback {
+    Some(|| book.select_fallback(None, base.variant, "-"))  // 正常模式
+} else {
+    None  // 关闭回退：不使用全局回退查找连字符
+};
+```
+
+**效果**：如果用户字体列表中没有包含 `-` 字形的字体，断字时找不到连字符，该行将不会添加连字符。
+
+### 9.5 完整路径图
+
+```
+fallback=false 时的字形处理路径：
+
+shape_segment()
+  │
+  ├─▶ get_font_and_covers()
+  │     ├─ 阶段1: 用户字体列表 → 找到？正常字形
+  │     ├─ 阶段2: 跳过（fallback=false）
+  │     └─ 阶段3: shape_tofus()  ← 用户字体中无匹配时直接进入
+  │
+  └─▶ rustybuzz.shape_with_plan()
+        │
+        ├─ glyph_id != 0 && is_covered → 正常字形
+        │
+        └─ glyph_id == 0 (tofu) → 递归 shape_segment()
+              │
+              ├─ get_font_and_covers()
+              │     ├─ 阶段1: 继续遍历剩余的字体列表
+              │     ├─ 阶段2: 跳过
+              │     └─ 阶段3: shape_tofus()
+              │
+              └─ 所有字体耗尽 → shape_tofus() ← 最终显示豆腐块
+```
+
+---
+
+## 十、边界路径：字体覆盖限制 (covers)
+
+### 10.1 设计意图
+
+`covers` 机制允许用户精确控制某个字体家族只用于特定范围的 Unicode 字符，避免字体回退"过度使用"某个字体。
+
+典型场景：
+```typst
+#set text(font: (
+  (name: "Inria Serif", covers: "latin-in-cjk"),
+  "Noto Serif CJK SC"
+))
+```
+这里 `Inria Serif` 只负责 Latin 字符，CJK 字符直接交给 `Noto Serif CJK SC`，而不是等 Inria Serif 缺字后再回退。
+
+### 10.2 `FontFamily` 和 `Covers` 数据结构
+
+[FontFamily](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/text/mod.rs#L942-L969)：
+
+```rust
+pub struct FontFamily {
+    name: EcoString,              // 家族名（小写）
+    covers: Option<Covers>,       // 覆盖限制（None 表示无限制）
+}
+```
+
+[Covers](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-library/src/text/mod.rs#L992-L1015) 枚举：
+
+```rust
+pub enum Covers {
+    LatinInCjk,           // 预定义：排除 CJK/Latin 共有标点
+    Regex(Regex),          // 自定义正则
+}
+```
+
+#### `latin-in-cjk` 的具体排除列表
+
+```rust
+Self::LatinInCjk => singleton!(Regex,
+    Regex::new(
+        "[^\u{00B7}\u{2013}\u{2014}\u{2018}\u{2019}\
+           \u{201C}\u{201D}\u{2025}-\u{2027}\u{2E3A}]"
+    ).unwrap()
+)
+```
+
+排除的字符：
+| Unicode | 字符 | 说明 |
+|---------|------|------|
+| U+00B7  | · | 间隔号 |
+| U+2013  | – | 短破折号 |
+| U+2014  | — | 长破折号 |
+| U+2018  | ' | 左单引号 |
+| U+2019  | ' | 右单引号 |
+| U+201C  | " | 左双引号 |
+| U+201D  | " | 右双引号 |
+| U+2025–U+2027 | ‥…‧ | 省略号相关 |
+| U+2E3A  | ⸺ | 双长破折号 |
+
+这些字符在 Latin 和 CJK 字体中都有，但 CJK 字体通常有更适合 CJK 排版的版本。
+
+### 10.3 覆盖限制在字形处理中的执行
+
+[shape_segment](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L956-L1158) 中的 `is_covered` 闭包：
+
+```rust
+let is_covered = |offset| {
+    let end = text[offset..]
+        .char_indices()
+        .nth(1)
+        .map(|(i, _)| offset + i)
+        .unwrap_or(text.len());
+    covers.is_none_or(|cov| cov.is_match(&text[offset..end]))
+};
+```
+
+**核心逻辑**：对每个字符，检查它是否匹配 `covers` 正则：
+- `covers == None` → 无限制，所有字符都被"覆盖"
+- `covers == Some(regex)` → 仅匹配正则的字符被视为"覆盖"
+
+### 10.4 覆盖限制影响字形选择的两个层面
+
+#### 层面1：字形输出阶段
+
+```rust
+if info.glyph_id != 0 && is_covered(cluster) {
+    // 字形有效且在覆盖范围内 → 正常输出
+    ctx.glyphs.push(ShapedGlyph { ... });
+} else {
+    // 两种情况进入此分支：
+    // A) glyph_id == 0（字体中确实没有这个字符）
+    // B) glyph_id != 0 但 !is_covered（字体有这个字符，但覆盖限制排除它）
+    //    → 强制回退到下一个字体
+    shape_segment(ctx, base + start, &text[start..end], families.clone());
+}
+```
+
+**关键**：即使字体确实包含某个字符的 glyph，如果 `covers` 排除了该字符，它也会被视为"tofu"并触发递归回退。这让用户可以精确控制某个字体只负责特定字符。
+
+#### 层面2：字体使用记录
+
+```rust
+if covers.is_none() {
+    ctx.used().push(font.clone());  // 无覆盖限制的字体：标记为已用完
+}
+```
+
+**关键**：有覆盖限制的字体（`covers.is_some()`）不会被加入 `used` 列表。这意味着同一个有覆盖限制的字体可以在不同字符段上被重复使用——只是每次只处理它覆盖范围内的字符。
+
+### 10.5 覆盖限制与连字符
+
+[ShapedText::hyphen](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L597-L601) 中：
+
+```rust
+let mut chain = families(base.styles)
+    .filter(|family| family.covers().is_none_or(|c| c.is_match("-")))
+    .map(|family| book.select(family.as_str(), base.variant))
+    .chain(fallback_func.iter().map(|f| f()))
+    .flatten();
+```
+
+连字符 `-` 在查找时也会检查覆盖限制。如果某个字体家族的 `covers` 不包含 `-`，该字体不会用于渲染连字符。
+
+---
+
+## 十一、边界路径：豆腐块 (tofu) 处理
+
+### 11.1 什么是 tofu
+
+"tofu"（豆腐块）是指字体中缺失的字符。在 OpenType 中，glyph ID 为 0 表示 `.notdef`（未定义字形），通常显示为一个小方框。
+
+### 11.2 tofu 的产生路径
+
+有三种情况会产生 tofu：
+
+#### 路径A：所有字体列表和全局回退都找不到包含该字符的字体
+
+在 [get_font_and_covers](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L940-L945) 中：
+
+```rust
+let Some(font) = selection else {
+    if let Some(font) = ctx.used().first().cloned() {
+        shape_tofus(ctx, text, font);   // 用第一个曾使用过的字体显示豆腐块
+    }
+    return None;  // 返回 None 表示字体选择失败
+};
+```
+
+**注意**：这里使用 `ctx.used().first()` 作为豆腐块的字体，而不是当前正在尝试的字体。这保证了即使没有任何字体包含该字符，至少有一个可用的字体来渲染 `.notdef`。
+
+**特殊情况**：如果 `ctx.used()` 为空（即此前没有任何字体被成功选择），则豆腐块也不会被渲染——该字符将完全消失在输出中。
+
+#### 路径B：字体包含该字符但 glyph_id 为 0
+
+在 rustybuzz 处理后，某些字符可能映射到 glyph ID 0，表示字体声称覆盖了该 Unicode 码位，但实际上没有对应的字形数据。
+
+#### 路径C：字符不在 covers 覆盖范围内
+
+即使字体包含该字符（glyph_id != 0），如果 `covers` 正则不匹配，该字符也被视为"未覆盖"并触发回退。
+
+### 11.3 `shape_tofus` 实现
+
+[shape_tofus](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1237-L1268)：
+
+```rust
+fn shape_tofus(ctx: &mut ShapingContext, base: usize, text: &str, font: &FontInstance) {
+    let x_advance = font.x_advance(0).unwrap_or_default();  // .notdef 字形的步进宽度
+    let add_glyph = |(cluster, c): (usize, char)| {
+        let start = base + cluster;
+        let end = start + c.len_utf8();
+        ctx.glyphs.push(ShapedGlyph {
+            font: font.clone(),
+            glyph_id: 0,              // ← 关键：始终为 0（.notdef）
+            x_advance,                // 使用 .notdef 的步进宽度
+            x_offset: Em::zero(),
+            y_offset: Em::zero(),
+            size: ctx.size,
+            adjustability: Adjustability::default(),
+            range: start..end,        // 每个字符一个独立范围
+            safe_to_break: true,      // 豆腐块总是安全可断
+            c,                        // 保留原始字符（用于后续处理）
+            is_justifiable: ...,
+            script: c.script(),
+        });
+    };
+    if ctx.dir.is_positive() {
+        text.char_indices().for_each(add_glyph);
+    } else {
+        text.char_indices().rev().for_each(add_glyph);  // RTL 反向遍历
+    }
+}
+```
+
+### 11.4 豆腐块在 PDF 子集化中的影响
+
+当 `glyph_id == 0` 的 `ShapedGlyph` 被构建为 `TextItem` 时：
+- `Glyph.id` 为 `0`
+- 通过 `PdfGlyph::glyph_id()` 传递给 krilla：`GlyphId::new(0)`
+- krilla 将 `.notdef` 字形记录到子集化集合中
+- **PDF 验证问题**：如果启用了 PDF/A 或 PDF/UA 等标准验证，krilla 会报告 `ValidationError::ContainsNotDefGlyph`
+
+[convert_error](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/convert.rs#L600-L606) 中的错误处理：
+
+```rust
+ValidationError::ContainsNotDefGlyph(f, loc, text) => error!(
+    to_span(*loc),
+    "{prefix} the text `{}` could not be displayed with {}",
+    text.repr(),
+    display_font(gc.fonts_backward.get(f));
+    hint: "try using a different font";
+),
+```
+
+**影响**：对于需要 PDF/A 合规的文档，包含 `.notdef` 字形会导致验证失败，文档无法生成。
+
+---
+
+## 十二、边界路径：字体构建失败
+
+### 12.1 `build_font` 失败
+
+[build_font](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L79-L104) 将 Typst 的 `FontInstance` 转换为 krilla 的 `krilla::text::Font`：
+
+```rust
+#[comemo::memoize]
+fn build_font(typst_font: FontInstance) -> SourceResult<krilla::text::Font> {
+    let font_data: Arc<dyn AsRef<[u8]> + Send + Sync> =
+        Arc::new(typst_font.data().clone());
+    let variations = ...;
+    match krilla::text::Font::new_variable(
+        font_data.into(),
+        typst_font.index(),
+        &variations,
+    ) {
+        Some(f) => Ok(f),
+        None => {
+            bail!(
+                Span::detached(),
+                "failed to process {}",
+                display_font(Some(&typst_font)),
+            )
+        }
+    }
+}
+```
+
+**失败原因**：
+- 字体数据损坏或不完整
+- 字体格式不被 krilla 支持（krilla 内部使用 `skrifa` 解析字体）
+- 字体索引超出范围
+- 可变字体实例化失败
+
+**注意**：此函数被 `#[comemo::memoize]` 装饰，意味着同一个 `FontInstance` 只会构建一次。如果首次构建失败，后续遇到同一字体会直接返回缓存的错误。
+
+### 12.2 krilla 序列化时字体错误
+
+[finish](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/convert.rs#L434-L533) 函数中，`document.finish()` 可能返回 `KrillaError::Font`：
+
+```rust
+KrillaError::Font(f, err) => {
+    bail!(
+        Span::detached(),
+        "failed to process {} ({err})",
+        display_font(gc.fonts_backward.get(&f));
+        hint: "make sure the font is valid";
+        hint: "the used font might be unsupported by Typst";
+    );
+}
+```
+
+**与 `build_font` 失败的区别**：
+- `build_font` 失败发生在字体转换阶段（页面渲染时）
+- `KrillaError::Font` 失败发生在最终 PDF 序列化阶段（子集化/嵌入时）
+
+### 12.3 字体许可证限制
+
+[ValidationError::RestrictedLicense](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/convert.rs#L641-L649)：
+
+```rust
+ValidationError::RestrictedLicense(f) => error!(
+    Span::detached(),
+    "{prefix} license of {} is too restrictive",
+    display_font(gc.fonts_backward.get(&f));
+    hint: "the font has specified \"Restricted License embedding\" in its metadata";
+    hint: "restrictive font licenses are prohibited by {} because they limit \
+           the suitability for archival",
+    failing_validators.to_and_list();
+),
+```
+
+**触发条件**：字体的 OS/2 表中 `fsType` 字段标记为"Restricted License embedding"，且导出标准（如 PDF/A）禁止受限许可证字体。
+
+**影响**：子集化虽然可以成功，但受限许可证会阻止 PDF/A 合规文档的生成。
+
+---
+
+## 十三、文本提取信息与 PDF 子集化的交接
+
+### 13.1 文本提取的数据流
+
+PDF 文本提取依赖两个关键信息：
+1. **Unicode 映射**（ToUnicode CMap）：子集化字体中 glyph ID → Unicode 的映射
+2. **ActualText 属性**（/ActualText）：复杂字形（如连字、合字）的原始文本
+
+### 13.2 `TextItem.text` 的来源
+
+[ShapedText.build](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L437-L446) 中：
+
+```rust
+let item = TextItem {
+    font,
+    size: glyph_size,
+    lang: self.lang,
+    region: self.region,
+    fill: fill.clone(),
+    stroke: stroke.clone().map(|s| s.unwrap_or_default()),
+    text: self.text[range.start - self.base..range.end - self.base].into(),  // ← 关键
+    glyphs,
+};
+```
+
+`text` 字段是通过字形的 `range` 从原始文本中切片得到的。这意味着：
+- 即使发生字体回退（同一段文本被不同字体渲染），每个 `TextItem` 的 `text` 仍然是原始文本的子串
+- `text` 保留了正确的 Unicode 内容，包括连字中的多字符映射
+
+### 13.3 `PdfGlyph::text_range()` 的作用
+
+[PdfGlyph::text_range](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L117-L119)：
+
+```rust
+fn text_range(&self) -> Range<usize> {
+    self.0.range.start as usize..self.0.range.end as usize
+}
+```
+
+`text_range` 告诉 krilla 这个字形对应 `text` 参数中的哪个位置。krilla 利用此信息：
+1. **构建 `/ActualText`**：对于复杂字形（多个 glyph 对应同一段文本，如连字 "fi"），krilla 使用 `/ActualText` 属性标注原始文本
+2. **构建 ToUnicode CMap**：krilla 在子集化字体时构建 glyph ID → Unicode 的反向映射
+
+### 13.4 cluster 范围与文本提取的关系
+
+[shape_segment](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-layout/src/inline/shaping.rs#L1050-L1086) 中，每个字形的文本范围基于 HarfBuzz 的 cluster 值计算：
+
+```rust
+// 同一 cluster 的所有 glyph 共享完整文本范围
+let start = base + cluster;
+let mut k = i;
+let step: isize = if ltr { 1 } else { -1 };
+let end = loop {
+    let Some((next, next_info)) = k.checked_add_signed(step)
+        .and_then(|n| infos.get(n).map(|info| (n, info)))
+    else {
+        break base + text.len();
+    };
+    if next_info.cluster != info.cluster {
+        break base + next_info.cluster as usize;
+    }
+    k = next;
+};
+```
+
+**设计意图**：注释中明确说明——
+
+> "Each glyph in the same cluster should be assigned the full text range. This is necessary because only this way krilla can properly assign `ActualText` attributes in complex shaping scenarios."
+
+**对 PDF 的影响**：
+- 连字（如 "fi"）：两个 glyph 共享 `0..2` 的范围，krilla 知道它们对应 "fi" 而非单独的 "f" 和 "i"
+- 合字（如阿拉伯语形变）：多个 glyph 对应同一段文本，`/ActualText` 确保文本提取正确
+- 回退分段：不同 `TextItem` 的 `text` 不重叠，每个字符恰好属于一个 `TextItem`
+
+### 13.5 `draw_glyphs` 的 `text` 参数
+
+[handle_text](file:///d:/fz/0601-2/solo-dogfeeding/code/129-typst/crates/typst-pdf/src/text.rs#L42-L57) 中：
+
+```rust
+let text = t.text.as_str();        // TextItem 的文本子串
+let glyphs: &[PdfGlyph] = TransparentWrapper::wrap_slice(t.glyphs.as_slice());
+surface.draw_glyphs(
+    krilla::geom::Point::from_xy(0.0, 0.0),
+    glyphs,         // 每个 glyph 的 text_range 指向 text 中的位置
+    font.clone(),
+    text,           // ← 原始文本，krilla 用它构建文本提取信息
+    size.to_f32(),
+    false,
+);
+```
+
+**`text` 的作用**：
+- krilla 将 `text[text_range]` 与 glyph ID 关联
+- 子集化时，krilla 为每个使用的 glyph 生成 ToUnicode 映射
+- 对于无法直接映射的 glyph（如连字），krilla 生成 `/ActualText` 标记
+
+### 13.6 豆腐块对文本提取的影响
+
+豆腐块（glyph_id == 0）对 PDF 文本提取有特殊影响：
+
+1. **ToUnicode 映射缺失**：`.notdef` glyph 通常不在 ToUnicode CMap 中，文本提取时该字符可能丢失
+2. **`/ActualText` 补救**：如果 krilla 为 `.notdef` 字形生成了 `/ActualText` 属性，文本提取仍可获取原始字符
+3. **PDF/A 合规**：`ContainsNotDefGlyph` 验证错误直接阻止合规文档生成
+
+### 13.7 回退分段对文本提取的影响
+
+字体回退会将同一段文本拆分为多个 `TextItem`，每个使用不同字体。在 PDF 中，这会产生多个独立的文本对象（`Tj` 操作符），每个对象使用不同的子集化字体。
+
+**对文本提取的影响**：
+- 正面：每个 `TextItem` 的 `text` 是原始文本的精确子串，文本提取时拼接正确
+- 潜在问题：如果 PDF 阅读器按文本对象分段提取，中间可能插入空格（取决于阅读器实现）
+- 解决方案：krilla 使用 `/ActualText` 属性确保连续文本的正确提取
+
+---
+
+## 十四、完整边界路径决策树
+
+```
+shape_segment(ctx, base, text, families)
+  │
+  ├─ text 全是换行/Tab/默认忽略字符？→ 直接返回（不处理）
+  │
+  ├─▶ get_font_and_covers()
+  │     │
+  │     ├─ [阶段1] 遍历用户字体列表
+  │     │     ├─ book.select(family, variant) → 找到？
+  │     │     │     ├─ 字体不在 used 中？→ 选中
+  │     │     │     └─ 字体已在 used 中？→ 继续下一个 family
+  │     │     └─ 所有 family 都尝试过？→ selection 仍为 None
+  │     │
+  │     ├─ [阶段2] fallback=true？
+  │     │     ├─ 是 → book.select_fallback(like, variant, text)
+  │     │     │        ├─ 找到包含该字符的字体？→ 选中
+  │     │     │        └─ 所有字体都不包含？→ selection 仍为 None
+  │     │     └─ 否 → 跳过
+  │     │
+  │     └─ [阶段3] selection 仍为 None？
+  │           ├─ used 列表非空 → shape_tofus(用 used[0])
+  │           └─ used 列表为空 → 返回 None（字符消失）
+  │
+  ├─▶ rustybuzz.shape_with_plan(font, plan, buffer)
+  │
+  └─ 遍历 glyphs
+        │
+        ├─ glyph_id != 0 && is_covered(cluster)?
+        │     │
+        │     │   is_covered 判定：
+        │     │   ├─ covers == None → 始终 true
+        │     │   └─ covers == Some(regex) → regex.is_match(字符)?
+        │     │
+        │     └─ 是 → 输出正常字形 ShapedGlyph
+        │
+        └─ glyph_id == 0 || !is_covered?
+              │
+              ├─ 找到连续 tofu/未覆盖序列 [start..end]
+              ├─ 移除不完整 cluster 的已有字形
+              └─ 递归 shape_segment(text[start..end], families.clone())
+                    │
+                    ├─ families 已耗尽 + fallback=false
+                    │     └─ shape_tofus() → glyph_id=0 的豆腐块
+                    │
+                    ├─ families 已耗尽 + fallback=true
+                    │     └─ select_fallback → 找到/找不到
+                    │           ├─ 找到 → 用新字体重新处理
+                    │           └─ 找不到 → shape_tofus()
+                    │
+                    └─ families 还有剩余
+                          └─ 用下一个字体重新处理
+```
+
+```
+PDF 子集化阶段的边界处理：
+
+TextItem (font, glyphs, text)
+  │
+  ├─▶ convert_font(gc, font)
+  │     ├─ 缓存命中 → 返回 krilla::text::Font
+  │     └─ 缓存未命中 → build_font()
+  │           ├─ krilla::text::Font::new_variable() 成功 → 缓存 + 返回
+  │           └─ 失败 → bail!() ← 编译中断，不生成 PDF
+  │
+  └─▶ surface.draw_glyphs(glyphs, font, text, size)
+        │
+        ├─ 每个 glyph 的 glyph_id → 记录到子集化集合
+        │     ├─ glyph_id != 0 → 正常字形，子集化时包含
+        │     └─ glyph_id == 0 → .notdef，可能触发验证错误
+        │
+        ├─ 每个 glyph 的 text_range → 构建 ActualText
+        │     └─ 同 cluster 多 glyph → 合并为一个 ActualText
+        │
+        └─ text 参数 → 构建 ToUnicode CMap
+              └─ text[range] → glyph_id 的 Unicode 映射
+
+document.finish() → PDF 序列化
+  │
+  ├─ 子集化字体嵌入
+  │     ├─ 收集所有 glyph_id → 生成子集
+  │     ├─ 生成 ToUnicode CMap
+  │     └─ 生成 ActualText 标记
+  │
+  ├─ 验证错误 (PDF/A, PDF/UA)
+  │     ├─ ContainsNotDefGlyph → 豆腐块字体 + 文本内容
+  │     ├─ RestrictedLicense → 许可证受限字体
+  │     ├─ NoCodepointMapping → 无 Unicode 映射
+  │     └─ InvalidCodepointMapping → 非法码点映射
+  │
+  └─ KrillaError::Font → 字体处理失败
+        └─ 编译中断，返回错误信息
+```
+
+---
+
+## 十五、相关文件索引
 
 | 模块 | 文件 | 核心功能 |
 |------|------|----------|
