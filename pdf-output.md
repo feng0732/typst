@@ -2,7 +2,9 @@
 
 ## 概述
 
-Typst 的 PDF 输出功能由 `typst-pdf` crate 实现，位于 `crates/typst-pdf/` 目录。该模块负责将排版后的 `PagedDocument` 转换为符合 PDF 规范的字节流。核心依赖是 **krilla** 库（v0.8.2），一个专门用于 PDF 生成的高级 Rust 库，构建在 `pdf-writer` 底层库之上。
+Typst 的 PDF 输出功能由 `typst-pdf` crate 实现，位于 `crates/typst-pdf/` 目录。该模块负责将排版后的 `PagedDocument` 转换为符合 PDF 规范的字节流。核心依赖是 **krilla 0.8.2** 库，一个专门用于 PDF 生成的高级 Rust 库，构建在 `pdf-writer` 底层库之上。
+
+krilla 源码已下载到 `krilla-src/krilla-0.8.2/` 目录供参考。
 
 ## 核心架构
 
@@ -10,11 +12,12 @@ Typst 的 PDF 输出功能由 `typst-pdf` crate 实现，位于 `crates/typst-pd
 
 ```
 typst-pdf
-├── krilla          # PDF 生成核心库（高级抽象）
-├── krilla-svg      # SVG 渲染支持
-├── pdf-writer      # 底层 PDF 语法生成（krilla 的依赖）
-├── typst-layout    # 排版后文档结构
-├── typst-library   # 类型定义和工具函数
+├── krilla 0.8.2      # PDF 生成核心库（高级抽象）
+│   └── pdf-writer    # 底层 PDF 语法生成（krilla 的依赖）
+├── krilla-svg        # SVG 渲染支持
+├── subsetter         # 字体子集化（krilla 的依赖）
+├── typst-layout      # 排版后文档结构
+├── typst-library     # 类型定义和工具函数
 └── ...
 ```
 
@@ -58,12 +61,6 @@ pub(crate) struct GlobalContext<'a> {
 }
 ```
 
-**设计要点：**
-- 双向字体映射避免重复转换，提高性能
-- 图像跨度映射用于错误报告（通过 `fonts_backward` 反向查找字体）
-- `PageIndexConverter` 处理部分页面导出的索引映射
-- `Tags` 结构管理 PDF 标签树（用于可访问性）
-
 ### 1.2 帧上下文 (FrameContext)
 
 在 [convert.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs#L220-L275) 中定义，用于单个 Frame 的转换：
@@ -88,604 +85,1090 @@ pub(crate) struct State {
 }
 ```
 
-**状态栈操作：**
-- `push()` / `pop()` 管理状态栈
-- `pre_concat()` 叠加变换
-- `register_container()` 标记硬帧边界（用于渐变/图案定位）
-
 ### 1.4 Krilla 对象模型
 
-Typst 不直接操作 PDF 语法，而是通过 krilla 提供的高级抽象。krilla 的对象可以分为两类：
-
-| 类别 | Typst 类型 | Krilla 类型 | 是否为间接对象 |
-|-----|-----------|------------|--------------|
-| 文档级 | `PagedDocument` | `Document` | —（容器） |
-| 页面 | 每个 `Page` | `Page` + `Surface` | 是 |
-| 字体 | `FontInstance` | `Font` | 是 |
-| 图像 | `Image` | `Image` | 是 |
-| 颜色空间 | `ColorSpace` | `SeparationSpace` 等 | 是 |
-| 填充/描边 | `Paint` | `Fill` / `Stroke` | 内联或引用 |
-| 渐变 | `Gradient` | `LinearGradient` 等 | 是 |
-| 图案 | `Tiling` | `Pattern` | 是 |
-| 注解 | 链接等 | `Annotation` | 是 |
-| 目的地 | 锚点 | `XyzDestination` 等 | 是 |
-| 标签树 | 语义结构 | `TagTree` | 是 |
+Typst 不直接操作 PDF 语法，而是通过 krilla 提供的高级抽象。
 
 ---
 
-## 二、页面资源 (Page Resources) 组织机制
+## 二、页面资源 (Page Resources) 字典 —— 基于源码的分析
 
-### 2.1 什么是页面资源
+### 2.1 资源字典结构定义
 
-在 PDF 规范中，每个页面都有一个 `Resources` 字典，包含该页面内容流中引用的所有外部资源。krilla 的 `Surface` 自动管理这些资源。
-
-### 2.2 Surface 的资源收集机制
-
-`Surface` 是 krilla 的核心绘制抽象，在 [surface](https://docs.rs/krilla/0.8.2/krilla/surface/index.html) 模块中定义。它既是内容流的构建器，也是资源的收集器。
-
-**资源类型：**
-
-| 资源类型 | 字典键 | Krilla API | 触发时机 |
-|---------|-------|-----------|---------|
-| 字体 | `/Font` | `draw_glyphs()` / `draw_text()` | 首次使用字体时 |
-| 颜色空间 | `/ColorSpace` | 设置填充/描边颜色时 | 使用特殊颜色空间时 |
-| 图案 | `/Pattern` | `draw_path()` 使用图案填充时 | 图案首次被引用时 |
-| 渐变 | `/Shading` | `draw_path()` 使用渐变填充时 | 渐变首次被引用时 |
-| 外部对象 | `/XObject` | `draw_image()` / `draw_svg()` | 图像/表单首次绘制时 |
-| 图形状态参数 | `/ExtGState` | 设置透明度/混合模式时 | 状态首次设置时 |
-
-### 2.3 资源收集流程
-
-从 Typst 代码使用模式可推断 krilla 的资源收集流程：
-
-```
-surface.draw_glyphs(..., font, ...)
-    ↓
-1. 检查字体是否已在当前页面资源中注册
-   ├─ 是 → 使用已有的资源名称（如 /F1）
-   └─ 否 → 分配新的资源名称，并将字体对象添加到文档的间接对象池中
-    ↓
-2. 在内容流中输出 Tf 操作符（设置字体）
-    ↓
-3. 输出文本显示操作符（Tj / TJ）
-```
-
-**证据：** 从 `convert_font()` 函数 [text.rs#L62-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/text.rs#L62-L76) 中可以看到，Typst 层只做了 `FontInstance` → `krilla::text::Font` 的转换缓存，而资源名称分配和页面资源字典的构建完全由 krilla 内部处理。
-
-### 2.4 流构建器 (Stream Builder) 模式
-
-在图案填充的实现中可以看到 `stream_builder()` 模式 [paint.rs#L175-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/paint.rs#L175-L189)：
+在 krilla [resource.rs#L13-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L13-L19) 中定义了 `Resource` trait，所有资源类型必须实现：
 
 ```rust
-let mut stream_builder = surface.stream_builder();
-let mut surface = stream_builder.surface();
-// ... 在 surface 上绘制图案内容 ...
-surface.finish();
-let stream = stream_builder.finish();
-let pattern = Pattern { stream, ... };
+pub(crate) trait Resource {
+    fn new(ref_: Ref) -> Self;
+    fn get_ref(&self) -> Ref;
+    fn get_dict<'a>(resources: &'a mut writers::Resources) -> Dict<'a>;
+    fn get_prefix() -> &'static str;
+    fn get_mapper(b: &mut ResourceDictionaryBuilder) -> &mut ResourceMapper<Self>;
+}
 ```
 
-这种模式表明：
-- `Surface` 可以嵌套使用
-- 每个 `Surface` 都有自己的内容流和资源集合
-- `stream_builder()` 创建一个独立的内容流（用于 Pattern 表单 XObject）
-- 嵌套的 Surface 有独立的资源字典
+### 2.2 资源类型与命名规则
 
----
+在 krilla [resource.rs#L25-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L25-L173) 中定义了六种资源类型及其命名前缀：
 
-## 三、间接对象管理与引用机制
+| 资源类型 | 前缀 | PDF 字典键 | 实现位置 |
+|---------|------|-----------|---------|
+| `Font` | `"f"` | `/Font` | [resource.rs#L150-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L150-L173) |
+| `XObject` | `"x"` | `/XObject` | [resource.rs#L100-L123](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L100-L123) |
+| `Pattern` | `"p"` | `/Pattern` | [resource.rs#L125-L148](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L125-L148) |
+| `Shading` | `"s"` | `/Shading` | [resource.rs#L75-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L75-L98) |
+| `ColorSpace` | `"c"` | `/ColorSpace` | [resource.rs#L50-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L50-L73) |
+| `ExtGState` | `"g"` | `/ExtGState` | [resource.rs#L25-L48](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L25-L48) |
 
-### 3.1 间接对象概念
+资源名称格式：`{prefix}{number}`，例如 `/F0`, `/F1`, `/Im0`, `/Im1`。
 
-PDF 中的间接对象（Indirect Object）是可以被其他对象通过编号引用的对象。每个间接对象有唯一的对象编号（object number）和生成号（generation number）。
+### 2.3 资源映射器 (ResourceMapper)
 
-### 3.2 Krilla 的间接对象池
-
-krilla 的 `Document` 内部维护一个间接对象池。从错误类型 [convert.rs#L571-L575](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs#L571-L575) 可以推断：
-
-```rust
-ValidationError::TooManyIndirectObjects => error!(
-    "the PDF has too many indirect objects";
-    hint: "reduce the size of your document";
-),
-```
-
-**间接对象的来源（按类型）：**
-
-| 对象类型 | 数量估算 | 何时创建 |
-|---------|---------|---------|
-| 页面对象 | O(n) 页 | `document.start_page_with()` |
-| 页面对内容流 | O(n) 页 | `surface.finish()` |
-| 字体对象 | O(m) 字体 | 字体首次被使用时 |
-| 字体描述符 | O(m) 字体 | 字体嵌入时 |
-| 字体文件流 | O(m) 字体 | 字体子集化后 |
-| ToUnicode CMap | O(m) 字体 | 字体嵌入时 |
-| 图像对象 | O(k) 图像 | `Image` 首次绘制时 |
-| 渐变/图案 | O(p) 填充 | 首次使用时 |
-| 注解对象 | O(q) 链接 | 页面添加注解时 |
-| 大纲条目 | O(r) 标题 | `document.set_outline()` |
-| 标签树节点 | O(s) 标签 | `document.set_tag_tree()` |
-
-### 3.3 对象引用机制
-
-krilla 使用强类型的 `Id<T>` 或直接的对象引用（如 `Font`、`Image`）来管理间接对象引用。从代码中可以观察到：
-
-1. **值语义引用**：`krilla::text::Font`、`krilla::image::Image` 等类型实现了 `Clone`，可以像值一样传递
-2. **内部共享**：这些类型内部可能使用 `Arc` 或类似机制共享底层数据
-3. **去重机制**：相同的字体/图像对象在序列化时会被合并为同一个间接对象
-
-**Typst 层的缓存设计印证了这一点：**
-- `fonts_forward` / `fonts_backward` 双向映射确保同一字体只创建一个 krilla `Font` 对象
-- `image_to_spans` 表明相同图像可以复用同一个 krilla `Image` 对象
-
-### 3.4 序列化阶段的对象编号分配
-
-在 `document.finish()` 阶段，krilla 执行以下操作：
-
-1. **对象收集**：遍历所有页面、资源、辅助对象，收集所有需要序列化的间接对象
-2. **编号分配**：按顺序分配对象编号（通常从 1 开始）
-3. **交叉引用表构建**：记录每个对象在文件中的字节偏移
-4. **引用解析**：将所有对象引用替换为实际的对象编号
-
----
-
-## 四、字体嵌入流程
-
-### 4.1 字体转换管道
-
-在 [text.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/text.rs#L62-L104) 中实现：
+在 krilla [resource.rs#L337-L381](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L337-L381) 中实现了双向映射机制：
 
 ```rust
-fn convert_font(
-    gc: &mut GlobalContext,
-    typst_font: FontInstance,
-) -> SourceResult<krilla::text::Font> {
-    if let Some(font) = gc.fonts_forward.get(&typst_font) {
-        return Ok(font.clone());  // 缓存命中
-    }
-    let font = build_font(typst_font.clone())?;
-    // 更新双向缓存
-    gc.fonts_forward.insert(typst_font.clone(), font.clone());
-    gc.fonts_backward.insert(font.clone(), typst_font.clone());
-    Ok(font)
+pub(crate) struct ResourceMapper<T: ?Sized> {
+    forward: Vec<Ref>,           // 资源编号 → 对象引用
+    backward: HashMap<Ref, ResourceNumber>,  // 对象引用 → 资源编号
+    phantom: PhantomData<T>,
 }
 
-#[comemo::memoize]
-fn build_font(typst_font: FontInstance) -> SourceResult<krilla::text::Font> {
-    let font_data: Arc<dyn AsRef<[u8]> + Send + Sync> =
-        Arc::new(typst_font.data().clone());
-    let variations = typst_font.variations().0.iter()
-        .map(|(tag, value)| (krilla::text::Tag::new(&tag.to_bytes()), value.0))
+impl<T> ResourceMapper<T> where T: Resource {
+    pub(crate) fn remap(&mut self, ref_: Ref) -> ResourceNumber {
+        let forward = &mut self.forward;
+        let backward = &mut self.backward;
+
+        *backward.entry(ref_).or_insert_with(|| {
+            let old = forward.len();
+            forward.push(ref_);
+            old as ResourceNumber
+        })
+    }
+
+    pub(crate) fn remap_with_name(&mut self, ref_: Ref) -> String {
+        Self::name_from_number(self.remap(ref_))
+    }
+}
+```
+
+**关键机制：**
+- 使用 `HashMap` 实现引用去重，同一对象不会被注册两次
+- 资源编号按注册顺序分配，从 0 开始递增
+- 资源名称由前缀 + 编号组成
+
+### 2.4 资源字典构建器 (ResourceDictionaryBuilder)
+
+在 krilla [resource.rs#L175-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L175-L214) 中：
+
+```rust
+pub(crate) struct ResourceDictionaryBuilder {
+    pub(crate) color_spaces: ResourceMapper<ColorSpace>,
+    pub(crate) ext_g_states: ResourceMapper<ExtGState>,
+    pub(crate) patterns: ResourceMapper<Pattern>,
+    pub(crate) x_objects: ResourceMapper<XObject>,
+    pub(crate) shadings: ResourceMapper<Shading>,
+    pub(crate) fonts: ResourceMapper<Font>,
+}
+
+impl ResourceDictionaryBuilder {
+    pub(crate) fn register_resource<T>(&mut self, obj: T) -> String
+    where
+        T: Resource,
+    {
+        T::get_mapper(self).remap_with_name(obj.get_ref())
+    }
+
+    pub(crate) fn finish(self) -> ResourceDictionary {
+        ResourceDictionary {
+            color_spaces: self.color_spaces.into_resource_list(),
+            ext_g_states: self.ext_g_states.into_resource_list(),
+            patterns: self.patterns.into_resource_list(),
+            x_objects: self.x_objects.into_resource_list(),
+            shadings: self.shadings.into_resource_list(),
+            fonts: self.fonts.into_resource_list(),
+        }
+    }
+}
+```
+
+### 2.5 资源字典序列化
+
+在 krilla [resource.rs#L241-L287](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L241-L287) 中，`to_pdf_resources()` 方法将资源字典写入 PDF：
+
+```rust
+pub fn to_pdf_resources<T>(
+    &self,
+    parent: &mut T,
+    sc: &mut SerializeContext,
+    resources_chunk: &mut Chunk,
+) where
+    T: ResourcesExt,
+{
+    // 检查是否需要写入 ProcSet（PDF 1.4 需要，高版本已弃用）
+    let write_proc_sets = !sc.serialize_settings().pdf_version().deprecates_proc_sets();
+    
+    if !write_proc_sets && !has_resource_entries {
+        parent.resources().finish();  // 空资源字典作为直接对象
+        return;
+    }
+
+    // 创建间接对象存储资源字典
+    let resources_ref = sc.new_ref();
+    let mut resources = resources_chunk
+        .indirect(resources_ref)
+        .start::<writers::Resources>();
+    
+    if write_proc_sets {
+        resources.proc_sets([
+            ProcSet::Pdf, ProcSet::Text,
+            ProcSet::ImageColor, ProcSet::ImageGrayscale,
+        ]);
+    }
+    
+    // 写入各类资源
+    write_resource_type::<ColorSpace>(&mut resources, &self.color_spaces);
+    write_resource_type::<ExtGState>(&mut resources, &self.ext_g_states);
+    write_resource_type::<Pattern>(&mut resources, &self.patterns);
+    write_resource_type::<XObject>(&mut resources, &self.x_objects);
+    write_resource_type::<Shading>(&mut resources, &self.shadings);
+    write_resource_type::<Font>(&mut resources, &self.fonts);
+    
+    parent.set_resources(resources_ref);
+}
+```
+
+**关键点：**
+- 资源字典作为**间接对象**存储，除非为空
+- `/ProcSet` 数组在 PDF 1.5+ 已弃用，但 PDF/A-1 等标准仍要求
+- 资源名称按注册顺序编号，如 `/F0`, `/F1`, `/X0`, `/X1`
+
+### 2.6 资源注册时机
+
+资源注册发生在内容流构建过程中，例如在 krilla [content.rs#L542-L544](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/content.rs#L542-L544) 中：
+
+```rust
+let font_name = self
+    .rd_builder
+    .register_resource(sc.register_font_identifier(font_identifier));
+self.content.set_font(font_name.to_pdf_name(), size);
+```
+
+**注册流程：**
+1. `sc.register_font_identifier()`：分配或获取字体的间接对象引用 (Ref)
+2. `rd_builder.register_resource()`：将 Ref 映射到资源名称（如 `/F0`）
+3. `content.set_font()`：在内容流中输出 `BT /F0 12 Tf ET` 操作符
+
+---
+
+## 三、间接对象编号分配 —— 基于源码的分析
+
+### 3.1 引用计数器初始化
+
+在 krilla [serialize.rs#L279-L310](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L279-L310) 中，`SerializeContext::new()` 初始化引用计数器：
+
+```rust
+impl SerializeContext {
+    pub(crate) fn new(mut serialize_settings: SerializeSettings) -> Self {
+        // ... 覆盖配置 ...
+        
+        let mut cur_ref = Ref::new(1);           // 初始编号 1
+        let page_tree_ref = cur_ref.bump();     // 2: Pages 字典
+        let pdf2_ns = Pdf2Namespaces {
+            ssn_ref: cur_ref.bump(),            // 3: PDF 2.0 命名空间
+            krilla_ref: cur_ref.bump(),         // 4: Krilla 命名空间
+        };
+        
+        Self {
+            cur_ref,                            // 当前编号 5
+            // ...
+        }
+    }
+}
+```
+
+**预分配的对象编号：**
+- `1`: 预留（未使用，实际从 2 开始）
+- `2`: `/Pages` 页面对象树的根
+- `3`: PDF 2.0 结构树命名空间
+- `4`: Krilla 扩展命名空间
+- `5+`: 动态分配
+
+### 3.2 动态编号分配
+
+在 krilla [serialize.rs#L368-L370](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L368-L370) 中定义了核心分配方法：
+
+```rust
+pub(crate) fn new_ref(&mut self) -> Ref {
+    self.cur_ref.bump()
+}
+```
+
+`Ref::bump()` 简单递增内部计数器：`Ref { id: self.id + 1, gen: 0 }`。
+
+### 3.3 编号分配时机
+
+**对象首次创建时分配编号：**
+
+| 操作 | 代码位置 | 说明 |
+|-----|---------|------|
+| 注册字体 | [serialize.rs#L640-L649](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L640-L649) | `register_font_identifier()` |
+| 注册颜色空间 | [serialize.rs#L651-L681](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L651-L681) | `register_colorspace()` |
+| 注册图像 | [serialize.rs#L614-L622](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L614-L622) | `register_image()` |
+| 注册页面 | [serialize.rs#L561-L571](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L561-L571) | `register_page()` |
+| 序列化字体 | [text/cid.rs#L196-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L196-L199) | 字体对象、描述符、CMap、CIDSet、字体数据 |
+| 资源字典 | [resource.rs#L267](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs#L267) | `to_pdf_resources()` 中 |
+
+**字体序列化时的编号分配示例** [text/cid.rs#L196-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L196-L199)：
+```rust
+let cid_ref = sc.new_ref();        // CIDFont 对象
+let descriptor_ref = sc.new_ref(); // FontDescriptor 对象
+let cmap_ref = sc.new_ref();       // ToUnicode CMap 对象
+let cid_set_ref = sc.new_ref();    // CIDSet 对象
+let data_ref = sc.new_ref();       // FontFile 流对象
+```
+
+### 3.4 二次编号重映射
+
+在最终序列化阶段，krilla 会进行二次编号重排。在 krilla [chunk_container.rs#L100-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/chunk_container.rs#L100-L120) 中：
+
+```rust
+pub(crate) fn finish(self, sc: &mut SerializeContext) -> KrillaResult<Pdf> {
+    let mut remapped_ref = Ref::new(1);
+    let mut remapper = HashMap::new();
+
+    // 第一遍：收集所有对象，重新分配连续编号
+    self.visit(sc, &mut |chunk| {
+        for object_ref in chunk.refs() {
+            let existing = remapper.insert(object_ref, remapped_ref.bump());
+            debug_assert!(existing.is_none());
+        }
+        chunks_byte_len += chunk.len();
+    })?;
+
+    // 第二遍：使用新编号重写所有引用
+    self.visit(sc, &mut |chunk| {
+        chunk.renumber_into(&mut pdf, |old| remapper[&old]);
+    })?;
+    
+    // ...
+}
+```
+
+**重映射目的：**
+- 确保 PDF 中的对象编号是**单调递增**的
+- 提高文件结构的清晰度和可读性
+- 为后续实现对象流（Object Streams）等优化做准备
+- 避免跨 chunk 的引用混乱
+
+### 3.5 对象数量限制
+
+在 krilla [serialize.rs#L944-L947](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L944-L947) 中定义了对象数量限制：
+
+```rust
+fn check_validator_limits(&mut self) {
+    if self.cur_ref > Ref::new(8388607) {
+        self.register_validation_error(ValidationError::TooManyIndirectObjects)
+    }
+}
+```
+
+最大间接对象数：8,388,607（约 830 万），远超过 PDF 1.4 的 8,191 限制。
+
+---
+
+## 四、XRef 表生成 —— 基于源码的分析
+
+### 4.1 PDF 写入流程
+
+XRef 表的生成由底层的 `pdf-writer` 库自动处理。整体流程在 krilla [chunk_container.rs#L100-L348](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/chunk_container.rs#L100-L348) 的 `finish()` 方法中：
+
+```rust
+pub(crate) fn finish(self, sc: &mut SerializeContext) -> KrillaResult<Pdf> {
+    // 阶段 1: 二次编号重映射（见上节）
+    let mut remapper = HashMap::new();
+    self.visit(sc, &mut |chunk| {
+        for object_ref in chunk.refs() {
+            remapper.insert(object_ref, remapped_ref.bump());
+        }
+    })?;
+
+    // 阶段 2: 创建 PDF 写入器
+    let mut pdf = sc.new_pdf_with_capacity(capacity);
+    sc.serialize_settings().pdf_version().set_version(&mut pdf);
+
+    // 阶段 3: 写入所有 chunk 对象（重编号后）
+    self.visit(sc, &mut |chunk| {
+        chunk.renumber_into(&mut pdf, |old| remapper[&old]);
+    })?;
+
+    // 阶段 4: 写入文档目录 (Catalog)
+    let catalog_ref = remapped_ref.bump();
+    let mut catalog = pdf.catalog(catalog_ref);
+    catalog.pages(remapper[&page_tree_ref]);
+    // ... 其他目录条目 ...
+    catalog.finish();
+
+    // 阶段 5: 返回 Pdf 对象（包含 xref）
+    Ok(pdf)
+}
+```
+
+### 4.2 pdf-writer 中的 XRef 生成
+
+`pdf_writer::Pdf` 在调用 `finish()` 或转换为字节时自动生成 xref 表。从 krilla 的使用可以推断：
+
+**`Chunk::renumber_into()`** 方法将对象写入 `Pdf` 时：
+1. 记录每个对象的字节偏移量
+2. 存储对象数据
+3. 维护内部的对象偏移表
+
+**`Pdf` 内部结构（推断自使用模式）：**
+- 字节缓冲区：存储实际的 PDF 语法
+- 对象偏移表：`HashMap<Ref, usize>` 记录每个对象的起始偏移
+- 配置信息：PDF 版本、是否压缩等
+
+### 4.3 XRef 表类型
+
+根据 krilla [serialize.rs#L54-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L54-L98) 中的 `SerializeSettings` 配置，xref 表可能有两种形式：
+
+| 配置 | XRef 类型 | PDF 版本 |
+|-----|----------|---------|
+| `pdf_version < 1.5` | 传统 xref 表（文本格式） | 1.4 |
+| `pdf_version >= 1.5` | 压缩 xref 流（可能） | 1.5+ |
+
+---
+
+## 五、字体子集化 —— 基于源码的分析
+
+### 5.1 字形收集阶段
+
+字形收集在内容流构建时进行，而非在 `finish()` 阶段。
+
+**FontContainer 结构** [text/mod.rs#L54-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/mod.rs#L54-L72)：
+
+```rust
+pub(crate) struct FontContainer {
+    font: Font,
+    type3_mapper: Type3FontMapper,
+    cid_font: CIDFont,           // ← 核心：包含 GlyphRemapper
+    cid_cache: FxHashMap<u32, (FontIdentifier, PDFGlyph)>,
+    type3_cache: HashMap<ColoredGlyph, (FontIdentifier, PDFGlyph)>,
+}
+
+impl FontContainer {
+    #[inline]
+    pub(crate) fn add_glyph(&mut self, glyph: ColoredGlyph) -> (FontIdentifier, PDFGlyph) {
+        if let Some(e) = self.cid_cache.get(&glyph.glyph_id.to_u32()) {
+            return e.clone();  // 缓存命中
+        } else if should_outline(&self.font, glyph.glyph_id) {
+            let cid = self.cid_font.add_glyph(glyph.glyph_id);  // ← 字形注册
+            let res = (self.cid_font.identifier(), PDFGlyph::Cid(cid));
+            self.cid_cache.insert(glyph.glyph_id.to_u32(), res.clone());
+            res
+        } else {
+            // Type3 字体路径（颜色字体等）
+        }
+    }
+}
+```
+
+**CIDFont::add_glyph()** [text/cid.rs#L154-L170](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L154-L170)：
+
+```rust
+/// Add a new glyph (if it has not already been added) and return its CID.
+#[inline]
+pub(crate) fn add_glyph(&mut self, glyph_id: GlyphId) -> Cid {
+    self.is_empty = false;
+
+    let new_id = self
+        .glyph_remapper
+        .remap(u16::try_from(glyph_id.to_u32()).unwrap());
+
+    // If it's a new glyph, add its width
+    if new_id as usize >= self.widths.len() {
+        self.widths.push(self.font.advance_width(glyph_id).unwrap_or(0.0));
+    }
+
+    new_id
+}
+```
+
+**关键点：**
+- 使用 `subsetter::GlyphRemapper` 维护原字形 ID → 子集 CID 的映射
+- `.notdef` 字形（GID 0）始终被包含 [text/cid.rs#L122-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L122-L124)
+- 同时收集字形宽度数组
+
+### 5.2 字形绘制时的收集触发
+
+在 krilla [content.rs#L530-L580](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/content.rs#L530-L580) 的 `encode_consecutive_glyph_run()` 中：
+
+```rust
+fn encode_consecutive_glyph_run(
+    &mut self,
+    sc: &mut SerializeContext,
+    cur_x: &mut f32,
+    cur_y: f32,
+    font_identifier: FontIdentifier,
+    pdf_font: &dyn PdfFont,
+    size: f32,
+    context_color: rgb::Color,
+    glyphs: &[impl Glyph],
+    text: &str,
+) {
+    // 1. 注册字体资源
+    let font_name = self.rd_builder.register_resource(
+        sc.register_font_identifier(font_identifier)
+    );
+    self.content.set_font(font_name.to_pdf_name(), size);
+    
+    // 2. 检查 .notdef 字形使用
+    for glyph in glyphs {
+        if glyph.glyph_id() == GlyphId::new(0) {
+            sc.register_validation_error(ValidationError::ContainsNotDefGlyph(...));
+        }
+    }
+    
+    // 3. 编码字形到内容流
+    if let [glyph] = glyphs {
+        self.encode_single_glyph(cur_x, pdf_font, size, context_color, glyph);
+    } else {
+        self.encode_glyphs_with_individual_positioning(...);
+    }
+}
+```
+
+### 5.3 字体子集化执行
+
+在 krilla [text/cid.rs#L237-L239](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L237-L239) 的 `serialize()` 方法中：
+
+```rust
+let (subsetted, global_bbox) = subset_font(self.font.clone(), glyph_remapper)?;
+let num_glyphs = subsetted.num_glyphs();
+let subsetted_data = subsetted.font_data().0;
+```
+
+**subset_font() 函数** [text/cid.rs#L436-L458](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L436-L458)：
+
+```rust
+#[cfg_attr(feature = "comemo", comemo::memoize)]
+fn subset_font(font: Font, glyph_remapper: &GlyphRemapper) -> KrillaResult<(Font, Rect)> {
+    let variation_coordinates = font.variation_coordinates()
+        .iter()
+        .map(|v| (subsetter::Tag::new(v.0.get()), v.1.get()))
         .collect::<Vec<_>>();
     
-    krilla::text::Font::new_variable(font_data.into(), typst_font.index(), &variations)
+    let font = subsetter::subset_with_variations(
+        font.font_data().as_ref(),
+        font.index(),
+        &variation_coordinates,
+        glyph_remapper,
+    )
+    .map_err(|e| KrillaError::Font(font.clone(), format!("failed to subset font: {e}")))
+    .and_then(|data| {
+        Font::new(Arc::new(data).into(), 0)
+            .ok_or(KrillaError::Font(font.clone(), "failed to subset font".to_string()))
+    })?;
+    
+    let global_bbox = font.bbox();
+    Ok((font, global_bbox))
 }
 ```
 
-### 4.2 两级缓存策略
+**subsetter 库功能（来自导入）：**
+- `subsetter::GlyphRemapper`：跟踪使用的字形
+- `subsetter::subset_with_variations()`：执行实际的子集化
+- 支持可变字体变化轴应用
 
-**第一级：单次导出内缓存（GlobalContext）**
-- `fonts_forward: FxHashMap<FontInstance, Font>`：Typst 字体 → Krilla 字体
-- `fonts_backward: FxHashMap<Font, FontInstance>`：Krilla 字体 → Typst 字体（用于错误报告反向查找）
+### 5.4 子集化后的数据处理
 
-**第二级：跨导出缓存（comemo memoization）**
-- `#[comemo::memoize]` 标记 `build_font` 函数
-- 基于输入参数的哈希值缓存结果
-- 同一字体在多次导出间复用 krilla `Font` 对象
-
-### 4.3 可变字体支持
-
-- 收集所有 OpenType 变化轴（weight, width, italic, optical size 等）
-- 通过 `Font::new_variable()` 将变化轴值传递给 krilla
-- krilla 在字体描述符中设置相应的变化值
-- krilla 在字体子集化时应用变化轴实例化（或保留变化轴信息）
-
-### 4.4 字形适配层
-
-在 [text.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/text.rs#L106-L148) 中通过 `PdfGlyph` 透明包装 Typst 的 `Glyph`：
+在 krilla [text/cid.rs#L241-L254](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L241-L254) 中：
 
 ```rust
-#[derive(Debug, TransparentWrapper)]
-#[repr(transparent)]
-struct PdfGlyph(Glyph);
+let font_stream = {
+    let mut data = subsetted_data.as_ref().as_ref();
 
-impl krilla::text::Glyph for PdfGlyph {
-    fn glyph_id(&self) -> GlyphId { GlyphId::new(self.0.id as u32) }
-    fn text_range(&self) -> Range<usize> { ... }
-    fn x_advance(&self, size: f32) -> f32 { ... }
-    fn x_offset(&self, size: f32) -> f32 { ... }
-    fn y_offset(&self, size: f32) -> f32 { ... }
-    fn y_advance(&self, size: f32) -> f32 { ... }
-    fn location(&self) -> Option<Location> { Some(self.0.span.0.into_raw()) }
+    // If we have a CFF font, only embed the standalone CFF program.
+    let subsetted_ref = skrifa::FontRef::new(data).map_err(|_| {
+        KrillaError::Font(self.font.clone(), "failed to read font subset".to_string())
+    })?;
+
+    if let Some(cff) = subsetted_ref.data_for_tag(Cff::TAG) {
+        data = cff.as_bytes();  // 提取独立的 CFF 程序
+    }
+
+    FilterStreamBuilder::new_from_binary_data(data).finish(&sc.serialize_settings())
+};
+```
+
+**字体格式特殊处理：**
+- **TTF 字体**：嵌入完整的子集化字体文件，使用 `/FontFile2`
+- **CFF 字体**：提取独立的 CFF 表嵌入，使用 `/FontFile3`
+- **CFF2 字体**：类似 CFF，但支持可变字体
+
+### 5.5 字体对象体系构建
+
+在 krilla [text/cid.rs#L263-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L263-L398) 中构建完整的字体对象体系：
+
+```
+Type0 Font (根字体对象)
+├── /BaseFont: "AAAAAA+FontName"
+├── /Encoding: /Identity-H
+├── /DescendantFonts: [ CIDFont 引用 ]
+└── /ToUnicode: CMap 流引用
+    ↓
+CIDFont 对象
+├── /Subtype: CIDFontType0 (CFF) 或 CIDFontType2 (TTF)
+├── /BaseFont: 同上
+├── /CIDSystemInfo: {Registry: "Adobe", Ordering: "Identity", Supplement: 0}
+├── /FontDescriptor: 字体描述符引用
+├── /W: 宽度数组
+└── /CIDToGIDMap: /Identity (仅 TTF)
+    ↓
+FontDescriptor 对象
+├── /FontName
+├── /Flags
+├── /FontBBox
+├── /ItalicAngle
+├── /Ascent, /Descent, /CapHeight
+├── /StemV
+├── /FontFile2 或 /FontFile3: 字体文件流引用
+└── /CIDSet: CIDSet 流引用 (PDF < 1.7)
+```
+
+**字体子集标签生成** [text/cid.rs#L413-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L413-L434)：
+
+```rust
+pub(crate) fn subset_tag<T: Hash>(data: &T) -> String {
+    const BASE: u128 = 26;
+    let mut hash = stable_hash128(data);
+    let mut letter = [b'A'; SUBSET_TAG_LEN];
+    // 6 个大写字母的子集标签，如 "AAAAAA"
+    for i in 0..SUBSET_TAG_LEN {
+        letter[i] = b'A' + (hash % BASE) as u8;
+        hash /= BASE;
+    }
+    std::str::from_utf8(&letter).unwrap().to_string()
+}
+
+fn base_font_name(font: &Font, data: impl Hash) -> String {
+    let postscript_name = font.postscript_name().unwrap_or("unknown");
+    let max_len = 127 - REST_LEN;  // REST_LEN = 7 (6 + "+" + 可能的 "-Identity-H")
+    let trimmed = &postscript_name[..postscript_name.len().min(max_len)];
+    let subset_tag = subset_tag(&data);
+    format!("{subset_tag}+{trimmed}")
 }
 ```
 
-**`Glyph` trait 的关键作用：**
-- `glyph_id()`：字体中的字形编号（用于渲染）
-- `text_range()`：对应原始文本中的字节范围（用于 ToUnicode 映射）
-- `x_advance() / y_advance()`：字形步进宽度（用于排版）
-- `x_offset() / y_offset()`：字形偏移（用于排版）
-- `location()`：源位置追踪（用于错误报告）
+**最终字体名称格式：**
+- TTF: `AAAAAA+ArialMT`
+- CFF: `AAAAAA+ArialMT-Identity-H`
 
 ---
 
-## 五、字体子集化 (Font Subsetting)
+## 六、ToUnicode CMap 生成 —— 基于源码的分析
 
-### 5.1 子集化的必要性
+### 6.1 码位映射收集
 
-完整的中文字体可能包含数万个字形，文件大小可达 10MB+。子集化只保留文档中实际使用的字形，大幅减小文件体积。
+码位映射在字形编码时收集，通过 `Glyph::text_range()` 方法获取。
 
-### 5.2 Krilla 的子集化机制
-
-根据 krilla 文档和 Typst 代码推断，krilla 的字体子集化采用**延迟（lazy）策略**：
-
-#### 阶段一：字形收集
-- 在 `surface.draw_glyphs()` 调用时，krilla 记录使用的字形 ID
-- 所有页面的所有字形引用被收集到字体的使用集合中
-- 支持颜色字体（SVG, COLR, sbix, CBDT/EBDT 表）
-
-#### 阶段二：子集化执行
-在 `document.finish()` 阶段，对每个字体执行：
-
-1. **字形收集汇总**：合并所有页面中该字体的所有使用字形
-2. **添加必需字形**：自动添加 `.notdef` 等必需字形
-3. **字体表裁剪**：
-   - 移除未使用的字形数据
-   - 调整 `glyf` / `CFF` 表
-   - 更新 `cmap` 表（字符→字形映射）
-   - 调整 `hmtx` / `vmtx` 度量表
-   - 保留必要的 OpenType 布局表（GSUB, GPOS 等）
-4. **字形 ID 重映射**：子集化后字形 ID 可能改变，需要：
-   - 更新内容流中的字形引用
-   - 更新 ToUnicode CMap 映射
-   - 更新宽度数组（`W` / `Widths`）
-5. **生成字体文件流**：将子集化后的字体序列化为 PDF 字体文件流
-
-#### 字体格式支持
-- **TTF 字体**：TrueType 轮廓（glyf 表），子集化相对简单
-- **CFF 字体**：PostScript Type 1 轮廓（CFF 表），需要特殊处理
-- **颜色字体**：保留相应的颜色表（SVG, COLR, sbix, CBDT/EBDT）
-
-### 5.3 错误类型佐证
-
-从 [convert.rs#L600-L630](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs#L600-L630) 的错误类型可以推断子集化的验证点：
+在 krilla [content.rs#L566-L569](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/content.rs#L566-L569) 的 `encode_single_glyph()` 中（推断）：
 
 ```rust
-ValidationError::ContainsNotDefGlyph(f, loc, text) => error!(
-    "the text `{}` could not be displayed with {}",
-    text.repr(), display_font(gc.fonts_backward.get(f));
-    hint: "try using a different font";
-),
+fn encode_single_glyph(
+    &mut self,
+    cur_x: &mut f32,
+    pdf_font: &dyn PdfFont,
+    size: f32,
+    context_color: rgb::Color,
+    glyph: &impl Glyph,
+) {
+    // ... 字形绘制 ...
+    
+    // 记录 Unicode 映射
+    let cid = pdf_font.get_gid(ColoredGlyph::new(glyph.glyph_id(), context_color)).unwrap();
+    let text_range = glyph.text_range();
+    let text = &text[text_range.clone()];
+    pdf_font.set_codepoints(cid, text.to_string(), glyph.location());
+    
+    self.content.show_str(glyph_id);  // Tj 操作符
+}
 ```
 
-- `.notdef` 字形检查：确保文本都能被字体显示
-- 子集化过程中验证所有引用的字形都存在
+**CIDFont 中的码位存储** [text/cid.rs#L112-L180](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L112-L180)：
+
+```rust
+pub(crate) struct CIDFont {
+    // ...
+    /// A mapping from CIDs to their string in the original text.
+    cmap_entries: FxHashMap<u16, (String, Option<Location>)>,
+    // ...
+}
+
+impl CIDFont {
+    #[inline]
+    pub(crate) fn set_codepoints(&mut self, cid: Cid, text: String, location: Option<Location>) {
+        self.cmap_entries.insert(cid, (text, location));
+    }
+}
+```
+
+### 6.2 ToUnicode CMap 写入
+
+在 krilla [text/cid.rs#L378-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L378-L398) 中：
+
+```rust
+let cmap = {
+    let mut cmap = UnicodeCmap::new(CMAP_NAME, SYSTEM_INFO);
+
+    // For the .notdef glyph, it's fine if no mapping exists, since it is included
+    // even if it was not referenced in the text.
+    for g in 1..self.glyph_remapper.num_gids() {
+        let entry = self.cmap_entries.get(&g);
+        write_cmap_entry(&self.font, entry, sc, &mut cmap, g);
+    }
+
+    cmap
+};
+
+let cmap_stream = cmap.finish();
+let cmap_stream = FilterStreamBuilder::new_from_content_stream(
+    &cmap_stream, &sc.serialize_settings()
+).finish(&sc.serialize_settings());
+
+let mut cmap = stream_chunk.cmap(cmap_ref, cmap_stream.encoded_data());
+cmap_stream.write_filters(cmap.deref_mut().deref_mut());
+cmap.writing_mode(WMode::Horizontal);
+cmap.finish();
+```
+
+**注意：** 跳过 `.notdef` 字形（g=0）的映射，因为它不对应实际文本。
+
+### 6.3 write_cmap_entry() 函数详解
+
+在 krilla [text/cid.rs#L40-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L40-L98) 中实现了完整的码位映射和验证逻辑：
+
+```rust
+pub(crate) fn write_cmap_entry<G>(
+    font: &Font,
+    entry: Option<&(String, Option<Location>)>,
+    sc: &mut SerializeContext,
+    cmap: &mut UnicodeCmap<G>,
+    g: G,
+) where
+    G: pdf_writer::types::GlyphId + Into<u32> + Copy,
+{
+    match entry {
+        None => sc.register_validation_error(ValidationError::NoCodepointMapping(
+            font.clone(), GlyphId::new(g.into()), None,
+        )),
+        Some((text, loc)) => {
+            let mut invalid_codepoint = text.is_empty();
+            let mut invalid_code = None;
+            let mut private_unicode = None;
+
+            for c in text.chars() {
+                // 检查无效码位：NUL, BOM, 反向 BOM
+                if matches!(c as u32, 0x0 | 0xFEFF | 0xFFFE) {
+                    invalid_code = Some(c);
+                    invalid_codepoint = true;
+                }
+                // 检查私有使用区域
+                if matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD) {
+                    private_unicode = Some(c);
+                }
+            }
+
+            // 报告无效码位错误
+            match invalid_code {
+                Some(c) => sc.register_validation_error(ValidationError::InvalidCodepointMapping(...)),
+                None if invalid_codepoint => sc.register_validation_error(
+                    ValidationError::NoCodepointMapping(...)),
+                _ => {}
+            }
+
+            // 报告私有使用区域警告
+            if let Some(code) = private_unicode {
+                sc.register_validation_error(ValidationError::UnicodePrivateArea(...));
+            }
+
+            // 写入实际的 CMap 映射
+            if !text.is_empty() {
+                cmap.pair_with_multiple(g, text.chars());
+            }
+        }
+    }
+}
+```
+
+**验证逻辑：**
+1. **缺少映射**：字形没有对应的 Unicode 码位
+2. **无效码位**：`\0`, `\u{FEFF}` (BOM), `\u{FFFE}` (反向 BOM)
+3. **私有使用区域**：PUA 码位可能导致文本提取问题
+4. **复杂脚本限制**：阿拉伯文等可能无法生成有效映射
+
+### 6.4 ToUnicode CMap 格式
+
+生成的 CMap 使用 `pdf-writer` 的 `UnicodeCmap` 构建器，输出标准的 CMap 格式：
+
+```
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo
+<< /Registry (Adobe)
+   /Ordering (UCS)
+   /Supplement 0
+>> def
+/CMapName /Custom def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+n beginbfchar
+<0001> <0048>    % CID 1 → 'H'
+<0002> <0065>    % CID 2 → 'e'
+<0003> <006C>    % CID 3 → 'l'
+<0004> <006C>    % CID 4 → 'l'
+<0005> <006F>    % CID 5 → 'o'
+...
+endbfchar
+n beginbfrange
+<0006> <000A> <0020>  % CID 6-10 → ' '-'E'
+...
+endbfrange
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+```
+
+**使用的 CMap 操作符：**
+- `beginbfchar` / `endbfchar`：单个字形→字符映射
+- `beginbfrange` / `endbfrange`：字形范围→字符范围映射（优化体积）
 
 ---
 
-## 六、ToUnicode CMap 处理
+## 七、从页面内容到 PDF 字节的完整链路 —— 基于源码
 
-### 6.1 什么是 ToUnicode CMap
+### 7.1 阶段 1：初始化与准备
 
-ToUnicode CMap 是 PDF 中的字符映射表，将字形 ID（Glyph ID）映射回 Unicode 码位。它是文本提取、搜索、复制粘贴的关键。
-
-### 6.2 Krilla 的 ToUnicode 生成
-
-krilla 利用 `Glyph` trait 提供的 `text_range()` 方法来构建 ToUnicode 映射：
+**SerializeContext 创建** [serialize.rs#L279-L310](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L279-L310)：
 
 ```
-文本: "Hello"
-字形: [Glyph(H), Glyph(e), Glyph(l), Glyph(l), Glyph(o)]
-       ↑         ↑        ↑        ↑        ↑
-       0..1      1..2     2..3     3..4     4..5  ← text_range
+Document::new_with(settings)
+  └─ SerializeContext::new(settings)
+      ├─ cur_ref = Ref::new(1)
+      ├─ page_tree_ref = cur_ref.bump()  // Ref(2)
+      ├─ 预分配命名空间对象 (3, 4)
+      ├─ cur_ref = Ref(5)  // 下一个可用编号
+      └─ 初始化 GlobalObjects 容器
 ```
 
-#### 映射构建步骤：
+### 7.2 阶段 2：页面内容绘制（字形收集）
 
-1. **字形-文本关联**：通过 `Glyph::text_range()` 获取每个字形对应的文本范围
-2. **码位提取**：从文本中提取对应范围的 Unicode 字符
-3. **映射去重**：多个字形映射到同一字符时进行合并处理
-4. **CMap 格式生成**：生成符合 PDF 规范的 ToUnicode CMap 流
-   - 使用 `beginbfchar` / `endbfchar` 单字符映射
-   - 使用 `beginbfrange` / `endbfrange` 范围映射优化体积
+**调用链：**
+```
+Surface::draw_glyphs()  [surface.rs#L275-L367]
+  └─ ContentBuilder::draw_glyphs()  [content.rs#L383-L524]
+      ├─ fill_action() / stroke_action()
+      │   └─ content_set_fill_properties()  [color/gradient/pattern 处理]
+      └─ fill_stroke_glyph_run()
+          └─ encode_consecutive_glyph_run()  [content.rs#L530-L580]
+              ├─ sc.register_font_identifier(font_identifier)  [serialize.rs#L640-L649]
+              │   └─ 检查 cached_mappings → new_ref() 或复用
+              ├─ rd_builder.register_resource(font_resource)  [resource.rs#L197-L202]
+              │   └─ fonts.remap_with_name(ref)  → "/F0"
+              ├─ content.set_font(font_name, size)
+              ├─ encode_single_glyph() / encode_glyphs_with_individual_positioning()
+              │   ├─ pdf_font.add_glyph(colored_glyph)  [text/mod.rs#L120-L139]
+              │   │   └─ cid_font.add_glyph(glyph_id)  [text/cid.rs#L154-L170]
+              │   │       └─ glyph_remapper.remap(gid)  ← 字形收集!
+              │   ├─ pdf_font.set_codepoints(cid, text, location)
+              │   │   └─ cmap_entries.insert(cid, (text, loc))  ← 码位收集!
+              │   └─ content.show_str(glyph_id)
+              └─ *cur_x += glyph.x_advance
+```
 
-### 6.3 复杂脚本的挑战
+**字形收集数据结构：**
+```
+GlyphRemapper (subsetter 库)
+  ├─ forward: Vec<u16>          // 新 GID → 原 GID
+  └─ backward: HashMap<u16, u16> // 原 GID → 新 GID
 
-从错误信息 [convert.rs#L607-L619](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs#L607-L619) 可以看到：
+CIDFont
+  ├─ glyph_remapper: GlyphRemapper
+  ├─ cmap_entries: FxHashMap<u16, (String, Option<Location>)>
+  └─ widths: Vec<f32>
+```
+
+### 7.3 阶段 3：页面完成与资源冻结
+
+**Page 完成时：**
+```
+surface.finish()
+  └─ ResourceDictionaryBuilder::finish()  [resource.rs#L204-L213]
+      ├─ 所有 ResourceMapper 转为 ResourceList
+      └─ 生成 ResourceDictionary
+          ├─ fonts: ResourceList<Font>
+          ├─ x_objects: ResourceList<XObject>
+          └─ ...
+```
+
+### 7.4 阶段 4：document.finish() —— 最终序列化
+
+在 krilla [serialize.rs#L449-L498](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L449-L498) 中：
+
+```
+SerializeContext::finish(chunk_container)
+  │
+  ├─ serialize_destination_profiles()      // ICC 输出配置
+  ├─ serialize_page_label_tree()           // 页码标签
+  ├─ serialize_outline()                   // 文档大纲
+  ├─ serialize_fonts()  ← 关键点！
+  │   └─ 对每个字体调用 FontContainer.serialize()
+  │       └─ CIDFont::serialize()  [text/cid.rs#L187-L398]
+  │           ├─ 分配 5 个新 Ref: cid, descriptor, cmap, cidset, data
+  │           ├─ subset_font(font, glyph_remapper)  ← 字体子集化!
+  │           │   └─ subsetter::subset_with_variations()
+  │           ├─ 写入 Type0 Font
+  │           │   └─ .to_unicode(cmap_ref)  ← ToUnicode 引用
+  │           ├─ 写入 CIDFont
+  │           ├─ 写入 FontDescriptor
+  │           │   └─ .font_file2/3(data_ref)
+  │           ├─ 构建 ToUnicode CMap  [text/cid.rs#L378-L398]
+  │           │   └─ UnicodeCmap + write_cmap_entry()
+  │           └─ 写入字体文件流
+  ├─ serialize_pages()                     // 页面对象 + 注解
+  ├─ serialize_page_tree()                 // Pages 字典
+  ├─ serialize_tag_tree()                  // 标签树（无障碍）
+  │
+  └─ chunk_container.finish(sc)  [chunk_container.rs#L100-L348]
+      │
+      ├─ 第一遍：二次编号重映射
+      │   ├─ remapped_ref = Ref::new(1)
+      │   └─ visit all chunks:
+      │       └─ for object_ref in chunk.refs():
+      │           remapper.insert(object_ref, remapped_ref.bump())
+      │
+      ├─ 创建 Pdf 写入器
+      │   └─ Pdf::with_settings_and_capacity()
+      │
+      ├─ 第二遍：重写所有对象到 Pdf
+      │   └─ visit all chunks:
+      │       chunk.renumber_into(&mut pdf, |old| remapper[&old])
+      │
+      ├─ 写入文档信息 (DocumentInfo)
+      ├─ 生成文件 ID (stable_hash_base64)
+      ├─ 写入 XMP 元数据流
+      └─ 写入文档目录 (Catalog)
+          ├─ /Pages → page_tree_ref
+          ├─ /Metadata → meta_ref
+          ├─ /StructTreeRoot → tag_tree_ref
+          ├─ /Outlines → outline_ref
+          ├─ /Names → (命名目标 + 附件)
+          └─ /Lang, /ViewerPreferences 等
+      
+      └─ 返回 Pdf 对象
+          └─ pdf_writer 在内部生成 xref 表
+```
+
+### 7.5 阶段 5：PDF 字节生成
+
+当 `Pdf` 对象被转换为 `Vec<u8>` 时，`pdf-writer` 库自动：
+
+1. **写入头部**：`%PDF-1.7\n%\xe2\xe3\xcf\xd3\n`
+2. **写入所有间接对象**：按编号顺序，记录偏移量
+3. **构建 xref 表**：
+   - 每个对象的字节偏移位置
+   - 每个对象的生成号（通常为 0）
+   - 标记空闲对象
+4. **写入 trailer**：
+   - `/Size`：对象总数
+   - `/Root`：Catalog 引用
+   - `/Info`：DocumentInfo 引用
+   - `/ID`：文件 ID 数组
+5. **写入 startxref**：xref 表的起始偏移
+6. **写入 `%%EOF`**
+
+### 7.6 完整数据流图
+
+```
+Typography → PagedDocument
+     │
+     ▼
+typst-pdf convert.rs
+     │
+     ├─ GlobalContext::new()
+     │   └─ 字体缓存初始化
+     │
+     └─ 逐页处理:
+         ├─ document.start_page_with()
+         │   └─ sc.register_page() → new_ref()
+         ├─ page.surface()
+         │   └─ Surface::new()
+         │       ├─ ContentBuilder::new()
+         │       └─ ResourceDictionaryBuilder::new()
+         ├─ handle_frame() (递归)
+         │   ├─ handle_text()
+         │   │   ├─ convert_font() [text.rs#L62-L76]
+         │   │   ├─ paint::convert_fill()
+         │   │   └─ surface.draw_glyphs() [surface.rs#L275]
+         │   │       └─ 见 7.2 的字形收集流程
+         │   ├─ handle_shape()
+         │   │   └─ surface.draw_path()
+         │   └─ handle_image()
+         │       └─ surface.draw_image()
+         ├─ surface.finish()
+         │   └─ rd_builder.finish() → ResourceDictionary
+         └─ page.finish()
+     │
+     ▼
+SerializeContext::finish()  [serialize.rs#L449]
+     │
+     ├─ serialize_fonts()
+     │   └─ CIDFont::serialize()  [text/cid.rs#L187]
+     │       ├─ 字体子集化 (subsetter)
+     │       ├─ 字体描述符
+     │       ├─ ToUnicode CMap 生成
+     │       └─ 字体文件流嵌入
+     │
+     └─ chunk_container.finish()  [chunk_container.rs#L100]
+         ├─ 二次编号重映射
+         ├─ 写入所有对象到 Pdf
+         ├─ xref 表生成 (pdf-writer 内部)
+         └─ 返回 Vec<u8>
+```
+
+---
+
+## 八、性能优化与缓存机制
+
+### 8.1 对象去重缓存
+
+在 krilla [serialize.rs#L573-L587](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L573-L587) 中：
 
 ```rust
-ValidationError::NoCodepointMapping(_, _, loc) => {
-    let msg = if loc.is_some() {
-        "the text was not mapped to a code point"
+fn register_cached<T: SipHashable>(
+    &mut self,
+    item: T,
+    mut func: impl FnMut(&mut Self, T, Ref),
+) -> Ref {
+    let hash = item.sip_hash();
+    if let Some(_ref) = self.cached_mappings.get(&hash) {
+        *_ref  // 缓存命中，复用现有引用
     } else {
-        "the PDF contains text with missing codepoints"
-    };
-    error!(..., "{msg}";
-        hint: "for complex scripts like Arabic, it might not be \
-               possible to produce a compliant document";
+        let root_ref = self.new_ref();
+        func(self, item, root_ref);
+        self.cached_mappings.insert(hash, root_ref);
+        root_ref
+    }
+}
+```
+
+**支持缓存的对象类型：**
+- 字体 (`register_font_identifier`)
+- 图像 (`register_image`)
+- 颜色空间 (`register_colorspace`)
+- XYZ 目的地 (`register_xyz_destination`)
+- 其他 `Cacheable` 对象
+
+### 8.2 comemo memoization
+
+krilla 支持使用 `comemo` 库缓存纯函数结果：
+
+- `#[cfg_attr(feature = "comemo", comemo::memoize)]` 标记 `subset_font()`
+- 相同字体 + 相同 GlyphRemapper 的子集化结果会被缓存
+- 适用于多次导出相同文档的场景
+
+---
+
+## 九、PDF 标准合规性
+
+### 9.1 字体相关验证点
+
+在 krilla [configure/validate.rs] 和 [text/cid.rs#L40-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L40-L98) 中实现：
+
+| 验证项 | 错误类型 | 触发条件 |
+|-------|---------|---------|
+| 字体许可证 | `RestrictedLicense` | OS/2.fsType 字段设置为受限（2） |
+| .notdef 字形使用 | `ContainsNotDefGlyph` | 实际文本使用了 GID 0 |
+| 缺少码位映射 | `NoCodepointMapping` | 字形没有对应 Unicode |
+| 无效码位 | `InvalidCodepointMapping` | 映射包含 NUL/BOM 等 |
+| 私有使用区域 | `UnicodePrivateArea` | 使用了 PUA 码位 |
+
+### 9.2 许可证检查逻辑
+
+在 krilla [text/cid.rs#L228-L235](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L228-L235) 中：
+
+```rust
+// 检查 OS/2 表的 fsType 字段
+if self.font.font_ref().os2()
+    .is_ok_and(|os2| os2.fs_type() & 0xF == 2)
+{
+    sc.register_validation_error(
+        ValidationError::RestrictedLicense(self.font.clone())
     );
 }
 ```
 
-**复杂脚本的难点：**
-- 连字（ligature）：一个字形对应多个字符（如 "fi" 连字）
-- 上下文替换：字形根据上下文变化
-- 双向文本：显示顺序与逻辑顺序不同
-- 标记重排：变音符号的顺序调整
-
-### 6.4 ToUnicode 与 PDF 标准
-
-- **PDF/A**：要求所有文本都有 ToUnicode 映射
-- **PDF/UA**：强制要求 ToUnicode 以保证可访问性
-- **标签 PDF**：需要 ToUnicode 配合标签树进行文本提取
+**注意：** OpenType 规范要求 `fsType & 0xF == 2`（只有 bit 1 置位）才是严格受限，而非 `fsType & 2 != 0`。
 
 ---
 
-## 七、从页面内容到 PDF 字节的完整链路
+## 十、关键代码引用汇总
 
-### 7.1 整体流程总览
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  阶段 1: Typst 排版输出                                      │
-│  PagedDocument (N 个 Page, 每个 Page 有一个 Frame)          │
-└──────────────────────────┬──────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│  阶段 2: 初始化与准备                                        │
-│  - 创建 krilla Document + SerializeSettings                 │
-│  - 创建 GlobalContext（字体缓存、图像缓存、标签上下文）      │
-│  - 预构建标签树（语义结构预遍历）                            │
-│  - 收集命名目标（锚点）                                      │
-└──────────────────────────┬──────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│  阶段 3: 逐页面转换 (循环 N 次)                              │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 3.1 创建 Page + Surface (内容流构建器)                │  │
-│  │     - 页面尺寸、出血、页码标签                         │  │
-│  │     - 初始化页面资源字典 (空)                          │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         ↓                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 3.2 Frame 递归遍历 (handle_frame)                     │  │
-│  │     - 变换状态栈管理 (push/pop)                       │  │
-│  │     - 处理 Group(变换+裁剪)                           │  │
-│  │     - 处理 Text → draw_glyphs() → 记录字形使用        │  │
-│  │     - 处理 Shape → draw_path() → 记录填充/描边资源    │  │
-│  │     - 处理 Image → draw_image() → 注册图像资源        │  │
-│  │     - 处理 Link → 收集链接注解                        │  │
-│  │     - 处理 Tag → 标签树标记                           │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         ↓                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 3.3 surface.finish()                                  │  │
-│  │     - 完成内容流构建                                  │  │
-│  │     - 冻结页面资源字典                                │  │
-│  │     - 将内容流转为内容流对象                          │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         ↓                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 3.4 添加页面注解 (链接等)                              │  │
-│  └───────────────────────────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│  阶段 4: 辅助内容设置                                        │
-│  - 文档大纲 (Outline)                                       │
-│  - 元数据 (Metadata / XMP)                                  │
-│  - 文件附件 (Embedded Files)                                │
-│  - 标签树 (Tag Tree)                                        │
-│  - 命名目标 (Named Destinations)                            │
-└──────────────────────────┬──────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│  阶段 5: document.finish() - 最终序列化                     │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 5.1 字体处理                                          │  │
-│  │     - 收集所有字体的已使用字形                        │  │
-│  │     - 字体子集化 (TTF/CFF 都支持)                     │  │
-│  │     - 生成 ToUnicode CMap                             │  │
-│  │     - 构建字体描述符 (FontDescriptor)                 │  │
-│  │     - 生成字体文件流 (FontFile2 / FontFile3)          │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         ↓                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 5.2 对象收集与编号                                    │  │
-│  │     - 遍历所有页面、资源、辅助对象                    │  │
-│  │     - 分配间接对象编号 (1, 2, 3, ...)                 │  │
-│  │     - 构建对象 → 编号映射                             │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         ↓                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 5.3 内容流重写 (如果需要)                              │  │
-│  │     - 字形 ID 重映射 (子集化后字形顺序变化)           │  │
-│  │     - 资源名称替换 (字体 F1, 图像 Im1 等)             │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         ↓                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 5.4 字节序列化                                        │  │
-│  │     - 写入 PDF 头部 (%PDF-1.x)                        │  │
-│  │     - 按编号顺序写入所有间接对象                       │  │
-│  │     - 记录每个对象的偏移位置                           │  │
-│  │     - 构建交叉引用表 (xref table / xref stream)       │  │
-│  │     - 构建文档目录 (Catalog)                           │  │
-│  │     - 写入页面树 (Pages)                              │  │
-│  │     - 写入尾部 (trailer + startxref)                  │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         ↓                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 5.5 压缩与优化                                        │  │
-│  │     - 内容流压缩 (FlateDecode)                        │  │
-│  │     - 对象流 (Object Streams, PDF 1.5+)               │  │
-│  │     - 交叉引用流 (XRef Streams, PDF 1.5+)             │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         ↓                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ 5.6 标准合规性验证                                    │  │
-│  │     - PDF/A 验证 (字体嵌入、元数据等)                 │  │
-│  │     - PDF/UA 验证 (标签、语言、ToUnicode)             │  │
-│  │     - 版本限制检查 (对象数量、字符串长度等)            │  │
-│  └───────────────────────────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────────┘
-                           ↓
-                  Vec<u8> (PDF 字节流)
-```
-
-### 7.2 关键函数调用链
-
-**顶层调用链：**
-```
-typst_pdf::pdf()
-  └─ convert::convert()
-      ├─ Document::new_with()          // 创建 krilla 文档
-      ├─ collect_named_destinations()  // 收集锚点
-      ├─ tags::init()                  // 初始化标签树
-      ├─ GlobalContext::new()          // 创建全局上下文
-      ├─ convert_pages()               // 转换所有页面
-      │   └─ (循环每个页面)
-      │       ├─ document.start_page_with()
-      │       ├─ page.surface()
-      │       ├─ handle_frame()        // 递归处理 Frame
-      │       ├─ surface.finish()
-      │       └─ page.finish()
-      ├─ attach_files()                // 附加文件
-      ├─ tags::resolve()               // 解析标签树
-      ├─ document.set_outline()
-      ├─ document.set_metadata()
-      ├─ document.set_tag_tree()
-      └─ document.finish()             // 最终序列化 → Vec<u8>
-```
-
-**Frame 递归调用链：**
-```
-handle_frame()
-  ├─ fc.push()                        // 保存变换状态
-  ├─ handle_shape()                   // 背景填充
-  ├─ fc.push()
-  ├─ (遍历所有 frame items)
-  │   ├─ FrameItem::Group → handle_group()
-  │   │   ├─ fc.push() + 变换
-  │   │   ├─ clip_path
-  │   │   └─ handle_frame() (递归)
-  │   ├─ FrameItem::Text → handle_text()
-  │   │   ├─ convert_font()
-  │   │   ├─ paint::convert_fill()
-  │   │   └─ surface.draw_glyphs()
-  │   ├─ FrameItem::Shape → handle_shape()
-  │   │   ├─ convert_geometry() → Path
-  │   │   ├─ paint::convert_fill/stroke()
-  │   │   └─ surface.draw_path()
-  │   ├─ FrameItem::Image → handle_image()
-  │   │   ├─ convert_raster/svg/pdf()
-  │   │   └─ surface.draw_image/draw_svg/draw_pdf_page()
-  │   ├─ FrameItem::Link → handle_link()
-  │   └─ FrameItem::Tag → tags::handle_start/end()
-  └─ fc.pop() (多次)
-```
-
----
-
-## 八、PDF 标准合规性
-
-通过 `PdfStandards` 和 `PdfStandard` 配置，在 [lib.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/lib.rs) 中定义：
-
-**支持的标准：**
-- PDF 版本：1.4, 1.5, 1.6, 1.7, 2.0
-- PDF/A（归档）：A-1b/a, A-2b/u/a, A-3b/u/a, A-4, A-4f, A-4e
-- PDF/UA（无障碍）：UA-1
-
-**与字体/文本相关的验证点：**
-- 字体必须完全嵌入（PDF/A 要求）
-- ToUnicode CMap 必须存在（PDF/UA 要求）
-- 字体名称长度限制（127 字符）
-- 禁止使用 .notdef 字形显示实际文本
-- 字符映射有效性验证
-
----
-
-## 九、性能优化策略
-
-1. **字体缓存**：双向哈希映射 + comemo 缓存，避免重复解析字体
-2. **图像缓存**：相同图像复用 krilla Image 对象（间接对象去重）
-3. **延迟初始化**：`OnceLock` 用于图像通道提取
-4. **memoization**：`#[comemo::memoize]` 宏缓存纯函数结果
-5. **哈希映射**：使用 `rustc-hash` (FxHashMap/FxHashSet) 提高性能
-6. **字体子集化**：减小最终文件体积
-7. **内容流压缩**：Flate 压缩减少传输体积
-
----
-
-## 十、错误处理
-
-错误转换层在 [convert.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs#L536-L838) 的 `convert_error` 函数中实现，将 krilla 错误映射为 Typst 友好的诊断信息。
-
-**字体相关错误：**
-- `KrillaError::Font`：字体处理失败
-- `ValidationError::ContainsNotDefGlyph`：文本无法被字体显示
-- `ValidationError::NoCodepointMapping`：缺少 Unicode 码位映射
-- `ValidationError::InvalidCodepointMapping`：无效的码位映射
-
-**对象相关错误：**
-- `ValidationError::TooManyIndirectObjects`：间接对象过多
-- `ValidationError::TooLongArray`：数组过长（>8191 元素）
-- `ValidationError::TooLongDictionary`：字典过大（>4095 条目）
+| 功能 | krilla 源码位置 | typst-pdf 调用位置 |
+|-----|----------------|-------------------|
+| 资源字典构建 | [resource.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/resource.rs) | [paint.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/paint.rs) |
+| 引用编号分配 | [serialize.rs#L368-L370](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/serialize.rs#L368-L370) | [convert.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/convert.rs) |
+| 二次编号重映射 | [chunk_container.rs#L100-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/chunk_container.rs#L100-L120) | `document.finish()` 内部 |
+| XRef 表生成 | pdf-writer 内部 | `chunk_container.finish()` 返回 |
+| 字形收集 | [text/cid.rs#L154-L170](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L154-L170) | [text.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/crates/typst-pdf/src/text.rs) |
+| 字体子集化 | [text/cid.rs#L436-L458](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L436-L458) | `serialize_fonts()` 内部 |
+| ToUnicode 生成 | [text/cid.rs#L378-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L378-L398) | `serialize_fonts()` 内部 |
+| 码位验证 | [text/cid.rs#L40-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/133-typst/krilla-src/krilla-0.8.2/src/text/cid.rs#L40-L98) | `write_cmap_entry()` 内部 |
 
 ---
 
 ## 总结
 
-### 对象与资源组织层次
+### 字体嵌入完整流程（基于源码）
 
 ```
-PDF 文件
-├─ Catalog (文档目录)
-├─ Pages (页面树)
-│   └─ Page (每个页面)
-│       ├─ Contents (内容流)
-│       ├─ Resources (页面资源)
-│       │   ├─ Font (字体字典)
-│       │   │   └─ /F1 → 字体对象引用
-│       │   ├─ XObject (外部对象)
-│       │   │   ├─ /Im1 → 图像对象引用
-│       │   │   └─ /Form1 → 表单对象引用
-│       │   ├─ Pattern (图案)
-│       │   ├─ Shading (渐变)
-│       │   ├─ ColorSpace (颜色空间)
-│       │   └─ ExtGState (图形状态参数)
-│       └─ Annots (注解数组)
-├─ Font (字体对象) ←──┐
-│   ├─ FontDescriptor │ (间接对象)
-│   │   └─ FontFile2/3 (字体文件流)
-│   ├─ ToUnicode CMap
-│   └─ Widths (宽度数组)
-├─ Outline (文档大纲)
-├─ Metadata (元数据)
-├─ StructTreeRoot (标签树根)
-├─ EmbeddedFiles (附件)
-└─ xref (交叉引用表)
-```
-
-### 字体嵌入全流程
-
-```
-FontInstance (Typst)
-    ↓ convert_font()
-krilla::text::Font (包装原始字体数据)
-    ↓ surface.draw_glyphs()
-记录使用的字形 ID + 文本范围
-    ↓ (所有页面处理完成后)
-document.finish()
-    ↓
-┌─────────────────────────────────┐
-│ 1. 收集所有使用的字形            │
-│ 2. 添加 .notdef 等必需字形       │
-│ 3. 字体子集化 (TTF/CFF)         │
-│ 4. 生成 ToUnicode CMap          │
-│ 5. 构建字体描述符                │
-│ 6. 生成字体文件流 (压缩)         │
-│ 7. 分配对象编号                  │
-└─────────────────────────────────┘
-    ↓
-PDF 中的字体对象体系
+Typst FontInstance
+     │
+     ▼  convert_font() [text.rs#L62]
+Krilla Font (包装原始数据)
+     │
+     ▼  surface.draw_glyphs() [surface.rs#L275]
+ContentBuilder::draw_glyphs() [content.rs#L383]
+     │
+     ├─ encode_consecutive_glyph_run() [content.rs#L530]
+     │   ├─ 注册字体资源 → /F0, /F1...
+     │   ├─ FontContainer::add_glyph() [text/mod.rs#L120]
+     │   │   └─ CIDFont::add_glyph() [text/cid.rs#L154]
+     │   │       └─ glyph_remapper.remap(gid)
+     │   ├─ pdf_font.set_codepoints() → cmap_entries 收集
+     │   └─ 写入内容流操作符 (Tj/TJ)
+     │
+     ▼  serialize_fonts() [serialize.rs#L756]
+CIDFont::serialize() [text/cid.rs#L187]
+     │
+     ├─ 分配对象编号: cid, desc, cmap, cidset, data
+     ├─ subset_font() [text/cid.rs#L436]
+     │   └─ subsetter::subset_with_variations() ← 子集化!
+     ├─ 写入 Type0 Font 对象
+     │   └─ .to_unicode(cmap_ref)
+     ├─ 写入 CIDFont 对象 (宽度数组等)
+     ├─ 写入 FontDescriptor (flags, bbox, metrics)
+     ├─ 生成 ToUnicode CMap [text/cid.rs#L378]
+     │   └─ UnicodeCmap + write_cmap_entry()
+     ├─ 写入字体文件流 (FontFile2/3)
+     └─ (可选) 写入 CIDSet 流
+     │
+     ▼  chunk_container.finish() [chunk_container.rs#L100]
+二次编号重映射 → 写入所有对象 → xref 生成
+     │
+     ▼
+PDF 字节流
 ```
