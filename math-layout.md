@@ -40,31 +40,150 @@
 
 - `Normal` - 普通符号
 - `Alphabetic` - 字母（默认斜体）
-- `Binary` - 二元运算符（如 `+`, `-`）
+- `Binary` - 二元运算符（如 `+`）
 - `Relation` - 关系符（如 `=`, `<`, `>`）
 - `Opening` / `Closing` - 开闭分隔符（如 `(`, `)`）
-- `Large` - 大型运算符（如 `∑`, `∫`）
-- `Fence` - 围栏
-- `Punctuation` - 标点
-- `Vary` - 可变类（根据上下文决定是 Binary 还是 Unary）
+- `Large` - 大型运算符（如 `∑`, `∏`）
+- `Fence` - 围栏（如 `|`）
+- `Punctuation` - 标点（如 `,`）
+- `Vary` - 可变类（如 `-`，根据上下文决定是二元还是一元运算符）
+- `Diacritic` - 变音类（重音符号）
 
-间距计算在 [process.rs 的 `spacing()` 函数](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/ir/process.rs#L274-L300) 中执行，遵循 TeX 规则：
+#### 间距计算核心函数
 
-| 场景 | 间距量 |
-|------|--------|
-| 标点后 | `THIN` (1/6 em) |
-| 关系符两侧 | `THICK` (5/18 em) |
-| 二元运算符两侧 | `MEDIUM` (2/9 em) |
-| 大型运算符两侧 | `THICK` |
-| Script/ScriptScript 尺寸 | 自动禁用上述间距 |
+间距计算在 [process.rs 的 `spacing()` 函数](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/ir/process.rs#L274-L316) 中执行。该函数接收左右两个相邻 `MathItem`，使用 `match (l.rclass(), r.lclass())` 模式匹配，**首次匹配即返回**——这是理解间距规则的关键：排在前面的规则优先级更高，后面的规则在前面已匹配时不会生效。
 
-间距常量定义在 [typst-library/src/math/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/mod.rs#L36-L40)：
+间距量常量定义在 [typst-library/src/math/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/mod.rs#L36-L40)：
 
 ```rust
-pub const THIN: Em = Em::new(1.0 / 6.0);
-pub const MEDIUM: Em = Em::new(2.0 / 9.0);
-pub const THICK: Em = Em::new(5.0 / 18.0);
+pub const THIN: Em = Em::new(1.0 / 6.0);    // ≈0.167em
+pub const MEDIUM: Em = Em::new(2.0 / 9.0);   // ≈0.222em
+pub const THICK: Em = Em::new(5.0 / 18.0);   // ≈0.278em
 ```
+
+#### 完整间距匹配规则
+
+以下是 `spacing()` 中 match 臂的完整顺序和逻辑：
+
+| 序号 | 匹配模式 (l.rclass, r.lclass) | 作用 | 设置 |
+|------|-------------------------------|------|------|
+| 1 | `(_, Punctuation)` | 标点前不加间距 | 无 |
+| 2 | `(Punctuation, _)` 非 Script | 标点后加 Thin | `l.rspace = THIN` |
+| 3 | `(Opening, _)` 或 `(_, Closing)` | 开分隔符后、闭分隔符前不加间距 | 无 |
+| 4 | `(Relation, Relation)` | 连续关系符间不加额外间距 | 无 |
+| 5 | `(Relation, _)` 非 Script | 关系符后加 Thick | `l.rspace = THICK` |
+| 6 | `(_, Relation)` 非 Script | 关系符前加 Thick | `r.lspace = THICK` |
+| 7 | `(Binary, _)` 非 Script | 二元运算符后加 Medium | `l.rspace = MEDIUM` |
+| 8 | `(_, Binary)` 非 Script | 二元运算符前加 Medium | `r.lspace = MEDIUM` |
+| 9 | `(Large, Opening \| Fence)` | **大型运算符后接开分隔符/围栏时，不加间距** | 无 |
+| 10 | `(Large, _)` | 大型运算符后加 Thin | `l.rspace = THIN` |
+| 11 | `(_, Large)` | 大型运算符前加 Thin | `r.lspace = THIN` |
+| 12 | `l.is_spaced() \|\| r.is_spaced()` | 用户显式标记间距的元素 | 返回显式空格 |
+| 13 | `_` | 默认不加间距 | 无 |
+
+**重要**：所有间距规则在 Script 或 ScriptScript 尺寸下被 `if !script(l/r)` 守卫跳过，即上下标内的运算符之间不自动添加间距。
+
+#### 左右侧有效类：rclass 与 lclass
+
+`spacing()` 匹配的不是简单 `class()`，而是 `rclass()` 和 `lclass()`。定义在 [item.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/ir/item.rs#L118-L146)：
+
+- **`rclass()`**（右侧有效类）：`FencedItem` 若含闭分隔符且无显式类 → 返回 `Closing`；否则返回 `class()`
+- **`lclass()`**（左侧有效类）：`FencedItem` 若含开分隔符且无显式类 → 返回 `Opening`；否则返回 `class()`
+
+这意味着整个 `(x+y)` 在其左侧视为 `Opening`，右侧视为 `Closing`。例如 `∑ (x+y)` 中，`(x+y)` 的 `lclass()` 是 `Opening`，从而匹配 `(Large, Opening|Fence)` 臂 → 不加间距。
+
+#### Vary 类的处理：一元 vs 二元
+
+减号 `-` 的 Unicode 数学类是 `Vary`（可变），而非 `Binary`。在 [preprocess](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/ir/process.rs#L213-L226) 中，`Vary` 会被动态转换为 `Binary`：
+
+```rust
+if item.class() == MathClass::Vary
+    && let Some(RawMathItem::Item(prev)) = last.map(|i| &resolved[i])
+    && matches!(
+        prev.class(),
+        MathClass::Normal | MathClass::Alphabetic
+            | MathClass::Closing | MathClass::Fence
+    )
+{
+    item.set_class(MathClass::Binary);
+}
+```
+
+即：当前面是字母、数字、闭分隔符或围栏时，`-` 视为二元运算符（如 `x - y`）；否则保持 `Vary`（如行首 `-x` 或 `∑ -x`），此时 `Vary` 不命中 `spacing()` 中任何臂 → 不加间距，正确表现一元运算符行为。
+
+#### 大型运算符间距规则详解
+
+大型运算符（`Large` 类，如 `∑`、`∏`、`∐`、`⋃`、`⋁` 等）的间距规则**不是简单的"两侧加 Thick"**，而是遵循 TeXBook 第 170 页的规则：
+
+1. **大型运算符后接开分隔符/围栏时不加间距**——`(Large, Opening|Fence)` 臂（序号 9）
+   - 这是最特殊的规则：`∑ (x)` 中 ∑ 与 `(` 之间没有间距
+   - 原因：大型运算符在 Display 尺寸下上下有极限标记（limits），它们占据了 ∑ 右侧的视觉空间，如果再加间距会显得太宽
+
+2. **大型运算符后接其他元素时加 Thin**——`(Large, _)` 臂（序号 10）
+   - `∑ x` → ∑ 与 x 之间有 THIN 间距
+   - `∑ ∏` → ∑ 与 ∏ 之间有 THIN 间距（序号 10 先于序号 11 匹配，只设置 `l.rspace`）
+
+3. **大型运算符前加 Thin**——`(_, Large)` 臂（序号 11）
+   - `x ∑` → x 与 ∑ 之间有 THIN 间距
+   - 但如果左侧是 Binary/Relation 等，更高优先级的臂会先匹配（见下文）
+
+#### 大型运算符与其他运算类交互的优先级影响
+
+由于 match 臂从上到下首次匹配，当 `Large` 与 `Binary`、`Relation` 相邻时，**Binary/Relation 的规则优先**：
+
+| 左侧项 | 右侧项 | 命中臂 | 实际间距 |
+|--------|--------|--------|----------|
+| `Binary` | `Large` | 序号 7 `(Binary, _)` | MEDIUM（Binary 后），无 THIN（`(_, Large)` 未命中） |
+| `Large` | `Binary` | 序号 8 `(_, Binary)` | MEDIUM（Binary 前），无 THIN（`(Large, _)` 未命中） |
+| `Relation` | `Large` | 序号 5 `(Relation, _)` | THICK（Relation 后），无 THIN |
+| `Large` | `Relation` | 序号 6 `(_, Relation)` | THICK（Relation 前），无 THIN |
+| `Large` | `Opening/Fence` | 序号 9 | **无间距** |
+| `Large` | `Closing` | 序号 3 `(_, Closing)` | **无间距** |
+| `Opening` | `Large` | 序号 3 `(Opening, _)` | **无间距** |
+| `Large` | `Alphabetic/Normal` | 序号 10 | THIN |
+| `Alphabetic/Normal` | `Large` | 序号 11 | THIN |
+| `Large` | `Large` | 序号 10 | THIN（后一个 Large 无 THIN） |
+
+关键发现：**当 Large 与 Binary/Relation 相邻时，只有一侧间距生效，且是 Binary 的 MEDIUM 或 Relation 的 THICK，而非 Large 的 THIN**。
+
+#### 间距的落地机制
+
+`spacing()` 通过 `l.set_rspace(Some(Em))` / `r.set_lspace(Some(Em))` 将间距量写入 `MathProperties` 的 `lspace`/`rspace` 字段。在布局阶段，[layout_realized](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-layout/src/math/mod.rs#L467-L551) 在每个组件前后各检查一次：
+
+```rust
+// 插入左间距
+if let Some(lspace) = props.lspace && !props.align_form_infix && !lspace.is_zero() {
+    let width = lspace.at(styles.resolve(TextElem::size));
+    ctx.push(MathFragment::Space(width));
+}
+// ... 布局组件本身 ...
+// 插入右间距
+if let Some(rspace) = props.rspace && !rspace.is_zero() {
+    let width = rspace.at(styles.resolve(TextElem::size));
+    ctx.push(MathFragment::Space(width));
+}
+```
+
+间距以 `Em` 为单位存储，在布局时乘以当前字体大小转为绝对长度 `Abs`，作为 `MathFragment::Space` 片段插入片段流。
+
+#### 求和符间距示例：`$sum_(i=1)^n i = (n(n+1)) / 2$`
+
+追踪此公式中 ∑ 周围的间距计算：
+
+1. IR 构建后，`∑_(i=1)^n` 被打包为 `ScriptsItem`，它从基底的 `raw_class()` 继承了 `Large` 类
+2. 紧跟其后的 `i` 是 `Alphabetic` 类
+3. 调用 `spacing(∑_i^n, i)`：`(Large, Alphabetic)` → 命中序号 10 `(Large, _)` → `∑_i^n.rspace = THIN`
+4. `i` 和 `=` 之间：`(Alphabetic, Relation)` → 命中序号 6 `(_, Relation)` → `=.lspace = THICK`
+5. `=` 和 `(n(n+1))` 之间：`(Relation, Opening)` → 命中序号 3 `(Opening, _)` → 无间距（因为 `(n(n+1))` 的 `lclass()` 是 `Opening`）
+
+所以 ∑ 与 i 之间有 THIN 间距，i 与 = 之间有 THICK 间距，= 与 `(` 之间无间距。
+
+对比另一个示例 `$sum_(k=0)^n (2k+1)$`：
+
+1. `∑_(k=0)^n` 是 `Large`
+2. `(2k+1)` 是 `FencedItem`，`lclass() = Opening`
+3. `spacing(∑, (2k+1))`：`(Large, Opening)` → 命中序号 9 → **无间距**
+4. 这正是 TeXBook p170 规则的体现——求和符后接括号时不加间距
 
 ### 2.3 符号的字形布局
 
@@ -286,15 +405,22 @@ frame.set_baseline(height / 2.0 + axis)
    - `MathFrac` → `FracElem`
 
 3. **IR 构建**（[typst-library/src/math/ir/resolve.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/ir/resolve.rs)）：
-   - `AttachElem` → `ScriptsItem`（含 base=∑, b=i=1, t=n）
-   - `LrElem` → `FencedItem`（含 open='(', body, close=')'）
+   - `AttachElem` → `ScriptsItem`（含 base=∑, b=i=1, t=n），从基底继承 `Large` 类
+   - `LrElem` → `FencedItem`（含 open='(', body, close=')'），lclass=Opening, rclass=Closing
    - `FracElem` → `FractionItem`（含 numerator, denominator）
-   - `process_group` 自动插入间距（`∑` 两侧 Thick，`=` 两侧 Thick 等）
 
-4. **布局**（[typst-layout/src/math/](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-layout/src/math/)）：
+4. **间距处理**（[process.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-library/src/math/ir/process.rs)）：
+   - `∑_i^n` 与 `i` 之间：`(Large, Alphabetic)` → THIN（∑ 的 rspace）
+   - `i` 与 `=` 之间：`(Alphabetic, Relation)` → THICK（= 的 lspace）
+   - `=` 与 `(n(n+1))` 之间：`(Relation, Opening)` → 无间距（Opening 后不加间距规则）
+   - `(n(n+1))` 与 `/` 之间：`(Closing, ...)` → 无间距（Closing 前不加间距）
+   - 分数线由 `FractionItem` 自身绘制，不依赖自动间距
+
+5. **布局**（[typst-layout/src/math/](file:///d:/fz/0601-2/solo-dogfeeding/code/123-typst/crates/typst-layout/src/math/)）：
    - `layout_scripts`: 将 `i=1` 放在 ∑ 下方（Limits 样式，因 Display 尺寸），`n` 放在 ∑ 上方
    - `layout_fenced`: 将 `(` `)` 拉伸匹配 `n(n+1)` 高度
    - `layout_fraction`: 绘制分数线，上下放置分子分母
+   - 每个组件前后按 `lspace`/`rspace` 插入 Space 片段
    - 所有片段水平排列，统一基线对齐
 
-5. **渲染**：最终 `Frame` 交给 `typst-render` 或 `typst-pdf` 输出为 PNG/PDF/SVG。
+6. **渲染**：最终 `Frame` 交给 `typst-render` 或 `typst-pdf` 输出为 PNG/PDF/SVG。
